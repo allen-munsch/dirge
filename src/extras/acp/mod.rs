@@ -164,6 +164,7 @@ async fn run_prompt(
         permission,
         ask_tx,
         sandbox,
+        false,
         #[cfg(feature = "mcp")]
         None::<&crate::extras::mcp::McpClientManager>,
     )

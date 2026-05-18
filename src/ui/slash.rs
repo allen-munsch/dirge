@@ -55,6 +55,7 @@ pub async fn handle_compress(
     cli: &Cli,
     cfg: &Config,
     context: &mut ContextFiles,
+    reasoning_enabled: bool,
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     sandbox: &Sandbox,
@@ -115,6 +116,7 @@ pub async fn handle_compress(
         permission.clone(),
         ask_tx.clone(),
         sandbox.clone(),
+        reasoning_enabled,
         #[cfg(feature = "mcp")]
         mcp_manager,
     )
@@ -144,6 +146,7 @@ pub async fn handle_slash(
     cfg: &Config,
     context: &mut ContextFiles,
     show_reasoning: &mut bool,
+    reasoning_enabled: &mut bool,
     is_running: &mut bool,
     input: &mut InputEditor,
     permission: &Option<PermCheck>,
@@ -169,6 +172,7 @@ pub async fn handle_slash(
                     permission.clone(),
                     ask_tx.clone(),
                     sandbox.clone(),
+                    *reasoning_enabled,
                     #[cfg(feature = "mcp")]
                     mcp_manager,
                 )
@@ -300,11 +304,26 @@ pub async fn handle_slash(
             }
         }
         "/reasoning" => {
-            *show_reasoning = !*show_reasoning;
+            *reasoning_enabled = !*reasoning_enabled;
+            *show_reasoning = *reasoning_enabled;
+            let model = client.completion_model(session.model.to_string());
+            *agent = crate::provider::build_agent(
+                model,
+                cli,
+                cfg,
+                context,
+                permission.clone(),
+                ask_tx.clone(),
+                sandbox.clone(),
+                *reasoning_enabled,
+                #[cfg(feature = "mcp")]
+                mcp_manager,
+            )
+            .await;
             renderer.write_line(
                 &format!(
-                    "reasoning visibility: {}",
-                    if *show_reasoning { "on" } else { "off" }
+                    "reasoning: {}",
+                    if *reasoning_enabled { "on" } else { "off" }
                 ),
                 C_AGENT,
             )?;
@@ -482,6 +501,7 @@ pub async fn handle_slash(
                         permission.clone(),
                         ask_tx.clone(),
                         sandbox.clone(),
+                        *reasoning_enabled,
                         #[cfg(feature = "mcp")]
                         mcp_manager,
                     )
@@ -587,6 +607,7 @@ pub async fn handle_slash(
                         permission.clone(),
                         ask_tx.clone(),
                         sandbox.clone(),
+                        *reasoning_enabled,
                         #[cfg(feature = "mcp")]
                         mcp_manager,
                     )
@@ -606,6 +627,7 @@ pub async fn handle_slash(
                         permission.clone(),
                         ask_tx.clone(),
                         sandbox.clone(),
+                        *reasoning_enabled,
                         #[cfg(feature = "mcp")]
                         mcp_manager,
                     )
@@ -652,6 +674,7 @@ pub async fn handle_slash(
                         permission.clone(),
                         ask_tx.clone(),
                         sandbox.clone(),
+                        *reasoning_enabled,
                         #[cfg(feature = "mcp")]
                         mcp_manager,
                     )

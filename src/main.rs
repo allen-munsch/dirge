@@ -184,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
             permission,
             ask_tx,
             sandbox.clone(),
+            true,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
         )
@@ -209,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                true,
                 #[cfg(feature = "mcp")]
                 mcp_manager.as_ref(),
             )
@@ -224,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
             permission.clone(),
             ask_tx.clone(),
             sandbox.clone(),
+            true,
             #[cfg(feature = "mcp")]
             mcp_manager.as_ref(),
         )

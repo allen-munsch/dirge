@@ -145,6 +145,7 @@ pub async fn run_interactive(
     let mut response_buf = String::new();
     let mut response_start_line: Option<usize> = None;
     let mut show_reasoning = true;
+    let mut reasoning_enabled = true;
     let mut was_reasoning = false;
     let mut todo_tools_enabled = false;
     #[allow(unused_mut)]
@@ -365,7 +366,7 @@ pub async fn run_interactive(
                                     renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
                                 }
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut reasoning_enabled, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -376,6 +377,7 @@ pub async fn run_interactive(
                                         let compress_result = handle_compress(
                                             instructions.as_deref(),
                                             &mut agent, &client, &mut renderer, session, cli, cfg, context,
+                                            reasoning_enabled,
                                             &permission, &ask_tx, &sandbox,
                                             #[cfg(feature = "mcp")] mcp_manager,
                                         ).await;
@@ -428,6 +430,7 @@ pub async fn run_interactive(
                                                 permission.clone(),
                                                 ask_tx.clone(),
                                                 sandbox.clone(),
+                                                reasoning_enabled,
                                                 #[cfg(feature = "mcp")] mcp_manager,
                                             ).await;
                                             render_session(&mut renderer, session, cli, cfg, context)?;
@@ -623,6 +626,7 @@ pub async fn run_interactive(
                             let compress_result = handle_compress(
                                 None,
                                 &mut agent, &client, &mut renderer, session, cli, cfg, context,
+                                reasoning_enabled,
                                 &permission, &ask_tx, &sandbox,
                                 #[cfg(feature = "mcp")] mcp_manager,
                             ).await;
@@ -687,6 +691,7 @@ pub async fn run_interactive(
                                         permission.clone(),
                                         ask_tx.clone(),
                                         sandbox.clone(),
+                                        reasoning_enabled,
                                         #[cfg(feature = "mcp")] mcp_manager,
                                     ).await;
                                     render_session(&mut renderer, session, cli, cfg, context)?;

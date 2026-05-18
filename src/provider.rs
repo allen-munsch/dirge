@@ -347,6 +347,7 @@ pub async fn build_agent(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
+    reasoning_enabled: bool,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
     match model {
@@ -359,6 +360,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -373,6 +375,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -387,6 +390,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -401,6 +405,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -415,6 +420,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox,
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -429,6 +435,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
