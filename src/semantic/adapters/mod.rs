@@ -1,0 +1,47 @@
+pub mod bash;
+#[cfg(feature = "semantic-python")]
+mod python;
+#[cfg(feature = "semantic-ts")]
+mod typescript;
+
+#[cfg(feature = "semantic-python")]
+pub use python::PythonAdapter;
+#[cfg(feature = "semantic-ts")]
+pub use typescript::TypescriptAdapter;
+
+use std::path::Path;
+
+use crate::semantic::adapter::LanguageAdapter;
+
+pub struct AdapterRegistry {
+    adapters: Vec<Box<dyn LanguageAdapter>>,
+}
+
+impl AdapterRegistry {
+    pub fn new(adapters: Vec<Box<dyn LanguageAdapter>>) -> Self {
+        Self { adapters }
+    }
+
+    pub fn find_for_file(&self, file_path: &Path) -> Option<&dyn LanguageAdapter> {
+        let ext = file_path.extension()?.to_str()?.to_lowercase();
+        self.adapters
+            .iter()
+            .find(|a| {
+                a.extensions()
+                    .iter()
+                    .any(|e| e.trim_start_matches('.') == ext)
+            })
+            .map(|a| a.as_ref())
+    }
+
+    pub fn all_extensions(&self) -> Vec<String> {
+        self.adapters
+            .iter()
+            .flat_map(|a| {
+                a.extensions()
+                    .iter()
+                    .map(|e| e.trim_start_matches('.').to_string())
+            })
+            .collect()
+    }
+}

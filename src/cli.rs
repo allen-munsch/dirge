@@ -1,0 +1,167 @@
+use clap::Parser;
+use compact_str::CompactString;
+
+use crate::config;
+
+#[derive(Parser, Debug)]
+#[command(name = "dirge", version, about = "Minimal coding agent")]
+pub struct Cli {
+    #[arg(short = 'p', long = "print", help = "Print response and exit")]
+    pub print: bool,
+
+    #[arg(short = 'c', long = "continue", help = "Continue most recent session")]
+    pub continue_session: bool,
+
+    #[arg(short = 'r', long = "resume", help = "Browse and select a session")]
+    pub resume: bool,
+
+    #[arg(long = "session", help = "Use specific session file or ID")]
+    pub session: Option<String>,
+
+    #[arg(long = "no-session", help = "Ephemeral mode, do not save")]
+    pub no_session: bool,
+
+    #[arg(long = "provider", env = "ZS_PROVIDER", help = "API provider")]
+    pub provider: Option<String>,
+
+    #[arg(long = "model", env = "ZS_MODEL", help = "Model name")]
+    pub model: Option<String>,
+
+    #[arg(
+        long = "api-key",
+        help = "API key for the provider (WARNING: visible to other users via ps/htop; prefer env vars)"
+    )]
+    pub api_key: Option<String>,
+
+    #[arg(long = "max-tokens", help = "Maximum tokens in response")]
+    pub max_tokens: Option<u64>,
+
+    #[arg(long = "max-agent-turns", help = "Maximum agent turns")]
+    pub max_agent_turns: Option<usize>,
+
+    #[arg(long = "temperature", help = "Model temperature (0.0 to 2.0)")]
+    pub temperature: Option<f64>,
+
+    #[arg(short = 't', long = "tools", help = "Allowlist specific tools")]
+    pub tools: Vec<String>,
+
+    #[arg(long = "no-tools", help = "Disable all tools")]
+    pub no_tools: bool,
+
+    #[arg(long = "no-color", help = "Disable colored TUI output")]
+    pub no_color: bool,
+
+    #[arg(
+        long = "restrictive",
+        short = 'R',
+        help = "Default all tools to ask for approval"
+    )]
+    pub restrictive: bool,
+
+    #[arg(
+        long = "accept-all",
+        help = "Auto-accept all operations within the working directory"
+    )]
+    pub accept_all: bool,
+
+    #[arg(
+        long = "yolo",
+        help = "Auto-accept ALL operations without any restriction"
+    )]
+    pub yolo: bool,
+
+    #[arg(
+        long = "sandbox",
+        help = "Run bash commands inside bubblewrap (bwrap) sandbox"
+    )]
+    pub sandbox: bool,
+
+    #[arg(
+        long = "no-context-files",
+        short = 'n',
+        help = "Disable AGENTS.md loading"
+    )]
+    pub no_context_files: bool,
+
+    #[cfg(feature = "loop")]
+    #[arg(
+        long = "loop",
+        help = "Run in headless loop mode (requires --loop-prompt or message)"
+    )]
+    pub loop_mode: bool,
+
+    #[cfg(feature = "acp")]
+    #[arg(
+        long = "acp",
+        help = "Enable ACP (Agent Communication Protocol) support"
+    )]
+    pub acp_enabled: bool,
+
+    #[cfg(feature = "acp")]
+    #[arg(long = "acp-host", help = "ACP TCP bind host [default: stdio mode]")]
+    pub acp_host: Option<String>,
+
+    #[cfg(feature = "acp")]
+    #[arg(long = "acp-port", help = "ACP TCP bind port [default: 7243]")]
+    pub acp_port: Option<u16>,
+
+    #[cfg(feature = "loop")]
+    #[arg(long = "loop-prompt", help = "Prompt for each loop iteration")]
+    pub loop_prompt: Option<String>,
+
+    #[cfg(feature = "loop")]
+    #[arg(long = "loop-plan", help = "Plan file path [default: LOOP_PLAN.md]")]
+    pub loop_plan: Option<std::path::PathBuf>,
+
+    #[cfg(feature = "loop")]
+    #[arg(long = "loop-max", help = "Maximum number of iterations")]
+    pub loop_max: Option<u32>,
+
+    #[cfg(feature = "loop")]
+    #[arg(
+        long = "loop-run",
+        help = "Validation command to run after each iteration"
+    )]
+    pub loop_run: Option<String>,
+
+    #[arg(help = "Prompt message(s)")]
+    pub message: Vec<String>,
+}
+
+impl Cli {
+    pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
+        self.model
+            .as_deref()
+            .or(cfg.model.as_deref())
+            .map(CompactString::new)
+            .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-flash"))
+    }
+
+    pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
+        self.provider
+            .as_deref()
+            .or(cfg.provider.as_deref())
+            .map(CompactString::new)
+            .unwrap_or_else(|| CompactString::new("openrouter"))
+    }
+
+    pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
+        self.max_tokens.or(cfg.max_tokens).unwrap_or(8192)
+    }
+
+    pub fn resolve_max_agent_turns(&self, cfg: &config::Config) -> usize {
+        self.max_agent_turns.or(cfg.max_agent_turns).unwrap_or(100)
+    }
+
+    pub fn resolve_no_context_files(&self, cfg: &config::Config) -> bool {
+        self.no_context_files || cfg.no_context_files.unwrap_or(false)
+    }
+
+    pub fn resolve_no_tools(&self, cfg: &config::Config) -> bool {
+        self.no_tools || cfg.no_tools.unwrap_or(false)
+    }
+
+    pub fn resolve_sandbox(&self, cfg: &config::Config) -> bool {
+        self.sandbox || cfg.sandbox.unwrap_or(false)
+    }
+}
