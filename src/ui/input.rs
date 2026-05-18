@@ -104,6 +104,17 @@ impl InputEditor {
         self.prompt_names = names;
     }
 
+    pub fn load_global_history(&mut self) {
+        if let Ok(entries) = crate::session::chat_history::load_history() {
+            self.history = entries
+                .into_iter()
+                .rev()
+                .map(|e| CompactString::new(e.content))
+                .collect();
+            self.history_pos = None;
+        }
+    }
+
     pub fn start_file_picker(&mut self) {
         let mut picker = FilePicker::new();
         picker.set_monochrome(self.monochrome);

@@ -7,12 +7,8 @@ use crate::session::storage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatHistoryEntry {
-    pub role: String,
     pub content: String,
     pub timestamp: CompactString,
-    pub session_id: CompactString,
-    pub model: CompactString,
-    pub provider: CompactString,
 }
 
 fn chat_history_path() -> PathBuf {

@@ -772,9 +772,7 @@ pub async fn handle_slash(
                             let preview: String = entry.content.chars().take(80).collect();
                             renderer.write_line(
                                 &format!(
-                                    "  [{}] {}: {}",
-                                    &entry.timestamp[..19].replace('T', " "),
-                                    entry.role,
+                                    "  {}",
                                     preview
                                 ),
                                 C_RESULT,

@@ -139,6 +139,7 @@ pub async fn run_interactive(
     let mut input = InputEditor::new();
     input.set_monochrome(cli.no_color);
     input.set_prompt_names(context.prompts.keys().cloned().collect());
+    input.load_global_history();
     let mut is_running = false;
     let mut agent_rx: Option<mpsc::Receiver<AgentEvent>> = None;
     let mut agent_line_started = false;
@@ -495,12 +496,8 @@ pub async fn run_interactive(
                                 if !cli.no_session {
                                     let _ = crate::session::chat_history::append_entry(
                                         &crate::session::chat_history::ChatHistoryEntry {
-                                            role: "user".to_string(),
                                             content: text.to_string(),
                                             timestamp: session.updated_at.clone(),
-                                            session_id: session.id.clone(),
-                                            model: session.model.clone(),
-                                            provider: session.provider.clone(),
                                         },
                                     );
                                 }
@@ -618,18 +615,6 @@ pub async fn run_interactive(
                         renderer.write_line("", Color::White)?;
                         renderer.write_line("", Color::White)?;
                         session.add_message(MessageRole::Assistant, &response);
-                        if !cli.no_session {
-                            let _ = crate::session::chat_history::append_entry(
-                                &crate::session::chat_history::ChatHistoryEntry {
-                                    role: "assistant".to_string(),
-                                    content: response.to_string(),
-                                    timestamp: session.updated_at.clone(),
-                                    session_id: session.id.clone(),
-                                    model: session.model.clone(),
-                                    provider: session.provider.clone(),
-                                },
-                            );
-                        }
                         session.total_tokens = session.total_tokens.saturating_add(tokens);
                         session.total_cost += cost;
                         agent_line_started = false;

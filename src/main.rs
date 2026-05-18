@@ -198,25 +198,10 @@ async fn main() -> anyhow::Result<()> {
             session.add_message(MessageRole::User, &msg);
             session.add_message(MessageRole::Assistant, &response);
             session::storage::save_session(&session)?;
-            let now = session.updated_at.clone();
             let _ = session::chat_history::append_entry(
                 &session::chat_history::ChatHistoryEntry {
-                    role: "user".to_string(),
                     content: msg,
-                    timestamp: now.clone(),
-                    session_id: session.id.clone(),
-                    model: session.model.clone(),
-                    provider: session.provider.clone(),
-                },
-            );
-            let _ = session::chat_history::append_entry(
-                &session::chat_history::ChatHistoryEntry {
-                    role: "assistant".to_string(),
-                    content: response,
-                    timestamp: now,
-                    session_id: session.id.clone(),
-                    model: session.model.clone(),
-                    provider: session.provider.clone(),
+                    timestamp: session.updated_at.clone(),
                 },
             );
         }
