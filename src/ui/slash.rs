@@ -1057,8 +1057,62 @@ pub async fn handle_slash(
                 C_RESULT,
             )?;
             renderer.write_line("  mouse scroll           scroll chat", C_RESULT)?;
+
+            // Plugin-registered commands, if any. Listed last so they sit
+            // visually after the built-ins and the keybindings.
+            #[cfg(feature = "plugin")]
+            if let Some(pm_arc) = crate::plugin::hook::global() {
+                let cmds = {
+                    let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    mgr.list_commands()
+                };
+                if !cmds.is_empty() {
+                    renderer.write_line("", C_AGENT)?;
+                    renderer.write_line("plugin commands:", C_AGENT)?;
+                    for (cmd, handler) in cmds {
+                        renderer.write_line(&format!("  /{:<20} -> {}", cmd, handler), C_RESULT)?;
+                    }
+                }
+            }
         }
         _ => {
+            // Fall through to plugin-registered commands. The process-global
+            // PluginManager is the same one HookedToolDyn uses, so we don't
+            // need to thread an Arc through handle_slash's already long
+            // parameter list.
+            #[cfg(feature = "plugin")]
+            if let Some(pm_arc) = crate::plugin::hook::global() {
+                let cmd = parts[0].trim_start_matches('/');
+                let args = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
+                let handler = {
+                    let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    mgr.list_commands()
+                        .into_iter()
+                        .find(|(name, _)| name == cmd)
+                        .map(|(_, h)| h)
+                };
+                if let Some(handler_fn) = handler {
+                    let result = {
+                        let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        mgr.invoke_command(&handler_fn, &args)
+                    };
+                    match result {
+                        Ok(Some(text)) => {
+                            for line in text.lines() {
+                                renderer.write_line(line, C_AGENT)?;
+                            }
+                        }
+                        Ok(None) => {
+                            // Handler ran cleanly but had nothing to say — no-op.
+                        }
+                        Err(e) => {
+                            renderer
+                                .write_line(&format!("[plugin] {} failed: {}", cmd, e), C_ERROR)?;
+                        }
+                    }
+                    return Ok(());
+                }
+            }
             renderer.write_line(
                 &format!("unknown command: {} (try /help)", parts[0]),
                 C_ERROR,
