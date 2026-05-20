@@ -523,6 +523,91 @@ mod tests {
         let result = mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
         assert_eq!(result.block, Some("no".to_string()));
     }
+
+    // --- Phase 2: plugin-registered slash commands ----------------------
+
+    /// `harness/register-command` records a (cmd-name, handler-fn) pair
+    /// readable by the host via `list_commands`.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_command_records_pair() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-command "hello" "say-hello")"#)
+            .unwrap();
+        let cmds = mgr.list_commands();
+        assert_eq!(cmds, vec![("hello".to_string(), "say-hello".to_string())]);
+    }
+
+    /// Multiple registrations all surface; order matches load order.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_multiple_commands() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-command "alpha" "fn-a")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-command "beta" "fn-b")"#)
+            .unwrap();
+        let cmds = mgr.list_commands();
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds.contains(&("alpha".to_string(), "fn-a".to_string())));
+        assert!(cmds.contains(&("beta".to_string(), "fn-b".to_string())));
+    }
+
+    /// Non-string args silently drop the registration instead of crashing.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_command_ignores_non_string_args() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-command 42 "ok")"#).unwrap();
+        mgr.eval(r#"(harness/register-command "name" 99)"#).unwrap();
+        assert_eq!(mgr.list_commands().len(), 0);
+    }
+
+    /// Invoking a registered handler runs the Janet fn with the args
+    /// string and returns its output as `Some(text)`. nil/empty becomes
+    /// `None` so the slash UI knows there was no message to display.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_command_runs_handler_and_returns_output() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn greet [args] (string "hello " args))"#)
+            .unwrap();
+        let r = mgr.invoke_command("greet", "world").unwrap();
+        assert_eq!(r, Some("hello world".to_string()));
+    }
+
+    /// Handler returning nil → None so the UI doesn't print "nil".
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_command_returns_none_for_nil_handler_output() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn quiet [args] nil)"#).unwrap();
+        let r = mgr.invoke_command("quiet", "anything").unwrap();
+        assert_eq!(r, None);
+    }
+
+    /// Unknown handler doesn't crash dispatch; returns None so the slash
+    /// UI can fall through to its "unknown command" path.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_unknown_handler_returns_none() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let r = mgr.invoke_command("nonexistent-fn", "args").unwrap();
+        assert_eq!(r, None);
+    }
+
+    /// Args with special characters round-trip through the escape pipeline.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_command_passes_escaped_args() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn echo [args] args)"#).unwrap();
+        // Quotes, newlines, and backslashes in the args string.
+        let r = mgr
+            .invoke_command("echo", "he said \"hi\"\nline 2 \\ x")
+            .unwrap();
+        assert_eq!(r, Some("he said \"hi\"\nline 2 \\ x".to_string()));
+    }
 }
 
 use std::collections::HashMap;
@@ -656,6 +741,17 @@ impl PluginManager {
                   (when (string? json-str) (set harness-mutate-input json-str)))
                 (defn harness/replace-result [output]
                   (when (string? output) (set harness-replace-result output)))
+
+                # Slash-command registry. Plugins register at load time;
+                # the host reads the list once after all plugins load and
+                # dispatches matching /cmd input back to the named handler.
+                # Stored as a `name|handler\n` blob to keep the read side
+                # easy (single Janet -> Rust string roundtrip).
+                (var harness-cmd-list "")
+                (defn harness/register-command [name handler]
+                  (when (and (string? name) (string? handler))
+                    (set harness-cmd-list
+                         (string harness-cmd-list name "|" handler "\n"))))
             "#,
             );
 
@@ -879,6 +975,85 @@ impl PluginManager {
         _context_janet: &str,
     ) -> Result<ToolHookResult, String> {
         Ok(ToolHookResult::default())
+    }
+
+    /// Snapshot the plugin-registered slash commands as `(cmd-name,
+    /// handler-fn-name)` pairs in load order. Read once after all plugins
+    /// finish loading; subsequent registrations require a reload to take
+    /// effect (kept simple for now — Phase 5 will add hot-reload).
+    #[cfg(feature = "plugin")]
+    pub fn list_commands(&mut self) -> Vec<(String, String)> {
+        // harness-cmd-list is a `name|handler\n` blob populated by the
+        // (harness/register-command ...) calls in plugin scripts. Janet
+        // stringifies strings without quotes, so the raw read is parseable
+        // as-is — no escaping concerns because plugins only ever pass
+        // alphanumeric command/handler names through here.
+        let raw = match self.client.run("harness-cmd-list") {
+            Ok(v) => v.to_string(),
+            Err(_) => return Vec::new(),
+        };
+        raw.lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, '|');
+                let cmd = parts.next()?.trim();
+                let handler = parts.next()?.trim();
+                if cmd.is_empty() || handler.is_empty() {
+                    None
+                } else {
+                    Some((cmd.to_string(), handler.to_string()))
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    pub fn list_commands(&mut self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Invoke a registered handler fn by name with the user-provided args
+    /// string (everything after the command name). Returns `Ok(Some(text))`
+    /// when the handler produced a non-nil string, `Ok(None)` when it
+    /// returned nil/empty or when the handler raised inside Janet. The
+    /// caller-visible error path is reserved for catastrophic Janet
+    /// failures (VM dead, etc.) — handler-level errors are swallowed so a
+    /// broken plugin doesn't tear down the slash dispatch.
+    #[cfg(feature = "plugin")]
+    pub fn invoke_command(
+        &mut self,
+        handler_fn: &str,
+        args: &str,
+    ) -> Result<Option<String>, String> {
+        let escaped_args = escape_janet_string(args);
+        let escaped_fn = escape_janet_string(handler_fn);
+        // Use `(get (curenv) (symbol ...))` to look up the handler so a
+        // missing fn doesn't print Janet's "unknown symbol" error to
+        // stderr. Then call it via `apply` if found.
+        let code = format!(
+            r#"(try
+                 (let [f (get (curenv) (symbol "{fname}"))]
+                   (if (and f (function? (f :value)))
+                     ((f :value) "{args}")
+                     nil))
+                 ([err fib] nil))"#,
+            fname = escaped_fn,
+            args = escaped_args,
+        );
+        let result = self.eval(&code)?;
+        if result == "nil" || result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    pub fn invoke_command(
+        &mut self,
+        _handler_fn: &str,
+        _args: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
     }
 }
 

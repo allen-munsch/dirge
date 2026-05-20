@@ -239,10 +239,17 @@ Janet scripts access harness capabilities through built-in functions:
 (harness/block "reason")          # Abort the tool call; LLM sees the reason
 (harness/mutate-input json-str)   # Rewrite tool args before the tool runs
 (harness/replace-result text)     # Swap the tool output the LLM sees
+
+# Slash-command registration (call at plugin load time):
+(harness/register-command "cmd" "handler-fn-name")
+# Then define the handler. It receives one arg string and returns nil
+# or a string the chat will display.
+(defn handler-fn-name [args] (string "result: " args))
 ```
 
-See `plugins/protected_paths.janet` for a working example that blocks
-writes to sensitive paths and truncates oversized tool outputs.
+See `plugins/protected_paths.janet` for an example that blocks writes
+to sensitive paths and truncates oversized tool outputs.
+See `plugins/hello_cmd.janet` for a minimal slash-command plugin.
 
 ### Workflow plugin
 
