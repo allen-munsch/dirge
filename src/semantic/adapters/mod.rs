@@ -1,9 +1,13 @@
 pub mod bash;
+#[cfg(feature = "semantic-clojure")]
+mod clojure;
 #[cfg(feature = "semantic-python")]
 mod python;
 #[cfg(feature = "semantic-ts")]
 mod typescript;
 
+#[cfg(feature = "semantic-clojure")]
+pub use clojure::ClojureAdapter;
 #[cfg(feature = "semantic-python")]
 pub use python::PythonAdapter;
 #[cfg(feature = "semantic-ts")]
