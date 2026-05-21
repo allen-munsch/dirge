@@ -1150,6 +1150,7 @@ fn left_truncate(s: &str, max: usize) -> String {
 }
 
 pub fn copy_to_clipboard(text: &str) {
+    // Try external clipboard tools first
     let cmds: &[(&str, &[&str])] = &[
         ("wl-copy", &[]),
         ("xclip", &["-selection", "clipboard"]),
@@ -1170,6 +1171,16 @@ pub fn copy_to_clipboard(text: &str) {
             return;
         }
     }
+
+    // Fall back to OSC 52 escape sequence — works in most modern terminals
+    // (Kitty, Alacritty, WezTerm, foot, iTerm2, Windows Terminal, etc.)
+    // No external tools needed.
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let osc52 = format!("\x1b]52;c;{encoded}\x07");
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(osc52.as_bytes());
+    let _ = stdout.flush();
 }
 
 #[cfg(test)]
