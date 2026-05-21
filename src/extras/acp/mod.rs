@@ -235,6 +235,9 @@ async fn run_prompt(
             AgentEvent::Error(_) => {
                 break;
             }
+            AgentEvent::TurnStart { .. } => {}
+            AgentEvent::TurnEnd { .. } => {}
+            AgentEvent::Interjected { .. } => {}
         }
     }
 
