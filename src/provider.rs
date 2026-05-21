@@ -145,6 +145,49 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
     }
 }
 
+/// Auto-detect provider from environment variables when none is
+/// explicitly configured. Returns the provider name string
+/// (e.g. "deepseek") for the first matching `*_API_KEY` env var
+/// with a non-empty value. Returns `None` if no known key is set.
+///
+/// Resolution order is fixed (see `PROVIDER_AUTODETECT_ORDER`).
+/// When multiple keys are present, the FIRST in that list wins so
+/// the behavior is deterministic — important for users who have
+/// several keys in their shell environment.
+pub fn auto_detect_provider() -> Option<&'static str> {
+    auto_detect_provider_from(|name| std::env::var(name).ok())
+}
+
+/// Provider candidate list for autodetect. Listed in priority
+/// order — first key with a non-empty value wins. Extracted as a
+/// module item so tests reference the same source of truth and
+/// adding a provider only touches one place.
+const PROVIDER_AUTODETECT_ORDER: &[(&str, &str)] = &[
+    ("DEEPSEEK_API_KEY", "deepseek"),
+    ("OPENAI_API_KEY", "openai"),
+    ("ANTHROPIC_API_KEY", "anthropic"),
+    ("GEMINI_API_KEY", "gemini"),
+    ("GLM_API_KEY", "glm"),
+    ("OLLAMA_API_KEY", "ollama"),
+    ("OPENROUTER_API_KEY", "openrouter"),
+];
+
+/// Pure helper that drives `auto_detect_provider` from a
+/// caller-supplied env lookup. Production calls
+/// `auto_detect_provider()` which passes `std::env::var`; tests
+/// pass a closure backed by a HashMap so they don't mutate
+/// process-wide env vars (which races under parallel `cargo test`).
+fn auto_detect_provider_from<F: Fn(&str) -> Option<String>>(env: F) -> Option<&'static str> {
+    for (env_var, provider_name) in PROVIDER_AUTODETECT_ORDER {
+        if let Some(v) = env(env_var)
+            && !v.is_empty()
+        {
+            return Some(provider_name);
+        }
+    }
+    None
+}
+
 fn resolve_api_key(
     kind: ProviderKind,
     api_key_env_override: Option<&str>,
@@ -529,5 +572,66 @@ pub async fn build_agent(
         AnyModel::Glm(m) => build_inner!(m, Glm),
         AnyModel::Ollama(m) => build_inner!(m, Ollama),
         AnyModel::Custom(m) => build_inner!(m, Custom),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Build an env-lookup closure backed by a HashMap. Avoids
+    /// mutating process-wide env vars — `std::env::set_var` is
+    /// thread-unsafe and the previous test suite raced under
+    /// parallel `cargo test`, producing intermittent failures.
+    fn mock_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    #[test]
+    fn auto_detect_returns_none_when_no_vars_set() {
+        assert_eq!(auto_detect_provider_from(mock_env(&[])), None);
+    }
+
+    #[test]
+    fn auto_detect_finds_deepseek_when_key_set() {
+        let env = mock_env(&[("DEEPSEEK_API_KEY", "sk-test-123")]);
+        assert_eq!(auto_detect_provider_from(env), Some("deepseek"));
+    }
+
+    #[test]
+    fn auto_detect_finds_openai_when_key_set() {
+        let env = mock_env(&[("OPENAI_API_KEY", "sk-test-456")]);
+        assert_eq!(auto_detect_provider_from(env), Some("openai"));
+    }
+
+    #[test]
+    fn auto_detect_skips_empty_var() {
+        let env = mock_env(&[("DEEPSEEK_API_KEY", ""), ("OPENAI_API_KEY", "sk-test-789")]);
+        assert_eq!(auto_detect_provider_from(env), Some("openai"));
+    }
+
+    #[test]
+    fn auto_detect_returns_first_match_in_order() {
+        let env = mock_env(&[("DEEPSEEK_API_KEY", "sk-ds"), ("OPENAI_API_KEY", "sk-oai")]);
+        assert_eq!(auto_detect_provider_from(env), Some("deepseek"));
+    }
+
+    /// Cover every provider in the autodetect list — guards
+    /// against accidentally dropping or reordering an entry.
+    #[test]
+    fn auto_detect_each_provider_in_isolation() {
+        for &(env_var, expected) in PROVIDER_AUTODETECT_ORDER {
+            let env = mock_env(&[(env_var, "sk-x")]);
+            assert_eq!(
+                auto_detect_provider_from(env),
+                Some(expected),
+                "env_var={env_var}",
+            );
+        }
     }
 }
