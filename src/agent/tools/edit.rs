@@ -141,14 +141,13 @@ impl Tool for EditTool {
 
         check_perm_path(&self.permission, &self.ask_tx, "edit", &args.path).await?;
 
-        if let Some(plan) = &self.plan_file {
-            if !is_plan_file(plan, &args.path) {
+        if let Some(plan) = &self.plan_file
+            && !is_plan_file(plan, &args.path) {
                 return Err(ToolError::Msg(
                     "Plan mode: edits restricted to PLAN.md only. Use /prompt default to exit plan mode."
                         .to_string(),
                 ));
             }
-        }
 
         let bytes = tokio::fs::read(&args.path).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");

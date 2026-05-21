@@ -335,6 +335,7 @@ fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
     client: AnyClient,
     mut agent: AnyAgent,
@@ -464,19 +465,19 @@ pub async fn run_interactive(
                             break;
                         }
                     }
-                    MouseEventKind::Down(btn) if btn == MouseButton::Left => {
+                    MouseEventKind::Down(MouseButton::Left) => {
                         let _ = user_tx_clone.blocking_send(UserEvent::MouseDown {
                             row: m.row,
                             col: m.column,
                         });
                     }
-                    MouseEventKind::Drag(btn) if btn == MouseButton::Left => {
+                    MouseEventKind::Drag(MouseButton::Left) => {
                         let _ = user_tx_clone.blocking_send(UserEvent::MouseDrag {
                             row: m.row,
                             col: m.column,
                         });
                     }
-                    MouseEventKind::Up(btn) if btn == MouseButton::Left => {
+                    MouseEventKind::Up(MouseButton::Left) => {
                         let _ = user_tx_clone.blocking_send(UserEvent::MouseUp {
                             row: m.row,
                             col: m.column,
@@ -822,9 +823,7 @@ pub async fn run_interactive(
                                     continue;
                                 }
                                 KeyCode::Up => {
-                                    if search_selected > 0 {
-                                        search_selected -= 1;
-                                    }
+                                    search_selected = search_selected.saturating_sub(1);
                                 }
                                 KeyCode::Down => {
                                     if search_selected + 1 < search_matches.len() {
@@ -913,8 +912,8 @@ pub async fn run_interactive(
 
                         if key.code == KeyCode::Esc && !is_running && !renderer.selection_active {
                             let now = std::time::Instant::now();
-                            if let Some(prev) = last_esc {
-                                if now.duration_since(prev) < std::time::Duration::from_millis(1500) {
+                            if let Some(prev) = last_esc
+                                && now.duration_since(prev) < std::time::Duration::from_millis(1500) {
                                     last_esc = None;
                                     open_rewind_picker(session, &mut rewind_picker);
                                     rewind_picker.draw()?;
@@ -925,7 +924,6 @@ pub async fn run_interactive(
                                     )?;
                                     continue;
                                 }
-                            }
                             last_esc = Some(now);
                             renderer.write_line("Press Esc again to rewind...", theme::dim())?;
                             renderer.draw_bottom(
@@ -1253,9 +1251,7 @@ pub async fn run_interactive(
                                     )?;
                                 }
                                 renderer.write_line(
-                                    &format!(
-                                        "(queued; runner will stop at next safe boundary — Ctrl+X drops, Ctrl+C cancels)"
-                                    ),
+                                    "(queued; runner will stop at next safe boundary — Ctrl+X drops, Ctrl+C cancels)",
                                     theme::dim(),
                                 )?;
                             } else {
@@ -2112,14 +2108,13 @@ pub async fn run_interactive(
                         tool: ask_req.tool.clone(),
                         pattern: pattern.clone(),
                     });
-                    if !cli.no_session {
-                        if let Err(e) = crate::session::storage::save_session(session) {
+                    if !cli.no_session
+                        && let Err(e) = crate::session::storage::save_session(session) {
                             renderer.write_line(
                                 &format!("warning: failed to save session: {}", e),
                                 c_error(),
                             )?;
                         }
-                    }
                     renderer.write_line(
                         &format!("  allowed {} {} (saved to session)", ask_req.tool, pattern),
                         Color::Green,
@@ -2233,16 +2228,14 @@ pub async fn run_interactive(
                                 } else {
                                     "▶"
                                 }
+                            } else if multi {
+                                if selected[i] { "  [x]" } else { "  [ ]" }
                             } else {
-                                if multi {
-                                    if selected[i] { "  [x]" } else { "  [ ]" }
-                                } else {
-                                    "  "
-                                }
+                                "  "
                             };
                             lines.push(LineEntry {
                                 text: compact_str::CompactString::new(
-                                    &format!("  {} {} — {}", marker, opt.label, opt.description),
+                                    format!("  {} {} — {}", marker, opt.label, opt.description),
                                 ),
                                 color: c_perm(),
                             });
@@ -2285,7 +2278,7 @@ pub async fn run_interactive(
 
                         match key.code {
                             KeyCode::Up | KeyCode::Char('k') => {
-                                if cursor > 0 { cursor -= 1; }
+                                cursor = cursor.saturating_sub(1);
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let max = if custom { num_options } else { num_options.saturating_sub(1) };
@@ -2302,7 +2295,7 @@ pub async fn run_interactive(
                                             input_anchor,
                                             vec![LineEntry {
                                                 text: compact_str::CompactString::new(
-                                                    &format!("  > {}", buf),
+                                                    format!("  > {}", buf),
                                                 ),
                                                 color: c_perm(),
                                             }],
@@ -2605,14 +2598,13 @@ pub async fn run_interactive(
                     )?;
 
                     // Re-render the session to show new prompt mode
-                    if !cli.print {
-                        if let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
+                    if !cli.print
+                        && let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
                             renderer.write_line(
                                 &format!("render error: {}", e),
                                 resolve_color(c_error(), cli.no_color),
                             )?;
                         }
-                    }
                 } else {
                     let _ = plan_req.reply.send(PlanSwitchResponse::Rejected);
                 }

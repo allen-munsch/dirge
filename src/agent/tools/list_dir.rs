@@ -89,11 +89,10 @@ impl Tool for ListDirTool {
 
         let cache_key = format!("list_dir:{}", path);
 
-        if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);
             }
-        }
 
         let walker = WalkBuilder::new(path)
             .git_ignore(true)

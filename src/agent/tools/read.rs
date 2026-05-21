@@ -81,11 +81,10 @@ impl Tool for ReadTool {
             args.limit.unwrap_or(2000),
         );
 
-        if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);
             }
-        }
 
         let metadata = tokio::fs::metadata(&args.path).await?;
         let file_size = metadata.len();

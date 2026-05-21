@@ -94,14 +94,13 @@ impl Tool for WriteTool {
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
         check_perm_path(&self.permission, &self.ask_tx, "write", &args.path).await?;
 
-        if let Some(plan) = &self.plan_file {
-            if !is_plan_file(plan, &args.path) {
+        if let Some(plan) = &self.plan_file
+            && !is_plan_file(plan, &args.path) {
                 return Err(ToolError::Msg(
                     "Plan mode: writes restricted to PLAN.md only. Use /prompt default to exit plan mode."
                         .to_string(),
                 ));
             }
-        }
 
         let path = Path::new(&args.path);
         if let Some(parent) = path.parent() {

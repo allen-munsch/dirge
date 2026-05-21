@@ -81,8 +81,8 @@ pub struct TreeNode {
 /// Defaults to empty (`leaf_id = None`, no entries) so pre-P4b
 /// session JSON loads cleanly via the serde defaults; `Session::new`
 /// + `add_message` initialize it correctly on subsequent appends.
-/// Legacy linear sessions are auto-converted on first access via
-/// `Session::ensure_tree_initialized`.
+///   Legacy linear sessions are auto-converted on first access via
+///   `Session::ensure_tree_initialized`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionTree {
     #[serde(default)]

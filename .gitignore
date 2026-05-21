@@ -35,3 +35,6 @@ model-prompts/
 .dolt/
 *.db
 .beads-credential-key
+
+# Agent session artifacts
+LOOP_PLAN.md

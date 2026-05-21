@@ -349,9 +349,7 @@ mod tests {
                 response: std::sync::Mutex::new(response),
             }
         }
-        fn seen_methods(&self) -> Vec<String> {
-            self.seen_methods.lock().unwrap().clone()
-        }
+
     }
 
     impl Spawner for ScriptedSpawner {

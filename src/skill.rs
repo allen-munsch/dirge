@@ -44,11 +44,10 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
                 if !skill_md.is_file() {
                     continue;
                 }
-                if let Ok(content) = std::fs::read_to_string(&skill_md) {
-                    if let Some(skill) = parse_skill(&content, &path) {
+                if let Ok(content) = std::fs::read_to_string(&skill_md)
+                    && let Some(skill) = parse_skill(&content, &path) {
                         map.entry(skill.name.clone()).or_insert(skill);
                     }
-                }
             }
         }
     }
@@ -63,11 +62,10 @@ pub fn find_project_ancestor_dirs(cwd: &Path) -> Vec<PathBuf> {
     let mut current = cwd.to_path_buf();
     dirs.push(current.clone());
     loop {
-        if current.join(".git").is_dir() {
-            if !dirs.contains(&current) {
+        if current.join(".git").is_dir()
+            && !dirs.contains(&current) {
                 dirs.push(current.clone());
             }
-        }
         if !current.pop() {
             break;
         }

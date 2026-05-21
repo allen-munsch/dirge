@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod semantic_tests {
+mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -15,15 +15,18 @@ mod semantic_tests {
     }
 
     fn mk_registry() -> Arc<AdapterRegistry> {
-        let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
+        #[allow(clippy::vec_init_then_push)]
+        {
+            let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
 
-        #[cfg(feature = "semantic-ts")]
-        adapters.push(Box::new(crate::semantic::adapters::TypescriptAdapter));
+            #[cfg(feature = "semantic-ts")]
+            adapters.push(Box::new(crate::semantic::adapters::TypescriptAdapter));
 
-        #[cfg(feature = "semantic-python")]
-        adapters.push(Box::new(crate::semantic::adapters::PythonAdapter));
+            #[cfg(feature = "semantic-python")]
+            adapters.push(Box::new(crate::semantic::adapters::PythonAdapter));
 
-        Arc::new(AdapterRegistry::new(adapters))
+            Arc::new(AdapterRegistry::new(adapters))
+        }
     }
 
     // ── CRITICAL #1: find_callers word boundary ──────────────────────────

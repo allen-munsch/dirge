@@ -812,6 +812,58 @@ impl Renderer {
             write!(stdout, "{}", ResetColor)?;
         }
 
+        // Slash-command completion preview: show upcoming commands above the input.
+        if let Some(ref completion) = editor.completion {
+            let cmds = &completion.all_commands;
+            let cur = completion.current_index;
+            let max_preview_lines: usize = 3;
+            let preview_width = cols.saturating_sub(bottom_indent as u16 + 3) as usize;
+            let upcoming: Vec<&&str> = cmds
+                .iter()
+                .cycle()
+                .skip(cur + 1)
+                .take(cmds.len().saturating_sub(1))
+                .collect();
+            let mut preview_lines: Vec<String> = Vec::new();
+            let mut cmd_iter = upcoming.iter().peekable();
+            for _ in 0..max_preview_lines {
+                let mut line = String::new();
+                while let Some(cmd) = cmd_iter.peek() {
+                    let candidate = if line.is_empty() {
+                        (*cmd).to_string()
+                    } else {
+                        format!("{}  {}", line, cmd)
+                    };
+                    if candidate.len() > preview_width {
+                        break;
+                    }
+                    line = candidate;
+                    cmd_iter.next();
+                }
+                if line.is_empty() {
+                    break;
+                }
+                preview_lines.push(line);
+            }
+            let dim_color = self.color(crate::ui::theme::dim());
+            for (i, line) in preview_lines.iter().enumerate().rev() {
+                let row = input_top.saturating_sub(i as u16 + 1);
+                if row == 0 {
+                    break;
+                }
+                stdout.execute(MoveTo(0, row))?;
+                write!(stdout, "{}", " ".repeat(cols as usize))?;
+                stdout.execute(MoveTo(bottom_indent as u16, row))?;
+                write!(
+                    stdout,
+                    "{}{}{}",
+                    SetForegroundColor(dim_color),
+                    line,
+                    ResetColor,
+                )?;
+            }
+        }
+
         // Status row — also centered under the chat band.
         stdout.execute(MoveTo(0, status_row))?;
         write!(stdout, "{}", " ".repeat(cols as usize))?;
@@ -1182,7 +1234,7 @@ mod tests {
         let mut r = Renderer::new().expect("renderer");
         for i in 0..n {
             r.buffer.push(LineEntry {
-                text: CompactString::new(&format!("line {i}")),
+                text: CompactString::new(format!("line {i}")),
                 color: Color::White,
             });
         }
@@ -1220,7 +1272,7 @@ mod tests {
         // Stream in 8 new lines while the user is scrolled up.
         for i in 0..8 {
             r.push_buffer_line(LineEntry {
-                text: CompactString::new(&format!("new {i}")),
+                text: CompactString::new(format!("new {i}")),
                 color: Color::White,
             });
         }
@@ -1244,7 +1296,7 @@ mod tests {
         // Replace from line 40 with twice as many lines.
         let new_lines: Vec<LineEntry> = (0..20)
             .map(|i| LineEntry {
-                text: CompactString::new(&format!("repl {i}")),
+                text: CompactString::new(format!("repl {i}")),
                 color: Color::White,
             })
             .collect();
@@ -1255,7 +1307,7 @@ mod tests {
         // Now replace with FEWER lines (response got shorter via re-render).
         let shorter: Vec<LineEntry> = (0..5)
             .map(|i| LineEntry {
-                text: CompactString::new(&format!("sh {i}")),
+                text: CompactString::new(format!("sh {i}")),
                 color: Color::White,
             })
             .collect();
@@ -1282,7 +1334,7 @@ mod tests {
 
         for i in 0..5 {
             r.push_buffer_line(LineEntry {
-                text: CompactString::new(&format!("new {i}")),
+                text: CompactString::new(format!("new {i}")),
                 color: Color::White,
             });
         }
@@ -1310,7 +1362,7 @@ mod tests {
 
         for i in 0..7 {
             r.push_buffer_line(LineEntry {
-                text: CompactString::new(&format!("new {i}")),
+                text: CompactString::new(format!("new {i}")),
                 color: Color::White,
             });
         }

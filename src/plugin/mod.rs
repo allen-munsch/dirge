@@ -1516,7 +1516,7 @@ pub fn load_plugin(
         let mut janet_files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
             .map_err(|e| format!("cannot read plugin dir {}: {}", path.display(), e))?
             .filter_map(|e| e.ok().map(|x| x.path()))
-            .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "janet"))
+            .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "janet"))
             .collect();
         janet_files.sort();
         if janet_files.is_empty() {
@@ -1578,8 +1578,8 @@ pub struct PluginManager {
     /// All Janet evaluation goes through this handle to the worker
     /// thread. The handle is naturally `Send + Sync` (only an mpsc Sender
     /// + JoinHandle inside) so no unsafe impl is needed — the previous
-    /// `unsafe impl Send for PluginManager` is gone now that Janet lives
-    /// on its own OS thread.
+    ///   `unsafe impl Send for PluginManager` is gone now that Janet lives
+    ///   on its own OS thread.
     worker: Worker,
     /// One-shot consumer end of the dialog channel. Taken out by
     /// `take_dialog_rx` on first call so the UI can register it in its

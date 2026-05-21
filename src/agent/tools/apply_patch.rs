@@ -182,8 +182,8 @@ impl Tool for ApplyPatchTool {
                 check_perm_path(&self.permission, &self.ask_tx, "apply_patch", new_path).await?;
             }
             // Validate create content size
-            if let PatchOp::Create { content, .. } = op {
-                if content.len() > MAX_CREATE_SIZE {
+            if let PatchOp::Create { content, .. } = op
+                && content.len() > MAX_CREATE_SIZE {
                     results.push(format!(
                         "FAILED: create content exceeds {} bytes ({} bytes provided)",
                         MAX_CREATE_SIZE,
@@ -191,7 +191,6 @@ impl Tool for ApplyPatchTool {
                     ));
                     break;
                 }
-            }
 
             let result = match op {
                 PatchOp::Create { path, content } => apply_create(path, content),

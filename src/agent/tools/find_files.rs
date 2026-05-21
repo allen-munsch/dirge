@@ -74,11 +74,10 @@ impl Tool for FindFilesTool {
             args.path.as_deref().unwrap_or("."),
         );
 
-        if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached);
             }
-        }
 
         let re = Regex::new(&args.pattern)
             .map_err(|e| ToolError::Msg(format!("Invalid regex: {}", e)))?;

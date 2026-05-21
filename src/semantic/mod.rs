@@ -19,18 +19,21 @@ pub struct SemanticManager {
 
 impl SemanticManager {
     pub fn new() -> Self {
-        let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
+        #[allow(clippy::vec_init_then_push)]
+        {
+            let mut adapters: Vec<Box<dyn LanguageAdapter>> = Vec::new();
 
-        #[cfg(feature = "semantic-ts")]
-        adapters.push(Box::new(adapters::TypescriptAdapter));
+            #[cfg(feature = "semantic-ts")]
+            adapters.push(Box::new(adapters::TypescriptAdapter));
 
-        #[cfg(feature = "semantic-python")]
-        adapters.push(Box::new(adapters::PythonAdapter));
+            #[cfg(feature = "semantic-python")]
+            adapters.push(Box::new(adapters::PythonAdapter));
 
-        let registry = Arc::new(adapters::AdapterRegistry::new(adapters));
-        let index = Arc::new(RwLock::new(SymbolIndex::new(registry)));
+            let registry = Arc::new(adapters::AdapterRegistry::new(adapters));
+            let index = Arc::new(RwLock::new(SymbolIndex::new(registry)));
 
-        Self { index }
+            Self { index }
+        }
     }
 
     pub fn tools(

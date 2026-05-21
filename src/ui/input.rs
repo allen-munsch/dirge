@@ -2,6 +2,7 @@ use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::picker::FilePicker;
+use crate::ui::slash::{try_complete, CompletionResult};
 
 const KILL_RING_MAX: usize = 10;
 
@@ -165,6 +166,8 @@ pub struct InputEditor {
     /// in the buffer. `None` entries are tombstones for expanded pastes (so
     /// existing indices remain valid).
     pastes: Vec<Option<CompactString>>,
+    /// Current slash-command completion state, for rendering a preview.
+    pub completion: Option<CompletionResult>,
 }
 
 /// Find the marker block `\x01<digits>\x01` containing or starting at
@@ -246,11 +249,10 @@ fn backspace_range(s: &str, cursor: usize) -> Option<(usize, usize)> {
     if cursor == 0 {
         return None;
     }
-    if let Some((start, end, _)) = marker_containing(s, cursor.saturating_sub(1)) {
-        if cursor == end {
+    if let Some((start, end, _)) = marker_containing(s, cursor.saturating_sub(1))
+        && cursor == end {
             return Some((start, end));
         }
-    }
     Some((prev_char_boundary(s, cursor), cursor))
 }
 
@@ -260,11 +262,10 @@ fn delete_range(s: &str, cursor: usize) -> Option<(usize, usize)> {
     if cursor >= s.len() {
         return None;
     }
-    if let Some((start, end, _)) = marker_containing(s, cursor + 1) {
-        if cursor == start {
+    if let Some((start, end, _)) = marker_containing(s, cursor + 1)
+        && cursor == start {
             return Some((start, end));
         }
-    }
     Some((cursor, next_char_boundary(s, cursor)))
 }
 
@@ -282,13 +283,12 @@ fn marker_blocks(s: &str) -> Vec<(usize, usize, usize)> {
                 .position(|&b| b == PASTE_MARK as u8)
             {
                 let close = body_start + rel;
-                if let Ok(digits) = std::str::from_utf8(&bytes[body_start..close]) {
-                    if let Ok(idx) = digits.parse::<usize>() {
+                if let Ok(digits) = std::str::from_utf8(&bytes[body_start..close])
+                    && let Ok(idx) = digits.parse::<usize>() {
                         out.push((start, close + 1, idx));
                         i = close + 1;
                         continue;
                     }
-                }
             }
         }
         i += 1;
@@ -315,6 +315,7 @@ impl InputEditor {
             last_action_was_kill: false,
             yank_state: None,
             pastes: Vec::new(),
+            completion: None,
         }
     }
 
@@ -399,11 +400,10 @@ impl InputEditor {
         // Detect any marker block fully contained in the removed range and
         // free its stored body.
         for (mstart, mend, idx) in marker_blocks(&self.buffer) {
-            if mstart >= start && mend <= end {
-                if let Some(slot) = self.pastes.get_mut(idx) {
+            if mstart >= start && mend <= end
+                && let Some(slot) = self.pastes.get_mut(idx) {
                     *slot = None;
                 }
-            }
         }
         self.buffer.replace_range(start..end, "");
         self.cursor = start;
@@ -493,6 +493,7 @@ impl InputEditor {
     fn reset_kill_accumulation(&mut self) {
         self.last_action_was_kill = false;
         self.yank_state = None;
+        self.completion = None;
     }
 
     fn push_kill(&mut self, text: CompactString, direction: KillDir) {
@@ -980,6 +981,16 @@ impl InputEditor {
             }
 
             KeyCode::Tab => {
+                // Slash-command completion: when the buffer starts with `/`,
+                // Tab cycles through completions instead of indenting.
+                if self.buffer.starts_with('/')
+                    && let Some(cr) = try_complete(&self.buffer, self.cursor) {
+                        self.buffer = cr.new_buffer.clone().into();
+                        self.cursor = cr.new_cursor;
+                        self.completion = Some(cr);
+                        self.reset_kill_accumulation();
+                        return None;
+                    }
                 self.buffer.insert_str(self.cursor, "  ");
                 self.cursor += 2;
                 self.reset_kill_accumulation();

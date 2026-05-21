@@ -341,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
                 //     `*.janet` contents are concatenated into one Janet
                 //     env (multi-file plugins)
                 let is_janet_file =
-                    path.is_file() && path.extension().map_or(false, |e| e == "janet");
+                    path.is_file() && path.extension().is_some_and(|e| e == "janet");
                 let is_plugin_dir = path.is_dir();
                 if !is_janet_file && !is_plugin_dir {
                     continue;

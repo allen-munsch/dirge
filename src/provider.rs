@@ -488,6 +488,7 @@ pub fn create_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_agent(
     model: AnyModel,
     cli: &Cli,

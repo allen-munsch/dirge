@@ -65,11 +65,10 @@ pub fn safe_resolve(dir: &Path, path: &str) -> Result<PathBuf, String> {
     if !resolved_canon.starts_with(&dir_canon) {
         return Err("Path escapes memory directory".to_string());
     }
-    if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
-        if meta.file_type().is_symlink() {
+    if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+        && meta.file_type().is_symlink() {
             return Err("Symlinks are not allowed in memory directory".to_string());
         }
-    }
     Ok(resolved)
 }
 
@@ -78,11 +77,10 @@ pub fn list_files(dir: &Path) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = entry.file_name().to_str() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str() {
                     files.push(name.to_string());
                 }
-            }
         }
     }
     files.sort();

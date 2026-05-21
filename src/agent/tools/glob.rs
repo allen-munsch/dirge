@@ -95,7 +95,7 @@ impl Tool for GlobTool {
         )
         .await?;
 
-        let re = glob_to_regex(&args.pattern).map_err(|e| ToolError::Msg(e))?;
+        let re = glob_to_regex(&args.pattern).map_err(ToolError::Msg)?;
 
         let root = args
             .path
@@ -115,7 +115,7 @@ impl Tool for GlobTool {
 
         for entry in walker {
             let entry = entry.map_err(|e| ToolError::Msg(e.to_string()))?;
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
 

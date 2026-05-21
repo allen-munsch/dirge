@@ -378,8 +378,10 @@ mod tests {
     // the session-allowlist contribution in isolation from the default.
     #[test]
     fn path_tool_session_allowlist_keeps_one_segment_semantics() {
-        let mut cfg = PermissionConfig::default();
-        cfg.default = Some(Action::Ask);
+        let cfg = PermissionConfig {
+            default: Some(Action::Ask),
+            ..Default::default()
+        };
         let mut checker = PermissionChecker::new(
             &cfg,
             SecurityMode::Standard,
