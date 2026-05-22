@@ -2,6 +2,9 @@ use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::picker::FilePicker;
+use crate::ui::slash::CompletionResult;
+#[cfg(feature = "experimental-ui-tab-slash")]
+use crate::ui::slash::try_complete;
 
 const KILL_RING_MAX: usize = 10;
 
@@ -165,6 +168,8 @@ pub struct InputEditor {
     /// in the buffer. `None` entries are tombstones for expanded pastes (so
     /// existing indices remain valid).
     pastes: Vec<Option<CompactString>>,
+    /// Current slash-command completion state, for rendering a preview.
+    pub completion: Option<CompletionResult>,
 }
 
 /// Find the marker block `\x01<digits>\x01` containing or starting at
@@ -315,6 +320,7 @@ impl InputEditor {
             last_action_was_kill: false,
             yank_state: None,
             pastes: Vec::new(),
+            completion: None,
         }
     }
 
@@ -502,6 +508,7 @@ impl InputEditor {
     fn reset_kill_accumulation(&mut self) {
         self.last_action_was_kill = false;
         self.yank_state = None;
+        self.completion = None;
     }
 
     fn push_kill(&mut self, text: CompactString, direction: KillDir) {
@@ -1025,6 +1032,20 @@ impl InputEditor {
             }
 
             KeyCode::Tab => {
+                #[cfg(feature = "experimental-ui-tab-slash")]
+                {
+                    // Slash-command completion: when the buffer starts with `/`,
+                    // Tab cycles through completions instead of indenting.
+                    if self.buffer.starts_with('/')
+                        && let Some(cr) = try_complete(&self.buffer, self.cursor)
+                    {
+                        self.buffer = cr.new_buffer.clone().into();
+                        self.cursor = cr.new_cursor;
+                        self.completion = Some(cr);
+                        self.reset_kill_accumulation();
+                        return None;
+                    }
+                }
                 self.buffer.insert_str(self.cursor, "  ");
                 self.cursor += 2;
                 self.reset_kill_accumulation();
