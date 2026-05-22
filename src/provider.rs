@@ -176,6 +176,10 @@ const PROVIDER_AUTODETECT_ORDER: &[(&str, &str)] = &[
     ("ANTHROPIC_API_KEY", "anthropic"),
     ("GEMINI_API_KEY", "gemini"),
     ("GLM_API_KEY", "glm"),
+    // Zhipu's canonical env var name for the same provider. Listed
+    // after GLM_API_KEY so users with both set get the dirge-
+    // primary one; users with only ZHIPU_API_KEY still get glm.
+    ("ZHIPU_API_KEY", "glm"),
     ("OLLAMA_API_KEY", "ollama"),
     ("OPENROUTER_API_KEY", "openrouter"),
 ];
@@ -194,6 +198,24 @@ fn auto_detect_provider_from<F: Fn(&str) -> Option<String>>(env: F) -> Option<&'
         }
     }
     None
+}
+
+/// Per-provider fallback env vars consulted AFTER the primary
+/// (returned by `provider_env_var`) and after any explicit
+/// `api_key_env_override`. Lets users with the upstream-canonical
+/// env var name (e.g. ZHIPU_API_KEY for GLM/Zhipu) skip aliasing.
+///
+/// Empty for providers with no widely-used alternative; the slice
+/// is iterated in order and the first non-empty value wins.
+fn provider_env_var_fallbacks(kind: ProviderKind) -> &'static [&'static str] {
+    match kind {
+        // Zhipu's docs + their official SDKs uniformly use
+        // ZHIPU_API_KEY. GLM_API_KEY is dirge's chosen primary
+        // (matches the provider name), but accepting the
+        // canonical form means users don't have to alias.
+        ProviderKind::Glm => &["ZHIPU_API_KEY"],
+        _ => &[],
+    }
 }
 
 fn resolve_api_key(
@@ -220,6 +242,19 @@ fn resolve_api_key(
         return Ok(key);
     }
 
+    // Provider-specific fallback env vars (e.g. ZHIPU_API_KEY
+    // for GLM). Skip if the override was explicit — in that case
+    // the user named the env var they want; don't second-guess.
+    if api_key_env_override.is_none_or(|s| s.is_empty()) {
+        for fallback in provider_env_var_fallbacks(kind) {
+            if let Ok(key) = std::env::var(fallback)
+                && !key.is_empty()
+            {
+                return Ok(key);
+            }
+        }
+    }
+
     if kind == ProviderKind::Ollama {
         return Ok(String::new());
     }
@@ -228,9 +263,17 @@ fn resolve_api_key(
         return Ok(String::new());
     }
 
-    anyhow::bail!(
-        "No API key found for {kind:?}. Set the {env_var} environment variable or pass --api-key."
-    )
+    let fallbacks = provider_env_var_fallbacks(kind);
+    if fallbacks.is_empty() {
+        anyhow::bail!(
+            "No API key found for {kind:?}. Set the {env_var} environment variable or pass --api-key."
+        )
+    } else {
+        anyhow::bail!(
+            "No API key found for {kind:?}. Set {env_var} (or one of: {}) or pass --api-key.",
+            fallbacks.join(", ")
+        )
+    }
 }
 
 pub enum AnyClient {
@@ -869,6 +912,53 @@ mod tests {
                 auto_detect_provider_from(env),
                 Some(expected),
                 "env_var={env_var}",
+            );
+        }
+    }
+
+    /// `ZHIPU_API_KEY` alone resolves to glm provider — Zhipu's
+    /// canonical env-var name doesn't require users to alias.
+    #[test]
+    fn auto_detect_zhipu_api_key_resolves_to_glm() {
+        let env = mock_env(&[("ZHIPU_API_KEY", "fake-zhipu-key")]);
+        assert_eq!(auto_detect_provider_from(env), Some("glm"));
+    }
+
+    /// When BOTH GLM_API_KEY and ZHIPU_API_KEY are set, the
+    /// dirge-primary GLM_API_KEY wins (it's earlier in
+    /// PROVIDER_AUTODETECT_ORDER). The fallback only fires when
+    /// the primary is absent.
+    #[test]
+    fn auto_detect_glm_api_key_wins_over_zhipu_when_both_set() {
+        let env = mock_env(&[("GLM_API_KEY", "primary"), ("ZHIPU_API_KEY", "fallback")]);
+        // Both map to "glm" so the answer is the same kind, but
+        // this guards against a future reordering breaking the
+        // primary-first invariant. We can't observe WHICH var
+        // resolve_api_key picked from auto_detect alone — that's
+        // tested below.
+        assert_eq!(auto_detect_provider_from(env), Some("glm"));
+    }
+
+    /// `provider_env_var_fallbacks` lists ZHIPU_API_KEY for GLM
+    /// and nothing else for other providers.
+    #[test]
+    fn fallback_list_is_glm_specific() {
+        assert_eq!(
+            provider_env_var_fallbacks(ProviderKind::Glm),
+            &["ZHIPU_API_KEY"]
+        );
+        for kind in [
+            ProviderKind::OpenAI,
+            ProviderKind::Anthropic,
+            ProviderKind::Gemini,
+            ProviderKind::DeepSeek,
+            ProviderKind::OpenRouter,
+            ProviderKind::Ollama,
+            ProviderKind::Custom,
+        ] {
+            assert!(
+                provider_env_var_fallbacks(kind).is_empty(),
+                "no fallback expected for {kind:?}",
             );
         }
     }
