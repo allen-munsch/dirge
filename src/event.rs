@@ -22,6 +22,17 @@ pub enum AgentEvent {
         output: CompactString,
     },
     Error(CompactString),
+    /// The streaming run failed with a context-length error. Audit
+    /// H17: the UI used to render this as a hard `Error` and stop;
+    /// users had to manually `/compress` then re-issue. Now the
+    /// runner emits `ContextOverflow` carrying the prompt it was
+    /// trying to send so the UI can auto-compact the session and
+    /// respawn the run with the same prompt against the compacted
+    /// history.
+    ContextOverflow {
+        prompt: CompactString,
+        error: CompactString,
+    },
     Done {
         response: CompactString,
         tokens: u64,

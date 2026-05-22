@@ -371,6 +371,16 @@ fn sanitize_single_line(s: &str, max_chars: usize) -> String {
 /// value to fill the available banner width (right side carries
 /// the meaningful info for paths — filename — so we cut from the
 /// left, not the right).
+/// Cached state for a collapsed tool result, so Ctrl+O can re-render
+/// it as a fresh chamber with the full body. We hold only the last
+/// one — older collapses live in chat history but aren't addressable.
+#[derive(Clone)]
+pub(crate) struct CollapsedToolResult {
+    pub tool_name: String,
+    pub banner_value: String,
+    pub full_output: String,
+}
+
 fn format_tool_banner_value(name: &str, args: &serde_json::Value) -> String {
     let obj = match args {
         serde_json::Value::Object(map) => map,
@@ -600,6 +610,32 @@ pub async fn run_interactive(
     let mut was_reasoning = false;
     let mut todo_tools_enabled = false;
     let mut last_tool_name: Option<String> = None;
+    // Tracks whether a tool chamber TOP has been drawn but no matching
+    // BOTTOM has been written yet. Used by the ask/alert handler to
+    // close the in-flight chamber BEFORE rendering the ALERT box.
+    //
+    // Why separate from `last_tool_name`?
+    // The alert handler used to gate the chamber-close on
+    // `last_tool_name.is_some()` — but in practice users reported the
+    // ALERT box rendering directly under an unclosed chamber TOP,
+    // meaning that check fell through. The root cause is subtle: when
+    // `tokio::select!` picks the ask channel after the ToolCall handler
+    // ran AND after a `close_tool_chamber_if_open` somewhere else
+    // cleared `last_tool_name`, the chamber TOP is on-screen but
+    // `last_tool_name` is `None`. Tracking the chamber visibility as
+    // its own boolean — set on every chamber TOP write, cleared on
+    // every chamber BOTTOM write — decouples the two state machines so
+    // the alert handler can rely on a fact about the *screen* rather
+    // than a fact about a name that has other clear sites.
+    let mut tool_chamber_open: bool = false;
+
+    // Last collapsed tool result, re-printable by Ctrl+O. Each
+    // `render_tool_output` call that truncates the body stashes the
+    // (tool, args-banner, full-output) tuple here; Ctrl+O reprints
+    // it as a fresh chamber with the full body. Only the most
+    // recent collapse is retained — past collapses scroll away into
+    // chat history and are not addressable.
+    let mut last_collapsed: Option<CollapsedToolResult> = None;
     #[allow(unused_mut)]
     let mut loop_label: Option<String> = None;
     #[cfg(feature = "loop")]
@@ -1045,6 +1081,43 @@ pub async fn run_interactive(
                             renderer.draw_bottom(
                                 &input,
                                 &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+
+                        // Ctrl+O — expand the most-recent collapsed
+                        // tool result. We re-print it as a fresh
+                        // chamber below the current chat so the user
+                        // sees the full body. Older collapsed results
+                        // are not addressable (they scroll into chat
+                        // history as collapsed); this matches the
+                        // "last one only" scope chosen during design.
+                        let ctrl_o = key.code == KeyCode::Char('o')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if ctrl_o {
+                            if let Some(c) = last_collapsed.take() {
+                                let max_chars = cfg.resolve_tool_result_max_chars();
+                                render_collapsed_in_full(&mut renderer, &c, max_chars)?;
+                            } else {
+                                renderer.write_line(
+                                    "  ↳ nothing to expand (no collapsed tool result in this turn)",
+                                    theme::dim(),
+                                )?;
+                            }
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(
+                                    StatusLine::render(
+                                        session,
+                                        is_running,
+                                        0,
+                                        loop_label.as_deref(),
+                                        context.current_prompt_name.as_deref(),
+                                        perm_mode().as_deref(),
+                                    ),
+                                    interjection_queue.len(),
+                                ),
                                 is_running,
                             )?;
                             continue;
@@ -1764,7 +1837,7 @@ pub async fn run_interactive(
                         // it before opening the new one. Without this
                         // the new `╭─ NAME ─ args` lands inside the
                         // stale chamber.
-                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
                         last_tool_name = Some(name.to_string());
                         if agent_line_started {
                             renderer.write_line("", Color::White)?;
@@ -1795,6 +1868,7 @@ pub async fn run_interactive(
                         let (frame_w, _) = chamber_widths(&renderer);
                         let header = fit_banner_header(&upper, &raw_value, frame_w);
                         renderer.write_line(&header, c_tool())?;
+                        tool_chamber_open = true;
 
                         // Note: on-tool-start fires from HookedToolDyn now,
                         // around the actual tool invocation. The UI no
@@ -1826,17 +1900,29 @@ pub async fn run_interactive(
                         // on-tool-end is also fired by HookedToolDyn so the
                         // host doesn't re-dispatch it here.
 
-                        // Permission-deny path: the ALERT handler
-                        // already closed the chamber (and the dim
-                        // `↳ denied: …` trailer printed there). The
-                        // tool still returns an error to the agent
-                        // which surfaces here as a ToolResult — but
-                        // painting chamber rows + a chamber bottom
-                        // now would produce orphan borders for a
-                        // chamber whose top no longer exists. Emit
-                        // a single dim line with the error body
-                        // instead and skip the chamber paint.
-                        if show_details && last_tool_name.is_none() {
+                        // Three states at ToolResult time:
+                        //
+                        //  (a) chamber OPEN, show_details=true  → paint body
+                        //      inside the chamber + close with `╰─╯`.
+                        //  (b) chamber NOT OPEN (deny path closed it via
+                        //      the alert handler), show_details=true →
+                        //      emit a single dim `  ↳ {output}` trailer.
+                        //      The trailer is the only thing pinned to
+                        //      the original tool call now that its
+                        //      chamber is gone.
+                        //  (c) show_details=false → no body, but if the
+                        //      chamber is still open we MUST close it
+                        //      (a bare chamber_bottom) or the next
+                        //      output paints inside a dead chamber.
+                        //
+                        // Gating on `tool_chamber_open` (not
+                        // `last_tool_name`) is deliberate: the name
+                        // slot has unrelated clear sites and can drain
+                        // while the chamber TOP is still on screen —
+                        // that's the whole reason for the dedicated
+                        // chamber-state bool.
+                        if !tool_chamber_open && show_details {
+                            // (b) chamber already closed by deny path.
                             let trimmed = output.trim();
                             if !trimmed.is_empty() {
                                 let first_line = trimmed.lines().next().unwrap_or("");
@@ -1846,9 +1932,47 @@ pub async fn run_interactive(
                                 )?;
                             }
                         }
-                        if show_details && last_tool_name.is_some() {
+                        if tool_chamber_open && !show_details {
+                            // (c) chamber on-screen but body suppressed
+                            // — close with a bare bottom so a stale
+                            // `╭─` doesn't swallow the next paint.
+                            let (frame_w, _) = chamber_widths(&renderer);
+                            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            tool_chamber_open = false;
+                        }
+                        if tool_chamber_open && show_details {
+                            // (a) normal completion path.
                             let is_edit =
                                 last_tool_name.as_deref() == Some("edit") && show_diff;
+
+                            // Resolve the tool name + banner for the
+                            // collapse store. Prefer the just-stored
+                            // `last_tool_name`; fall back to looking
+                            // up the call by id in `tool_calls_buf`
+                            // (covers paths where `last_tool_name`
+                            // was drained out from under us — same
+                            // shape as the alert-bug fix).
+                            let resolved_name: String = last_tool_name
+                                .clone()
+                                .or_else(|| {
+                                    tool_calls_buf
+                                        .iter()
+                                        .rev()
+                                        .find(|e| e.id == id.as_str())
+                                        .map(|e| e.name.to_string())
+                                })
+                                .unwrap_or_default();
+                            let resolved_args = tool_calls_buf
+                                .iter()
+                                .rev()
+                                .find(|e| e.id == id.as_str())
+                                .map(|e| e.args.clone())
+                                .unwrap_or(serde_json::Value::Null);
+                            let banner_value = format_tool_banner_value(
+                                &resolved_name,
+                                &resolved_args,
+                            );
+                            let max_lines = cfg.resolve_tool_result_max_lines();
 
                             if is_edit {
                                 // Colorized diff rendering. The edit tool emits
@@ -1922,14 +2046,29 @@ pub async fn run_interactive(
                                         &chamber_bottom(frame_w),
                                         theme::dim(),
                                     )?;
+                                    tool_chamber_open = false;
                                 } else {
                                     // No diff section found, show normally
-                                    render_tool_output(
-                                        &mut renderer, &output, max_chars,
+                                    last_collapsed = render_tool_output(
+                                        &mut renderer,
+                                        &resolved_name,
+                                        &banner_value,
+                                        &output,
+                                        max_chars,
+                                        max_lines,
                                     )?;
+                                    tool_chamber_open = false;
                                 }
                             } else {
-                                render_tool_output(&mut renderer, &output, max_chars)?;
+                                last_collapsed = render_tool_output(
+                                    &mut renderer,
+                                    &resolved_name,
+                                    &banner_value,
+                                    &output,
+                                    max_chars,
+                                    max_lines,
+                                )?;
+                                tool_chamber_open = false;
                             }
                         }
                         // Clear after consuming so a future stray ToolResult
@@ -1938,6 +2077,20 @@ pub async fn run_interactive(
                     }
                     AgentEvent::Done { response, tokens, cost } => {
                         was_reasoning = false;
+                        // A successful turn must not leave a chamber
+                        // half-painted. If anything slipped through
+                        // — show_details=false skipping the body, an
+                        // in-flight Ask the user resolved with a path
+                        // that didn't reach the bottom paint, etc. —
+                        // close with a plain chamber bottom (not the
+                        // `⚠ tool denied · aborted` wording, which
+                        // would mislead the user about an otherwise-
+                        // successful run).
+                        if tool_chamber_open {
+                            let (frame_w, _) = chamber_widths(&renderer);
+                            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            tool_chamber_open = false;
+                        }
                         last_tool_name = None;
                         renderer.set_avatar_state(avatar::AvatarState::Done);
 
@@ -2270,7 +2423,7 @@ pub async fn run_interactive(
                     }
                     AgentEvent::Interjected { partial_response, tokens } => {
                         was_reasoning = false;
-                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
 
                         // Finalize whatever assistant text streamed so far so
                         // the conversation history reflects what the user saw,
@@ -2373,10 +2526,113 @@ pub async fn run_interactive(
                             is_running = true;
                         }
                     }
+                    AgentEvent::ContextOverflow { prompt, error } => {
+                        // Audit H17: the streaming run hit a context-
+                        // length error. Auto-compact then re-spawn with
+                        // the same prompt against the now-compacted
+                        // history — opencode-style automatic recovery
+                        // (compaction.ts:477-558) instead of leaving the
+                        // user stranded at the error.
+                        was_reasoning = false;
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
+                        let safe = sanitize_output(&error);
+                        renderer.write_line(
+                            &format!("context overflow: {}", safe),
+                            c_error(),
+                        )?;
+                        // Tear down the current runner before respawn.
+                        if let Some(h) = agent_abort.take() {
+                            h.abort();
+                        }
+                        agent_rx = None;
+                        agent_interject = None;
+                        agent_line_started = false;
+                        response_buf.clear();
+                        response_start_line = None;
+
+                        renderer.write_line(
+                            "▒░ auto-compacting then retrying ░▒",
+                            theme::accent(),
+                        )?;
+                        let compress_result = handle_compress(
+                            None,
+                            &mut agent,
+                            &client,
+                            &mut renderer,
+                            session,
+                            cli,
+                            cfg,
+                            context,
+                            &permission,
+                            &ask_tx,
+                            &bg_store,
+                            &sandbox,
+                            #[cfg(feature = "mcp")]
+                            mcp_manager,
+                            #[cfg(feature = "semantic")]
+                            semantic_manager,
+                        )
+                        .await;
+
+                        match compress_result {
+                            Ok(()) => {
+                                // Build history from the compacted session.
+                                // Drop the trailing User message because
+                                // it's the prompt we're about to resubmit
+                                // — otherwise rig would receive it twice.
+                                let mut history = crate::agent::runner::convert_history(session);
+                                if let Some(last) = history.last()
+                                    && matches!(last, rig::completion::Message::User { .. })
+                                {
+                                    history.pop();
+                                }
+                                let prompt_owned = prompt.to_string();
+                                let prepared_prompt =
+                                    crate::agent::tools::background::prepend_pending_notifications(
+                                        &prompt_owned,
+                                        bg_store.as_ref(),
+                                    );
+                                let runner =
+                                    agent.clone().spawn_runner(prepared_prompt, history);
+                                agent_rx = Some(runner.event_rx);
+                                agent_abort = Some(runner.task);
+                                agent_interject = Some(runner.interject_tx);
+                                is_running = true;
+                                renderer.write_line(
+                                    "  ↳ resumed run with compacted history",
+                                    theme::dim(),
+                                )?;
+                            }
+                            Err(ce) => {
+                                renderer.write_line(
+                                    &format!(
+                                        "auto-compact failed ({}); leaving session as-is. Try /compress manually or /clear.",
+                                        ce
+                                    ),
+                                    c_error(),
+                                )?;
+                                is_running = false;
+                                // Drop queued interjections — they assumed
+                                // the failed turn would succeed.
+                                let dropped = interjection_queue.len();
+                                interjection_queue.clear();
+                                if dropped > 0 {
+                                    renderer.write_line(
+                                        &format!(
+                                            "{} queued message{} dropped due to compact failure",
+                                            dropped,
+                                            if dropped == 1 { "" } else { "s" }
+                                        ),
+                                        c_error(),
+                                    )?;
+                                }
+                            }
+                        }
+                    }
                     AgentEvent::Error(e) => {
                         was_reasoning = false;
                         renderer.set_avatar_state(avatar::AvatarState::Error);
-                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), c_error())?;
 
@@ -2547,19 +2803,36 @@ pub async fn run_interactive(
                 // ToolResult body lands inside it as usual. If the
                 // user denies, the chamber is already closed and
                 // we add a brief "(denied)" line below.
-                let pending_chamber_tool =
-                    if let Some(open_name) = last_tool_name.clone() {
-                        let (frame_w, inner) = chamber_widths(&renderer);
-                        renderer.write_line(
-                            &chamber_row("awaiting permission…", inner),
-                            theme::dim(),
-                        )?;
-                        renderer.write_line(&chamber_bottom(frame_w), c_tool())?;
-                        last_tool_name = None;
-                        Some(open_name)
-                    } else {
-                        None
-                    };
+                // FIX: gate the in-flight chamber close on
+                // `tool_chamber_open`, not on `last_tool_name`. The
+                // two state variables drift apart in practice because
+                // `last_tool_name` is also cleared by paths that do
+                // not paint a chamber BOTTOM (e.g. `AgentEvent::Done`
+                // at the end of an LLM turn), leaving the chamber TOP
+                // on-screen but the name slot empty. Previously this
+                // showed up as an ALERT box rendering directly under
+                // an unclosed chamber TOP — no "awaiting permission…"
+                // row, no chamber bottom. Now the chamber-close is
+                // driven by what's actually on the screen.
+                let pending_chamber_tool: Option<String> = if tool_chamber_open {
+                    let (frame_w, inner) = chamber_widths(&renderer);
+                    renderer.write_line(
+                        &chamber_row("awaiting permission…", inner),
+                        theme::dim(),
+                    )?;
+                    renderer.write_line(&chamber_bottom(frame_w), c_tool())?;
+                    tool_chamber_open = false;
+                    let reopen = last_tool_name.clone();
+                    last_tool_name = None;
+                    // If `last_tool_name` was somehow cleared while
+                    // the chamber stayed open, the reopen-after-allow
+                    // path has no name to anchor the new chamber to.
+                    // Fall back to the asked tool's name so the
+                    // user still gets the visual pair.
+                    Some(reopen.unwrap_or_else(|| ask_req.tool.to_string()))
+                } else {
+                    None
+                };
                 // Blank line above the ALERT box guarantees visual
                 // separation from whatever was just on screen — a
                 // closed tool chamber, plain agent text, or even
@@ -2739,23 +3012,36 @@ pub async fn run_interactive(
                 // enqueued and auto-deny each. New requests that
                 // arrive after this drain still go through the
                 // normal alert flow on the next iteration.
-                if was_denied
-                    && let Some(rx) = ask_rx.as_mut()
-                {
-                    let mut cascaded = 0usize;
-                    while let Ok(stale) = rx.try_recv() {
-                        let _ = stale.reply.send(UserDecision::Deny);
-                        cascaded += 1;
+                if was_denied {
+                    if let Some(rx) = ask_rx.as_mut() {
+                        let mut cascaded = 0usize;
+                        while let Ok(stale) = rx.try_recv() {
+                            let _ = stale.reply.send(UserDecision::Deny);
+                            cascaded += 1;
+                        }
+                        if cascaded > 0 {
+                            renderer.write_line(
+                                &format!(
+                                    "  ↳ also denied {} queued tool request{}",
+                                    cascaded,
+                                    if cascaded == 1 { "" } else { "s" },
+                                ),
+                                theme::dim(),
+                            )?;
+                        }
                     }
-                    if cascaded > 0 {
-                        renderer.write_line(
-                            &format!(
-                                "  ↳ also denied {} queued tool request{}",
-                                cascaded,
-                                if cascaded == 1 { "" } else { "s" },
-                            ),
-                            theme::dim(),
-                        )?;
+                    // Audit H10 (extended): the drain above only
+                    // covers requests already in `ask_rx` at this
+                    // moment. The agent may still emit MORE tool
+                    // calls in the current run — without an
+                    // interject signal, the user would keep seeing
+                    // fresh permission dialogs for the same denied
+                    // intent. Send an interject so the runner halts
+                    // at the next tool-result boundary; the partial
+                    // response is preserved via the Interjected
+                    // event. try_send so a full channel is a no-op.
+                    if let Some(tx) = agent_interject.as_ref() {
+                        let _ = tx.try_send(());
                     }
                 }
 
@@ -2812,6 +3098,7 @@ pub async fn run_interactive(
                         let header = fit_banner_header(&upper, &raw_value, frame_w);
                         renderer.write_line(&header, c_tool())?;
                         last_tool_name = Some(reopen_name);
+                        tool_chamber_open = true;
                     }
                 }
 
@@ -3417,27 +3704,25 @@ fn suggest_pattern(tool: &str, input: &str) -> String {
 fn close_tool_chamber_if_open(
     renderer: &mut Renderer,
     last_tool_name: &mut Option<String>,
+    tool_chamber_open: &mut bool,
 ) -> anyhow::Result<()> {
-    if last_tool_name.is_some() {
+    // Close ANY of: a name-tracked open chamber OR a flag-tracked one.
+    // The two can disagree (see comment on `tool_chamber_open` at its
+    // declaration). Either signal alone is enough to mean "there's an
+    // unclosed `╭─` on screen", and we close it idempotently.
+    if last_tool_name.is_some() || *tool_chamber_open {
         let (frame_w, inner) = chamber_widths(renderer);
         // Abnormal close: this helper is only called when the tool's
         // chamber is closing without a `ToolResult` (permission
         // denied, interjected mid-execution, agent error, fresh tool
-        // call before the previous one finished). Previously we
-        // painted CRT-static dither rows here, but those used
-        // `static_row()` which was 2 chars narrower than the chamber
-        // frame so the right border never lined up, and the dithered
-        // noise was visually loud for a state the user just needs to
-        // SEE quickly. Now we emit a single centered alert row in
-        // the perm/error color (same orange tone as the permission
-        // ask), which lines up with the chamber border and reads at
-        // a glance.
+        // call before the previous one finished).
         renderer.write_line(
             &chamber_row_centered("⚠ tool denied · aborted · no result", inner),
             theme::perm(),
         )?;
         renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
         *last_tool_name = None;
+        *tool_chamber_open = false;
     }
     Ok(())
 }
@@ -3473,34 +3758,110 @@ fn chamber_row_centered(content: &str, inner: usize) -> String {
     format!("│ {}{}{} │", " ".repeat(left), content, " ".repeat(right))
 }
 
+/// Tools whose result body is the WHOLE point — diff hunks, user-
+/// facing Q&A, subagent answers. Collapsing these to 4 lines hides
+/// the value the LLM/user just paid for; keep them fully expanded.
+fn tool_skips_collapse(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "edit" | "apply_patch" | "question" | "task" | "task_status"
+    )
+}
+
+/// Render a tool result chamber. Lines past `max_lines` collapse to a
+/// `↓ N more lines (Ctrl+O to expand)` footer; `max_chars` is a hard
+/// ceiling on the displayed slice. `max_lines = usize::MAX` (passed
+/// for tools in `tool_skips_collapse`) disables the line cap.
+/// Returns `Some(CollapsedToolResult)` if the body was actually
+/// truncated, so the caller can stash it for Ctrl+O.
 fn render_tool_output(
     renderer: &mut Renderer,
+    tool_name: &str,
+    banner_value: &str,
     output: &str,
     max_chars: usize,
-) -> anyhow::Result<()> {
+    max_lines: usize,
+) -> anyhow::Result<Option<CollapsedToolResult>> {
     let sanitized = sanitize_output(output);
-    let char_count = sanitized.chars().count();
-    let body: String = if char_count <= max_chars {
+    let total_chars = sanitized.chars().count();
+    // Hard char ceiling first — keeps a single pathological line
+    // from blowing the chamber even if the line count is fine.
+    let char_sliced: String = if total_chars <= max_chars {
         sanitized.into_string()
     } else {
         sanitized.chars().take(max_chars).collect()
     };
-    // Tool output renders inside a closed rounded chamber:
-    //   ╭─ READ ─ /path
-    //   │ contents ...                    │
-    //   ╰─────────────────────────────────╯
-    // Lines are padded/truncated to a fixed inner width so the right
-    // border stays aligned across the chamber.
+    let chars_truncated = total_chars.saturating_sub(char_sliced.chars().count());
+
+    // Apply the per-tool line cap (skipped for diff / Q&A / task
+    // results where the body IS the value).
+    let lines: Vec<&str> = char_sliced.lines().collect();
+    let total_lines = lines.len();
+    let line_cap = if tool_skips_collapse(tool_name) {
+        usize::MAX
+    } else {
+        max_lines
+    };
+    let shown_lines = total_lines.min(line_cap);
+    let hidden_lines = total_lines.saturating_sub(shown_lines);
+
     let (frame_w, inner) = chamber_widths(renderer);
-    for line in body.lines() {
+    for line in &lines[..shown_lines] {
         renderer.write_line(&chamber_row(line, inner), theme::result())?;
     }
-    if char_count > max_chars {
-        let remaining = char_count - max_chars;
-        let note = format!("░ +{} chars truncated", remaining);
+    if hidden_lines > 0 {
+        // The Ctrl+O hint inside the row — concise enough to fit the
+        // 120-col chamber without truncation on typical widths.
+        let note = format!(
+            "↓ {} more line{} (Ctrl+O to expand)",
+            hidden_lines,
+            if hidden_lines == 1 { "" } else { "s" }
+        );
+        renderer.write_line(&chamber_row(&note, inner), theme::dim())?;
+    }
+    if chars_truncated > 0 {
+        // Char-ceiling hit BEFORE the line cap. Report separately so
+        // the user knows the char-truncated text has already been
+        // dropped (expanding via Ctrl+O won't bring it back).
+        let note = format!("░ +{} chars truncated (output too large)", chars_truncated);
         renderer.write_line(&chamber_row(&note, inner), theme::dim())?;
     }
     renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+
+    if hidden_lines > 0 {
+        Ok(Some(CollapsedToolResult {
+            tool_name: tool_name.to_string(),
+            banner_value: banner_value.to_string(),
+            full_output: output.to_string(),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Re-render a previously-collapsed result with NO line cap, as a
+/// fresh chamber below the prior chat content. Char ceiling still
+/// applies so a multi-MB output doesn't take forever.
+fn render_collapsed_in_full(
+    renderer: &mut Renderer,
+    collapsed: &CollapsedToolResult,
+    max_chars: usize,
+) -> anyhow::Result<()> {
+    let upper = collapsed.tool_name.to_ascii_uppercase();
+    let (frame_w, _) = chamber_widths(renderer);
+    let header = fit_banner_header(&upper, &collapsed.banner_value, frame_w);
+    renderer.write_line("", Color::White)?;
+    renderer.write_line(&header, theme::tool())?;
+    // Skip-collapse semantics here so even a normally-collapsed tool
+    // (e.g. read) reprints its body in full when the user opts in.
+    let _ = render_tool_output(
+        renderer,
+        &collapsed.tool_name,
+        &collapsed.banner_value,
+        &collapsed.full_output,
+        max_chars,
+        usize::MAX,
+    )?;
     Ok(())
 }
 
@@ -3962,6 +4323,101 @@ mod tests {
             row.ends_with(" │"),
             "right border missing on truncated wide-char row: {row:?}"
         );
+    }
+
+    /// Regression for the "ALERT renders inside open chamber" report:
+    /// `close_tool_chamber_if_open` must close on EITHER signal —
+    /// the legacy `last_tool_name.is_some()` OR the newer
+    /// `tool_chamber_open` flag. The two state variables can
+    /// disagree because `last_tool_name` is cleared by paths that
+    /// don't paint a chamber bottom (Done, etc.), so a chamber TOP
+    /// can be on-screen while the name slot is None. Without the OR
+    /// gate the alert handler would skip the close and the alert
+    /// would render directly under an unclosed `╭─ TOOL ─` TOP.
+    #[test]
+    fn close_tool_chamber_fires_when_only_flag_is_open() {
+        let mut renderer = Renderer::new().expect("renderer");
+        // Pretend a chamber was painted but `last_tool_name` was
+        // drained by an unrelated clear site — exactly the bug
+        // shape from the user's screenshot.
+        let mut name: Option<String> = None;
+        let mut open = true;
+        close_tool_chamber_if_open(&mut renderer, &mut name, &mut open).unwrap();
+        assert!(!open, "flag must be cleared by the close");
+        assert!(name.is_none(), "name stays cleared after the close");
+        // Symmetric case: flag false, name Some → also closes
+        // (legacy behavior preserved).
+        let mut name: Option<String> = Some("read".to_string());
+        let mut open = false;
+        close_tool_chamber_if_open(&mut renderer, &mut name, &mut open).unwrap();
+        assert!(name.is_none(), "name cleared on legacy-signal close");
+        assert!(!open, "flag stays cleared");
+        // Both false → no-op (idempotent).
+        let mut name: Option<String> = None;
+        let mut open = false;
+        close_tool_chamber_if_open(&mut renderer, &mut name, &mut open).unwrap();
+        assert!(name.is_none());
+        assert!(!open);
+    }
+
+    /// Tool-result body collapse: long output truncates at
+    /// `max_lines` and returns a `CollapsedToolResult` so Ctrl+O
+    /// can replay it. Tools in `tool_skips_collapse` bypass the
+    /// line cap (returns None).
+    #[test]
+    fn render_tool_output_collapses_past_max_lines() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let output = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let collapsed = render_tool_output(&mut renderer, "read", "/tmp/foo", &output, 10_000, 4)
+            .expect("render ok");
+        let c = collapsed.expect("read should collapse past 4 lines");
+        assert_eq!(c.tool_name, "read");
+        assert_eq!(c.banner_value, "/tmp/foo");
+        assert!(c.full_output.contains("line 19"));
+    }
+
+    /// Exempt tools (edit/apply_patch/question/task/task_status)
+    /// pass the line cap through unchanged — `tool_skips_collapse`
+    /// forces `usize::MAX`. The render call returns None (no
+    /// collapse store) even when the output is 100 lines long.
+    #[test]
+    fn render_tool_output_does_not_collapse_exempt_tools() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let output = (0..20)
+            .map(|i| format!("+ added line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for tool in ["edit", "apply_patch", "question", "task", "task_status"] {
+            let collapsed = render_tool_output(&mut renderer, tool, "arg", &output, 10_000, 4)
+                .expect("render ok");
+            assert!(
+                collapsed.is_none(),
+                "exempt tool `{}` must not collapse",
+                tool,
+            );
+        }
+    }
+
+    /// Output that fits in `max_lines` returns None (no collapse
+    /// indicator) — no expand footer rendered, and no entry stashed
+    /// for Ctrl+O so the keybind correctly reports "nothing to
+    /// expand" if pressed.
+    #[test]
+    fn render_tool_output_returns_none_when_no_truncation() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let collapsed = render_tool_output(
+            &mut renderer,
+            "list_dir",
+            ".",
+            "1 entries (1 files):\n  [file]  foo.txt",
+            10_000,
+            4,
+        )
+        .expect("render ok");
+        assert!(collapsed.is_none());
     }
 
     /// Self-review bug 1: `apply_patch` arg is `operations`

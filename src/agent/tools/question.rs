@@ -179,18 +179,29 @@ impl Tool for QuestionTool {
         match reply_rx.await {
             Ok(QuestionResponse::Answered(answers)) => {
                 let mut output = String::new();
-                for (i, (item, answer)) in args.questions.iter().zip(answers.iter()).enumerate() {
+                // Audit L13: zip(answers) silently dropped trailing
+                // questions when the UI returned fewer answer arrays
+                // than questions (partial response, plugin override
+                // shape mismatch). Iterate by question index so
+                // every question surfaces; missing answers are
+                // explicitly marked `[no answer]` so the LLM sees
+                // the gap and the user knows what slipped through.
+                for (i, item) in args.questions.iter().enumerate() {
                     if i > 0 {
                         output.push_str("\n\n");
                     }
                     if let Some(header) = &item.header {
                         output.push_str(&format!("## {}\n", header));
                     }
+                    let answer_text = match answers.get(i) {
+                        Some(a) if !a.is_empty() => a.join(", "),
+                        _ => "[no answer]".to_string(),
+                    };
                     output.push_str(&format!(
                         "**Q{}:** {}\n**A:** {}",
                         i + 1,
                         item.question,
-                        answer.join(", ")
+                        answer_text,
                     ));
                 }
                 if output.is_empty() {
