@@ -1845,17 +1845,29 @@ pub async fn run_interactive(
                         // on-tool-end is also fired by HookedToolDyn so the
                         // host doesn't re-dispatch it here.
 
-                        // Permission-deny path: the ALERT handler
-                        // already closed the chamber (and the dim
-                        // `↳ denied: …` trailer printed there). The
-                        // tool still returns an error to the agent
-                        // which surfaces here as a ToolResult — but
-                        // painting chamber rows + a chamber bottom
-                        // now would produce orphan borders for a
-                        // chamber whose top no longer exists. Emit
-                        // a single dim line with the error body
-                        // instead and skip the chamber paint.
-                        if show_details && last_tool_name.is_none() {
+                        // Three states at ToolResult time:
+                        //
+                        //  (a) chamber OPEN, show_details=true  → paint body
+                        //      inside the chamber + close with `╰─╯`.
+                        //  (b) chamber NOT OPEN (deny path closed it via
+                        //      the alert handler), show_details=true →
+                        //      emit a single dim `  ↳ {output}` trailer.
+                        //      The trailer is the only thing pinned to
+                        //      the original tool call now that its
+                        //      chamber is gone.
+                        //  (c) show_details=false → no body, but if the
+                        //      chamber is still open we MUST close it
+                        //      (a bare chamber_bottom) or the next
+                        //      output paints inside a dead chamber.
+                        //
+                        // Gating on `tool_chamber_open` (not
+                        // `last_tool_name`) is deliberate: the name
+                        // slot has unrelated clear sites and can drain
+                        // while the chamber TOP is still on screen —
+                        // that's the whole reason for the dedicated
+                        // chamber-state bool.
+                        if !tool_chamber_open && show_details {
+                            // (b) chamber already closed by deny path.
                             let trimmed = output.trim();
                             if !trimmed.is_empty() {
                                 let first_line = trimmed.lines().next().unwrap_or("");
@@ -1865,7 +1877,16 @@ pub async fn run_interactive(
                                 )?;
                             }
                         }
-                        if show_details && last_tool_name.is_some() {
+                        if tool_chamber_open && !show_details {
+                            // (c) chamber on-screen but body suppressed
+                            // — close with a bare bottom so a stale
+                            // `╭─` doesn't swallow the next paint.
+                            let (frame_w, _) = chamber_widths(&renderer);
+                            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            tool_chamber_open = false;
+                        }
+                        if tool_chamber_open && show_details {
+                            // (a) normal completion path.
                             let is_edit =
                                 last_tool_name.as_deref() == Some("edit") && show_diff;
 
@@ -1962,15 +1983,19 @@ pub async fn run_interactive(
                         was_reasoning = false;
                         // A successful turn must not leave a chamber
                         // half-painted. If anything slipped through
-                        // — e.g. an in-flight Ask that the user
-                        // resolved but the bottom-paint path didn't
-                        // execute — close it now so the next turn
-                        // doesn't start inside a stale chamber.
-                        close_tool_chamber_if_open(
-                            &mut renderer,
-                            &mut last_tool_name,
-                            &mut tool_chamber_open,
-                        )?;
+                        // — show_details=false skipping the body, an
+                        // in-flight Ask the user resolved with a path
+                        // that didn't reach the bottom paint, etc. —
+                        // close with a plain chamber bottom (not the
+                        // `⚠ tool denied · aborted` wording, which
+                        // would mislead the user about an otherwise-
+                        // successful run).
+                        if tool_chamber_open {
+                            let (frame_w, _) = chamber_widths(&renderer);
+                            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            tool_chamber_open = false;
+                        }
+                        last_tool_name = None;
                         renderer.set_avatar_state(avatar::AvatarState::Done);
 
                         #[allow(unused_mut, unused_variables)]
@@ -4126,6 +4151,41 @@ mod tests {
             row.ends_with(" │"),
             "right border missing on truncated wide-char row: {row:?}"
         );
+    }
+
+    /// Regression for the "ALERT renders inside open chamber" report:
+    /// `close_tool_chamber_if_open` must close on EITHER signal —
+    /// the legacy `last_tool_name.is_some()` OR the newer
+    /// `tool_chamber_open` flag. The two state variables can
+    /// disagree because `last_tool_name` is cleared by paths that
+    /// don't paint a chamber bottom (Done, etc.), so a chamber TOP
+    /// can be on-screen while the name slot is None. Without the OR
+    /// gate the alert handler would skip the close and the alert
+    /// would render directly under an unclosed `╭─ TOOL ─` TOP.
+    #[test]
+    fn close_tool_chamber_fires_when_only_flag_is_open() {
+        let mut renderer = Renderer::new().expect("renderer");
+        // Pretend a chamber was painted but `last_tool_name` was
+        // drained by an unrelated clear site — exactly the bug
+        // shape from the user's screenshot.
+        let mut name: Option<String> = None;
+        let mut open = true;
+        close_tool_chamber_if_open(&mut renderer, &mut name, &mut open).unwrap();
+        assert!(!open, "flag must be cleared by the close");
+        assert!(name.is_none(), "name stays cleared after the close");
+        // Symmetric case: flag false, name Some → also closes
+        // (legacy behavior preserved).
+        let mut name: Option<String> = Some("read".to_string());
+        let mut open = false;
+        close_tool_chamber_if_open(&mut renderer, &mut name, &mut open).unwrap();
+        assert!(name.is_none(), "name cleared on legacy-signal close");
+        assert!(!open, "flag stays cleared");
+        // Both false → no-op (idempotent).
+        let mut name: Option<String> = None;
+        let mut open = false;
+        close_tool_chamber_if_open(&mut renderer, &mut name, &mut open).unwrap();
+        assert!(name.is_none());
+        assert!(!open);
     }
 
     /// Self-review bug 1: `apply_patch` arg is `operations`
