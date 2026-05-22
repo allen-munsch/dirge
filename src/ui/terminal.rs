@@ -92,6 +92,27 @@ impl Drop for TerminalGuard {
         let _ = stdout.flush();
         // Drain pass 2: catches responses to LeaveAlternateScreen.
         drain_events(Duration::from_millis(100));
+
+        // Pass 3 — direct stdin sweep. Crossterm's event::poll/read
+        // only parses bytes it can convert into known Event variants
+        // (keys, mouse, paste, resize). Unrecognized escape sequences
+        // — OSC 11 bg-color responses (`\x1b]11;rgb:…`), primary DA
+        // (`\x1b[?64;…c`), cursor-position reports (`\x1b[…R`) — are
+        // NOT crossterm events and stay sitting in the OS stdin
+        // buffer after event::read() returns. If we disable raw
+        // mode with those bytes still in the buffer, the shell
+        // inherits them and the kernel's TTY line discipline echoes
+        // the unprintable-escape payload to the user's prompt.
+        //
+        // The previous fix (4ebcc66) kept raw mode on past
+        // LeaveAlternateScreen so timing was right, but it relied
+        // on crossterm to consume the bytes — which it doesn't for
+        // these specific sequences. Issue a single libc::read on
+        // stdin in non-blocking mode to physically drain the buffer
+        // regardless of crossterm's parsing.
+        #[cfg(unix)]
+        drain_raw_stdin(Duration::from_millis(80));
+
         // Raw mode last — by now everything the terminal would
         // unsolicit has been parsed and discarded.
         let _ = terminal::disable_raw_mode();
@@ -119,6 +140,82 @@ impl Drop for TerminalGuard {
 /// bg-color, primary DA) sneak through after we tear down raw mode.
 /// Honoring the full budget on the first quiet poll costs at most
 /// the remaining time; that's fine for a shutdown path.
+/// Physically drain stdin via direct `libc::read` while in raw mode,
+/// discarding any bytes (whether or not crossterm understood them).
+/// The crossterm event drain only consumes parseable Events; OSC 11
+/// background-color responses, primary DA, and cursor-position
+/// reports are unrecognized escape sequences that crossterm leaves
+/// in the OS stdin buffer. If those bytes are still there when raw
+/// mode flips off, the shell inherits them and the kernel echoes
+/// the payload to the user's prompt.
+///
+/// Implementation:
+///   - fd 0 (stdin) flipped to O_NONBLOCK via fcntl
+///   - loop: read into a buffer; EWOULDBLOCK = empty, count silently
+///   - poll for new arrivals every ~5ms until the budget expires
+///     OR two consecutive empty reads (terminal quiesced)
+///   - restore the original flags
+///
+/// Errors are swallowed. The process is exiting; we just want
+/// best-effort silence on the shell after we leave.
+#[cfg(unix)]
+fn drain_raw_stdin(budget: Duration) {
+    let fd = 0; // stdin
+    // Save original flags so we can restore on exit.
+    let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if original_flags < 0 {
+        return;
+    }
+    // Set non-blocking.
+    let nb_flags = original_flags | libc::O_NONBLOCK;
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, nb_flags) } < 0 {
+        return;
+    }
+
+    let deadline = std::time::Instant::now() + budget;
+    let mut buf = [0u8; 1024];
+    let mut empty_polls = 0;
+    while std::time::Instant::now() < deadline {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n > 0 {
+            // Discarded `n` bytes of terminal telemetry — typically
+            // OSC 11 reply, DA1, CPR. Count toward "saw activity"
+            // for the early-break.
+            empty_polls = 0;
+            continue;
+        }
+        if n == 0 {
+            // EOF on stdin (rare; pty closed). No more drain to do.
+            break;
+        }
+        // n < 0 → errno. EWOULDBLOCK / EAGAIN means "nothing pending
+        // right now"; keep polling until the budget or two
+        // consecutive empties. EINTR retries immediately.
+        let err = std::io::Error::last_os_error().raw_os_error();
+        match err {
+            // EAGAIN and EWOULDBLOCK are the same value on macOS /
+            // glibc Linux, so match only EAGAIN. EWOULDBLOCK
+            // pattern is technically redundant on POSIX but the
+            // earlier draft listed both for clarity.
+            Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
+                empty_polls += 1;
+                if empty_polls >= 2 {
+                    break;
+                }
+                // Short sleep so we don't busy-spin while waiting
+                // for the next round-trip from a slow terminal.
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Some(libc::EINTR) => continue,
+            _ => break,
+        }
+    }
+
+    // Restore blocking mode so subsequent stdin readers (the shell)
+    // see normal semantics.
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) };
+}
+
 fn drain_events(budget: Duration) {
     let deadline = std::time::Instant::now() + budget;
     let mut first = true;
