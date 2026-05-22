@@ -73,12 +73,40 @@ impl RubyAdapter {
     }
 
     /// Walk the body of a class/module and emit Method symbols
-    /// anchored to `parent`.
+    /// anchored to `parent`. Tracks visibility state across the
+    /// walk: a bare `private` / `protected` / `public` statement
+    /// flips the visibility for subsequent `def`s in this scope,
+    /// matching Ruby semantics (audit L4 — every method was
+    /// silently emitted as `is_exported: true` regardless).
     fn walk_class_body(&self, n: Node, s: &[u8], symbols: &mut Vec<Symbol>, parent: &str) {
+        // Current visibility for the next method. `true` = public,
+        // `false` = non-public (private OR protected — we collapse
+        // both to "not exported" because dirge's Symbol shape only
+        // has a binary is_exported flag).
+        let mut visibility_public = true;
         // The body is `body_statement`; iterate its named children
         // and pick up `method` and `singleton_method` (class methods).
         for i in 0..n.named_child_count() {
             let Some(c) = n.named_child(i) else { continue };
+            // Detect visibility-toggle statements before per-kind
+            // handling. tree-sitter-ruby parses a bare `private` as
+            // an `identifier` node; `private :foo` and `private def`
+            // are `call` nodes — we ignore those (they only toggle
+            // the named target, not subsequent defs).
+            if c.kind() == "identifier" {
+                let txt = self.text(c, s);
+                match txt {
+                    "public" => {
+                        visibility_public = true;
+                        continue;
+                    }
+                    "private" | "protected" => {
+                        visibility_public = false;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             match c.kind() {
                 "method" => {
                     if let Some(name) = self.method_name(c, s) {
@@ -87,7 +115,7 @@ impl RubyAdapter {
                             name,
                             range: self.range(c),
                             signature: self.signature(c, s),
-                            is_exported: true,
+                            is_exported: visibility_public,
                             parent_class: Some(parent.to_string()),
                         });
                     }
@@ -110,6 +138,11 @@ impl RubyAdapter {
                             name,
                             range: self.range(c),
                             signature: self.signature(c, s),
+                            // Class methods (`def self.foo`) don't
+                            // participate in instance-method
+                            // private/protected visibility — they're
+                            // always public unless declared via
+                            // `private_class_method`. Keep as public.
                             is_exported: true,
                             parent_class: Some(parent.to_string()),
                         });

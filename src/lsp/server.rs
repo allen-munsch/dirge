@@ -149,6 +149,61 @@ fn clojure_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
     )
 }
 
+fn go_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    nearest_root(file, stop_at, &["go.mod", "go.work"], &[])
+}
+
+fn java_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    nearest_root(
+        file,
+        stop_at,
+        &[
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+        ],
+        &[],
+    )
+}
+
+fn cfamily_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    // clangd: compile_commands.json is the canonical marker, with
+    // CMakeLists.txt / Makefile as fallbacks. .clangd config file
+    // also pins a root if present.
+    nearest_root(
+        file,
+        stop_at,
+        &[
+            "compile_commands.json",
+            ".clangd",
+            "CMakeLists.txt",
+            "Makefile",
+            "meson.build",
+        ],
+        &[],
+    )
+}
+
+fn ruby_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    nearest_root(
+        file,
+        stop_at,
+        &["Gemfile", "Rakefile", ".rubocop.yml", "config.ru"],
+        &[],
+    )
+}
+
+fn bash_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
+    // bash-language-server doesn't have a project concept; use the
+    // file's parent dir (or `stop_at` if at the boundary). Falling
+    // through to `stop_at` matches what other rootless tools do.
+    file.parent()
+        .map(|p| p.to_path_buf())
+        .or_else(|| Some(stop_at.to_path_buf()))
+}
+
 /// All built-in LSP server descriptors. Order is significant only for tie-
 /// breaking when an extension is claimed by more than one server — earlier
 /// entries are tried first.
@@ -174,6 +229,38 @@ pub fn builtin_servers() -> Vec<ServerInfo> {
             id: "clojure-lsp",
             extensions: owned(&["clj", "cljs", "cljc", "edn", "bb"]),
             root: clojure_root,
+        },
+        // Audit M5: semantic adapters cover 10 languages but only 4
+        // had LSP servers (rust, ts, python, clojure). Added gopls,
+        // jdtls, clangd (c/cpp), ruby-lsp, and bash-language-server
+        // so diagnostics + go-to-def work on edits in those files.
+        // Each entry is best-effort: if the binary isn't on PATH the
+        // spawn errors and the broken-server backoff (10s → 10min)
+        // takes over.
+        ServerInfo {
+            id: "gopls",
+            extensions: owned(&["go"]),
+            root: go_root,
+        },
+        ServerInfo {
+            id: "jdtls",
+            extensions: owned(&["java"]),
+            root: java_root,
+        },
+        ServerInfo {
+            id: "clangd",
+            extensions: owned(&["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "m", "mm"]),
+            root: cfamily_root,
+        },
+        ServerInfo {
+            id: "ruby-lsp",
+            extensions: owned(&["rb", "rake", "gemspec"]),
+            root: ruby_root,
+        },
+        ServerInfo {
+            id: "bash-language-server",
+            extensions: owned(&["sh", "bash"]),
+            root: bash_root,
         },
     ]
 }

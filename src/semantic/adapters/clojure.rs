@@ -156,15 +156,23 @@ impl ClojureAdapter {
                 if let Some(name_node) = forms.get(1)
                     && let Some(name) = self.sym_name(*name_node, source)
                 {
-                    // Dispatch value (forms[2]) is part of the
-                    // signature but not the symbol name.
+                    // Audit L5: the multifn name *is* the symbol name;
+                    // setting `parent_class = Some(name)` was
+                    // self-referential and useless for disambiguation.
+                    // The dispatch value (`forms[2]`) is what makes
+                    // sibling defmethods on the same multifn distinct
+                    // (`(defmethod shape :circle …)` vs
+                    // `(defmethod shape :square …)`), so anchor the
+                    // method to that dispatch value instead. Falls
+                    // back to `None` when forms[2] isn't extractable.
+                    let dispatch_val = forms.get(2).map(|n| self.node_text(*n, source).to_string());
                     symbols.push(Symbol {
                         kind: SymbolKind::Method,
                         name: name.to_string(),
                         range,
                         signature,
                         is_exported: true,
-                        parent_class: Some(name.to_string()),
+                        parent_class: dispatch_val,
                     });
                 }
             }

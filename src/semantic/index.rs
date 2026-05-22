@@ -28,11 +28,6 @@ impl SymbolIndex {
     pub fn ensure_file(&mut self, path: &Path) -> Result<&ExtractedFile, String> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
-        let adapter = self
-            .registry
-            .find_for_file(&canonical)
-            .ok_or_else(|| format!("No language adapter for file: {}", canonical.display()))?;
-
         let mtime = std::fs::metadata(&canonical)
             .ok()
             .and_then(|m| m.modified().ok());
@@ -45,11 +40,24 @@ impl SymbolIndex {
         if needs_refresh {
             let source =
                 std::fs::read_to_string(&canonical).map_err(|e| format!("Read error: {e}"))?;
+            // Audit L3: when picking the adapter for `.h` files,
+            // pass the source content so a C++ header (with `class`,
+            // `namespace`, `template`, etc.) routes to the C++
+            // adapter instead of being parsed as C.
+            let adapter = self
+                .registry
+                .find_for_file_with_content(&canonical, Some(&source))
+                .ok_or_else(|| format!("No language adapter for file: {}", canonical.display()))?;
             let mut extracted = adapter.extract(&canonical, &source)?;
             if let Some(mt) = mtime {
                 extracted.mtime = mt;
             }
             self.cache.insert(canonical.clone(), extracted);
+        } else {
+            // Cache hit — adapter lookup unused, but keep the
+            // existing extension-only path so a registry without
+            // C++ doesn't error on `.h`.
+            let _ = self.registry.find_for_file(&canonical);
         }
 
         self.cache
