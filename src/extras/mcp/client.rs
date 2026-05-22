@@ -168,21 +168,24 @@ fn spawn_stderr_forwarder(server_name: String, stderr: ChildStderr) {
     });
 }
 
-/// Sanitize and emit one MCP child stderr line through tracing.
+/// Sanitize and emit one MCP child stderr line through the UI's
+/// off-stream notification channel.
+///
 /// Filter blocks:
 ///   - C0 controls except `\t` (0x00..=0x1F minus 0x09)
 ///   - DEL (0x7F)
-///   - C1 controls (U+0080..=U+009F) — #1 fix: U+009B is single-byte
-///     CSI on terminals in 8-bit mode and behaves identically to
-///     `ESC[`, so leaving it through defeated the whole point of
-///     filtering ESC. Also blocks NEL (U+0085), DCS (U+0090), etc.
+///   - C1 controls (U+0080..=U+009F) — U+009B is single-byte CSI
+///     on terminals in 8-bit mode and behaves identically to
+///     `ESC[`, so leaving it through would defeat the sanitizer.
+///     Also blocks NEL (U+0085), DCS (U+0090), etc.
 ///   - Trailing `\r` from CRLF children
 ///
-/// Emits at `warn` level instead of `info` (#2 fix): dirge's default
-/// EnvFilter is `warn,rig=off`, so `info!` was silently dropped.
-/// Users with diagnostic needs (MCP server panics, init errors)
-/// would otherwise see nothing — a regression vs the old
-/// `Stdio::inherit()` where stderr printed unconditionally.
+/// Routes through `ui::notifications::notify_mcp_log` rather than
+/// `tracing::warn!` or direct stderr writes — the UI event loop
+/// drains the channel and renders via the standard
+/// `Renderer::write_line` pipeline. Without this, MCP server logs
+/// painted directly on top of the alt-screen UI from raw stderr
+/// (e.g. `[Lattice] session closed` overlapping a chamber).
 fn emit_mcp_line(server_name: &str, raw: &[u8]) {
     let s = String::from_utf8_lossy(raw);
     let sanitized: String = s
@@ -204,7 +207,12 @@ fn emit_mcp_line(server_name: &str, raw: &[u8]) {
             true
         })
         .collect();
-    tracing::warn!(target: "dirge::mcp", server = %server_name, "{}", sanitized);
+    if sanitized.trim().is_empty() {
+        // Don't surface blank lines — children often emit \n
+        // between log groups; we collapse those.
+        return;
+    }
+    crate::ui::notifications::notify_mcp_log(server_name, &sanitized);
 }
 
 fn parse_headers(

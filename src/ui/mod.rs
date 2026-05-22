@@ -3,6 +3,7 @@ mod events;
 mod highlight;
 pub(crate) mod input;
 mod markdown;
+pub(crate) mod notifications;
 pub(crate) mod picker;
 #[cfg(feature = "plugin")]
 mod plugin_tree;
@@ -765,6 +766,13 @@ pub async fn run_interactive(
         ),
         false,
     )?;
+
+    // Install the off-stream notification channel. Producers like
+    // the MCP-server stderr forwarder push lines through this so
+    // they render via the same `Renderer::write_line` pipeline as
+    // agent output — no more raw stderr writes painting over the
+    // alt-screen UI.
+    let mut notify_rx = crate::ui::notifications::install();
 
     let (user_tx, mut user_rx) = mpsc::channel::<UserEvent>(64);
     let user_tx_clone = user_tx.clone();
@@ -3401,6 +3409,57 @@ pub async fn run_interactive(
                     picker.draw(renderer.input_top_row())?;
                 }
             }
+            Some(notif) = async {
+                if let Some(rx) = &mut notify_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                // Off-stream message from a non-agent producer
+                // (MCP server stderr, future plugin warnings,
+                // etc.). Render through the standard pipeline so
+                // it inherits wrap / scroll / theming semantics.
+                use crate::ui::notifications::Notification;
+                close_tool_chamber_if_open(
+                    &mut renderer,
+                    &mut last_tool_name,
+                    &mut tool_chamber_open,
+                )?;
+                match notif {
+                    Notification::McpLog { server, line } => {
+                        renderer.write_line(
+                            &format!("[mcp:{}] {}", server, line),
+                            theme::dim(),
+                        )?;
+                    }
+                    Notification::Info(line) => {
+                        renderer.write_line(&line, c_agent())?;
+                    }
+                    Notification::Warn(line) => {
+                        renderer.write_line(&line, theme::warn())?;
+                    }
+                    Notification::Error(line) => {
+                        renderer.write_line(&line, c_error())?;
+                    }
+                }
+                renderer.render_viewport()?;
+                renderer.draw_bottom(
+                    &input,
+                    &with_queue(
+                        StatusLine::render(
+                            session,
+                            is_running,
+                            0,
+                            loop_label.as_deref(),
+                            context.current_prompt_name.as_deref(),
+                            perm_mode().as_deref(),
+                        ),
+                        interjection_queue.len(),
+                    ),
+                    is_running,
+                )?;
+            }
             Some(lifecycle_evt) = async {
                 if let Some(rx) = &mut lifecycle_rx {
                     rx.recv().await
@@ -4005,8 +4064,26 @@ fn suggest_pattern(tool: &str, input: &str) -> String {
             let first = trimmed.split_whitespace().next().unwrap_or(PLACEHOLDER);
             format!("{}*", first)
         }
-        // Unknown tools (MCP, semantic, etc.) — return placeholder
-        // so the user explicitly edits before allowing.
+        // MCP tools: input has the shape `mcp_tool:<server>:<name>`.
+        // "Allow always" usually means "trust everything from this
+        // server" rather than "trust this exact call", so derive a
+        // wildcarded per-server pattern. Without this, mcp_tool
+        // fell into the catch-all PLACEHOLDER branch and "allow
+        // always" silently degraded to "allow once" — every
+        // subsequent call from the same server re-prompted the
+        // user, with no way to make the allowlist stick.
+        "mcp_tool" => {
+            let mut parts = trimmed.splitn(3, ':');
+            let umbrella = parts.next().unwrap_or("");
+            let server = parts.next().unwrap_or("");
+            if umbrella == "mcp_tool" && !server.is_empty() {
+                format!("mcp_tool:{}:*", server)
+            } else {
+                PLACEHOLDER.to_string()
+            }
+        }
+        // Other unknown tools (semantic, plugin) — return
+        // placeholder so the user explicitly edits before allowing.
         _ => PLACEHOLDER.to_string(),
     }
 }
@@ -5181,6 +5258,47 @@ mod tests {
     fn suggest_pattern_works_for_non_empty_inputs() {
         assert_eq!(suggest_pattern("bash", "cargo test --all"), "cargo *");
         assert_eq!(suggest_pattern("grep", "fn foo bar"), "fn*");
+    }
+
+    /// User-reported bug: `[a] allow always` on an MCP tool call
+    /// silently degraded to `allow once` because the catch-all
+    /// `_ => PLACEHOLDER` branch fired for `mcp_tool`. Result: the
+    /// permission allowlist never got an entry and every
+    /// subsequent call to the same MCP server re-prompted the
+    /// user.
+    #[test]
+    fn suggest_pattern_derives_server_wildcard_for_mcp_tool() {
+        let p = suggest_pattern("mcp_tool", "mcp_tool:lattice:lattice_expand");
+        assert_eq!(p, "mcp_tool:lattice:*");
+        // Multi-segment server names also work.
+        let p = suggest_pattern("mcp_tool", "mcp_tool:my-server:do_thing");
+        assert_eq!(p, "mcp_tool:my-server:*");
+    }
+
+    /// Malformed MCP input (missing colons, wrong umbrella) still
+    /// falls through to the placeholder rather than producing a
+    /// nonsense pattern.
+    #[test]
+    fn suggest_pattern_mcp_tool_malformed_input_uses_placeholder() {
+        assert!(is_placeholder_pattern(&suggest_pattern(
+            "mcp_tool", "garbage"
+        )));
+        assert!(is_placeholder_pattern(&suggest_pattern(
+            "mcp_tool",
+            "mcp_tool:"
+        )));
+        // Note: `"mcp_tool::"` parses with server="" so it
+        // correctly falls into the placeholder branch.
+        assert!(is_placeholder_pattern(&suggest_pattern(
+            "mcp_tool",
+            "mcp_tool::"
+        )));
+        // Note: `wrong_umbrella:lattice:foo` doesn't start with
+        // `mcp_tool:` so the umbrella check refuses.
+        assert!(is_placeholder_pattern(&suggest_pattern(
+            "mcp_tool",
+            "wrong:lattice:foo"
+        )));
     }
 
     // Rewind must sync tree.entries + message_store + leaf_id with
