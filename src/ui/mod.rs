@@ -2373,6 +2373,109 @@ pub async fn run_interactive(
                             is_running = true;
                         }
                     }
+                    AgentEvent::ContextOverflow { prompt, error } => {
+                        // Audit H17: the streaming run hit a context-
+                        // length error. Auto-compact then re-spawn with
+                        // the same prompt against the now-compacted
+                        // history — opencode-style automatic recovery
+                        // (compaction.ts:477-558) instead of leaving the
+                        // user stranded at the error.
+                        was_reasoning = false;
+                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name)?;
+                        let safe = sanitize_output(&error);
+                        renderer.write_line(
+                            &format!("context overflow: {}", safe),
+                            c_error(),
+                        )?;
+                        // Tear down the current runner before respawn.
+                        if let Some(h) = agent_abort.take() {
+                            h.abort();
+                        }
+                        agent_rx = None;
+                        agent_interject = None;
+                        agent_line_started = false;
+                        response_buf.clear();
+                        response_start_line = None;
+
+                        renderer.write_line(
+                            "▒░ auto-compacting then retrying ░▒",
+                            theme::accent(),
+                        )?;
+                        let compress_result = handle_compress(
+                            None,
+                            &mut agent,
+                            &client,
+                            &mut renderer,
+                            session,
+                            cli,
+                            cfg,
+                            context,
+                            &permission,
+                            &ask_tx,
+                            &bg_store,
+                            &sandbox,
+                            #[cfg(feature = "mcp")]
+                            mcp_manager,
+                            #[cfg(feature = "semantic")]
+                            semantic_manager,
+                        )
+                        .await;
+
+                        match compress_result {
+                            Ok(()) => {
+                                // Build history from the compacted session.
+                                // Drop the trailing User message because
+                                // it's the prompt we're about to resubmit
+                                // — otherwise rig would receive it twice.
+                                let mut history = crate::agent::runner::convert_history(session);
+                                if let Some(last) = history.last()
+                                    && matches!(last, rig::completion::Message::User { .. })
+                                {
+                                    history.pop();
+                                }
+                                let prompt_owned = prompt.to_string();
+                                let prepared_prompt =
+                                    crate::agent::tools::background::prepend_pending_notifications(
+                                        &prompt_owned,
+                                        bg_store.as_ref(),
+                                    );
+                                let runner =
+                                    agent.clone().spawn_runner(prepared_prompt, history);
+                                agent_rx = Some(runner.event_rx);
+                                agent_abort = Some(runner.task);
+                                agent_interject = Some(runner.interject_tx);
+                                is_running = true;
+                                renderer.write_line(
+                                    "  ↳ resumed run with compacted history",
+                                    theme::dim(),
+                                )?;
+                            }
+                            Err(ce) => {
+                                renderer.write_line(
+                                    &format!(
+                                        "auto-compact failed ({}); leaving session as-is. Try /compress manually or /clear.",
+                                        ce
+                                    ),
+                                    c_error(),
+                                )?;
+                                is_running = false;
+                                // Drop queued interjections — they assumed
+                                // the failed turn would succeed.
+                                let dropped = interjection_queue.len();
+                                interjection_queue.clear();
+                                if dropped > 0 {
+                                    renderer.write_line(
+                                        &format!(
+                                            "{} queued message{} dropped due to compact failure",
+                                            dropped,
+                                            if dropped == 1 { "" } else { "s" }
+                                        ),
+                                        c_error(),
+                                    )?;
+                                }
+                            }
+                        }
+                    }
                     AgentEvent::Error(e) => {
                         was_reasoning = false;
                         renderer.set_avatar_state(avatar::AvatarState::Error);
@@ -2739,23 +2842,36 @@ pub async fn run_interactive(
                 // enqueued and auto-deny each. New requests that
                 // arrive after this drain still go through the
                 // normal alert flow on the next iteration.
-                if was_denied
-                    && let Some(rx) = ask_rx.as_mut()
-                {
-                    let mut cascaded = 0usize;
-                    while let Ok(stale) = rx.try_recv() {
-                        let _ = stale.reply.send(UserDecision::Deny);
-                        cascaded += 1;
+                if was_denied {
+                    if let Some(rx) = ask_rx.as_mut() {
+                        let mut cascaded = 0usize;
+                        while let Ok(stale) = rx.try_recv() {
+                            let _ = stale.reply.send(UserDecision::Deny);
+                            cascaded += 1;
+                        }
+                        if cascaded > 0 {
+                            renderer.write_line(
+                                &format!(
+                                    "  ↳ also denied {} queued tool request{}",
+                                    cascaded,
+                                    if cascaded == 1 { "" } else { "s" },
+                                ),
+                                theme::dim(),
+                            )?;
+                        }
                     }
-                    if cascaded > 0 {
-                        renderer.write_line(
-                            &format!(
-                                "  ↳ also denied {} queued tool request{}",
-                                cascaded,
-                                if cascaded == 1 { "" } else { "s" },
-                            ),
-                            theme::dim(),
-                        )?;
+                    // Audit H10 (extended): the drain above only
+                    // covers requests already in `ask_rx` at this
+                    // moment. The agent may still emit MORE tool
+                    // calls in the current run — without an
+                    // interject signal, the user would keep seeing
+                    // fresh permission dialogs for the same denied
+                    // intent. Send an interject so the runner halts
+                    // at the next tool-result boundary; the partial
+                    // response is preserved via the Interjected
+                    // event. try_send so a full channel is a no-op.
+                    if let Some(tx) = agent_interject.as_ref() {
+                        let _ = tx.try_send(());
                     }
                 }
 

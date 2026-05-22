@@ -82,10 +82,10 @@ impl Tool for FindCallersTool {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
         let results = {
-            let mut idx = self
+            let idx = self
                 .index
-                .write()
-                .map_err(|e| ToolError::Msg(format!("Index lock error: {e}")))?;
+                .read()
+                .map_err(|e| ToolError::Msg(format!("Index read-lock error: {e}")))?;
             idx.ensure_all(&search_path, None)
                 .map_err(|e| ToolError::Msg(e))?;
             idx.find_callers(&args.name, &search_path)

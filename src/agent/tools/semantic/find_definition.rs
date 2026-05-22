@@ -67,10 +67,10 @@ impl Tool for FindDefinitionTool {
         .await?;
 
         let results = {
-            let mut idx = self
+            let idx = self
                 .index
-                .write()
-                .map_err(|e| ToolError::Msg(format!("Index lock error: {e}")))?;
+                .read()
+                .map_err(|e| ToolError::Msg(format!("Index read-lock error: {e}")))?;
             idx.ensure_all(
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 None,

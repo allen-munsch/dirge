@@ -76,10 +76,10 @@ impl Tool for GetSymbolBodyTool {
         let file_path = PathBuf::from(&args.path);
 
         let body = {
-            let mut idx = self
+            let idx = self
                 .index
-                .write()
-                .map_err(|e| ToolError::Msg(format!("Index lock error: {e}")))?;
+                .read()
+                .map_err(|e| ToolError::Msg(format!("Index read-lock error: {e}")))?;
             idx.get_symbol_body(&file_path, &args.name)
                 .map_err(|e| ToolError::Msg(e))?
         };

@@ -1,6 +1,6 @@
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 
@@ -21,18 +21,34 @@ type FileCache = IndexMap<PathBuf, ExtractedFile>;
 
 pub struct SymbolIndex {
     registry: Arc<AdapterRegistry>,
-    cache: FileCache,
+    /// Interior mutability so every public method can take `&self`.
+    /// Audit M13: the tools wrapping `Arc<RwLock<SymbolIndex>>` used
+    /// to grab `.write()` even for pure read paths because `&mut self`
+    /// methods needed exclusive access to the cache. Moving the
+    /// mutation inside a `Mutex<FileCache>` lets the outer `RwLock`
+    /// stay in read mode so concurrent semantic tool invocations on
+    /// the same index don't serialize.
+    cache: Mutex<FileCache>,
 }
 
 impl SymbolIndex {
     pub fn new(registry: Arc<AdapterRegistry>) -> Self {
         Self {
             registry,
-            cache: IndexMap::new(),
+            cache: Mutex::new(IndexMap::new()),
         }
     }
 
-    pub fn ensure_file(&mut self, path: &Path) -> Result<&ExtractedFile, String> {
+    fn cache_lock(&self) -> std::sync::MutexGuard<'_, FileCache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Populate or refresh the cache entry for `path` and return a
+    /// CLONE of the extracted file. The clone is mandatory because
+    /// the returned data outlives the `Mutex<FileCache>` lock.
+    /// Per-file extracts are small (dozens of symbols), so the
+    /// clone cost is dwarfed by the saved write-lock contention.
+    pub fn ensure_file(&self, path: &Path) -> Result<ExtractedFile, String> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
         let meta = std::fs::metadata(&canonical).ok();
@@ -45,64 +61,58 @@ impl SymbolIndex {
         // stale extracts. Combine mtime + size; size catches almost
         // every real edit (anything but a same-size in-place patch)
         // without the cost of hashing the file content.
-        let needs_refresh = match self.cache.get(&canonical) {
-            Some(entry) => {
-                let mtime_changed = mtime.map_or(true, |mt| mt != entry.mtime);
-                let size_changed = size.map_or(true, |sz| sz != entry.size);
-                mtime_changed || size_changed
-            }
-            None => true,
-        };
-
-        if needs_refresh {
-            let source =
-                std::fs::read_to_string(&canonical).map_err(|e| format!("Read error: {e}"))?;
-            // Audit L3: when picking the adapter for `.h` files,
-            // pass the source content so a C++ header (with `class`,
-            // `namespace`, `template`, etc.) routes to the C++
-            // adapter instead of being parsed as C.
-            let adapter = self
-                .registry
-                .find_for_file_with_content(&canonical, Some(&source))
-                .ok_or_else(|| format!("No language adapter for file: {}", canonical.display()))?;
-            let mut extracted = adapter.extract(&canonical, &source)?;
-            if let Some(mt) = mtime {
-                extracted.mtime = mt;
-            }
-            if let Some(sz) = size {
-                extracted.size = sz;
-            }
-            // Audit L14: LRU-evict the oldest entry before insert if
-            // we're at the cap. Only fires when the path isn't
-            // already in the cache (an in-place refresh keeps the
-            // existing slot and bumps it to most-recent below).
-            if !self.cache.contains_key(&canonical) && self.cache.len() >= MAX_INDEX_FILES {
-                self.cache.shift_remove_index(0);
-            }
-            self.cache.insert(canonical.clone(), extracted);
-            // Move the just-touched entry to the most-recent end so
-            // it survives the next eviction. `IndexMap::move_index`
-            // is O(N) worst case but the cache is bounded by
-            // MAX_INDEX_FILES, so this stays fast.
-            if let Some((idx, _, _)) = self.cache.get_full(&canonical) {
-                let last = self.cache.len().saturating_sub(1);
-                if idx != last {
-                    self.cache.move_index(idx, last);
+        // Fast-path: check cache freshness under a brief lock.
+        {
+            let cache = self.cache_lock();
+            if let Some(entry) = cache.get(&canonical) {
+                let mtime_unchanged = mtime.map_or(false, |mt| mt == entry.mtime);
+                let size_unchanged = size.map_or(false, |sz| sz == entry.size);
+                if mtime_unchanged && size_unchanged {
+                    return Ok(entry.clone());
                 }
             }
-        } else {
-            // Cache hit — adapter lookup unused, but keep the
-            // existing extension-only path so a registry without
-            // C++ doesn't error on `.h`.
-            let _ = self.registry.find_for_file(&canonical);
         }
 
-        self.cache
-            .get(&canonical)
-            .ok_or_else(|| "Cache miss after insert".to_string())
+        // Cache miss / stale — extract outside the lock so other
+        // threads can keep reading other files concurrently.
+        let source = std::fs::read_to_string(&canonical).map_err(|e| format!("Read error: {e}"))?;
+        // Audit L3: when picking the adapter for `.h` files, pass
+        // the source content so a C++ header (with `class`,
+        // `namespace`, `template`, etc.) routes to the C++ adapter
+        // instead of being parsed as C.
+        let adapter = self
+            .registry
+            .find_for_file_with_content(&canonical, Some(&source))
+            .ok_or_else(|| format!("No language adapter for file: {}", canonical.display()))?;
+        let mut extracted = adapter.extract(&canonical, &source)?;
+        if let Some(mt) = mtime {
+            extracted.mtime = mt;
+        }
+        if let Some(sz) = size {
+            extracted.size = sz;
+        }
+
+        let mut cache = self.cache_lock();
+        // Audit L14: LRU-evict the oldest entry before insert if
+        // we're at the cap. Only fires when the path isn't
+        // already in the cache (an in-place refresh keeps the
+        // existing slot and bumps it to most-recent below).
+        if !cache.contains_key(&canonical) && cache.len() >= MAX_INDEX_FILES {
+            cache.shift_remove_index(0);
+        }
+        cache.insert(canonical.clone(), extracted.clone());
+        // Move the just-touched entry to the most-recent end so it
+        // survives the next eviction.
+        if let Some((idx, _, _)) = cache.get_full(&canonical) {
+            let last = cache.len().saturating_sub(1);
+            if idx != last {
+                cache.move_index(idx, last);
+            }
+        }
+        Ok(extracted)
     }
 
-    pub fn ensure_all(&mut self, root: &Path, include: Option<&str>) -> Result<usize, String> {
+    pub fn ensure_all(&self, root: &Path, include: Option<&str>) -> Result<usize, String> {
         let mut count = 0;
         let extensions = self.registry.all_extensions();
 
@@ -165,17 +175,18 @@ impl SymbolIndex {
         Ok(count)
     }
 
-    pub fn find_definition(&mut self, name: &str) -> Result<Vec<(PathBuf, Symbol)>, String> {
+    pub fn find_definition(&self, name: &str) -> Result<Vec<(PathBuf, Symbol)>, String> {
         let mut results = Vec::new();
 
-        if self.cache.is_empty() {
+        let is_empty = self.cache_lock().is_empty();
+        if is_empty {
             self.ensure_all(
                 &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                 None,
             )?;
         }
 
-        let file_paths: Vec<PathBuf> = self.cache.keys().cloned().collect();
+        let file_paths: Vec<PathBuf> = self.cache_lock().keys().cloned().collect();
         for path in file_paths {
             let Ok(entry) = self.ensure_file(&path) else {
                 continue;
@@ -190,7 +201,7 @@ impl SymbolIndex {
         Ok(results)
     }
 
-    pub fn find_callers(&mut self, name: &str, root: &Path) -> Result<Vec<String>, String> {
+    pub fn find_callers(&self, name: &str, root: &Path) -> Result<Vec<String>, String> {
         let mut results = Vec::new();
 
         let extensions = self.registry.all_extensions();
@@ -281,7 +292,7 @@ impl SymbolIndex {
         Ok(results)
     }
 
-    pub fn find_callees(&mut self, file_path: &Path, name: &str) -> Result<Vec<String>, String> {
+    pub fn find_callees(&self, file_path: &Path, name: &str) -> Result<Vec<String>, String> {
         let entry = self.ensure_file(file_path)?;
 
         let matches: Vec<&Symbol> = entry.symbols.iter().filter(|s| s.name == name).collect();
@@ -336,7 +347,7 @@ impl SymbolIndex {
         adapter.find_callees_in_range(&source, file_path, range)
     }
 
-    pub fn get_symbol_body(&mut self, file_path: &Path, name: &str) -> Result<String, String> {
+    pub fn get_symbol_body(&self, file_path: &Path, name: &str) -> Result<String, String> {
         let entry = self.ensure_file(file_path)?;
 
         let symbol = entry
@@ -360,7 +371,7 @@ impl SymbolIndex {
     }
 
     pub fn list_symbols(
-        &mut self,
+        &self,
         file_path: Option<&Path>,
         kind_filter: Option<SymbolKind>,
     ) -> Result<Vec<(PathBuf, Vec<Symbol>)>, String> {
@@ -376,13 +387,14 @@ impl SymbolIndex {
                 .collect();
             result.push((entry.file_path.clone(), symbols));
         } else {
-            if self.cache.is_empty() {
+            let is_empty = self.cache_lock().is_empty();
+            if is_empty {
                 self.ensure_all(
                     &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
                     None,
                 )?;
             }
-            let file_paths: Vec<PathBuf> = self.cache.keys().cloned().collect();
+            let file_paths: Vec<PathBuf> = self.cache_lock().keys().cloned().collect();
             for path in file_paths {
                 let Ok(entry) = self.ensure_file(&path) else {
                     continue;

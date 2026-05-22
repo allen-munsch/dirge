@@ -226,9 +226,34 @@ impl Tool for GrepTool {
 
                     match_count += match_lines.len();
 
+                    // Audit M7b: per-line cap. A minified JS / generated
+                    // SQL / single-line JSON file can produce a match
+                    // on a 10 MB line; pushing that into the output
+                    // verbatim ships 10 MB through the LLM context.
+                    // Truncate each output line to MAX_LINE_BYTES with
+                    // a `…[truncated]` marker. Boundary-safe (lands on
+                    // a UTF-8 char boundary).
+                    const MAX_LINE_BYTES: usize = 4096;
+                    const TRUNC_MARKER: &str = "…[truncated]";
+                    let trim_line = |s: &str| -> String {
+                        if s.len() <= MAX_LINE_BYTES {
+                            return s.to_string();
+                        }
+                        let mut cut = MAX_LINE_BYTES;
+                        while cut > 0 && !s.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        format!("{}{}", &s[..cut], TRUNC_MARKER)
+                    };
+
                     if context == 0 {
                         for &ml in &match_lines {
-                            all_results.push(format!("{}:{}:{}", path_str, ml + 1, lines[ml]));
+                            all_results.push(format!(
+                                "{}:{}:{}",
+                                path_str,
+                                ml + 1,
+                                trim_line(&lines[ml])
+                            ));
                             if all_results.len() >= MAX_GREP_RESULTS {
                                 break;
                             }
@@ -262,7 +287,7 @@ impl Tool for GrepTool {
                                     path_str,
                                     i + 1,
                                     sep,
-                                    lines[i]
+                                    trim_line(&lines[i]),
                                 ));
                                 i += 1;
                             }
