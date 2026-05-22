@@ -316,12 +316,15 @@ impl PermissionChecker {
             SecurityMode::Yolo => unreachable!(),
         };
 
-        let action =
-            if matched.is_empty() && action == Action::Allow && is_external && ext_dir_action.is_none() {
-                Action::Ask
-            } else {
-                action
-            };
+        let action = if matched.is_empty()
+            && action == Action::Allow
+            && is_external
+            && ext_dir_action.is_none()
+        {
+            Action::Ask
+        } else {
+            action
+        };
 
         if action != Action::Deny {
             self.track_doom_loop(tool, path);

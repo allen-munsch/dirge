@@ -89,15 +89,28 @@ pub fn apply_tree_op(op: TreeOp, session: &mut Session, input: &mut InputEditor)
             // can still recover it via `/sessions`. Failures here are
             // logged but don't block the reset — getting wedged on disk
             // I/O would be worse than losing a session.
+            //
+            // Audit L15: previously a `let _ =` swallowed save errors
+            // silently. On disk-full / permission errors the user lost
+            // the previous session with no warning. Now we include
+            // the save failure in the effect message so the user sees
+            // it before the destructive reset takes effect.
             let prev_id = session.id.to_string();
             let parent_id = parent.as_deref().unwrap_or(&prev_id);
-            let _ = crate::session::storage::save_session(session);
+            let save_err = crate::session::storage::save_session(session).err();
             session.reset_to_new(Some(parent_id));
             input.set_text("");
-            TreeOpEffect::SessionReplaced(format!(
+            let mut msg = format!(
                 "[plugin] new session started (parent: {})",
                 short(parent_id),
-            ))
+            );
+            if let Some(e) = save_err {
+                msg.push_str(&format!(
+                    "\n  warning: previous session save failed ({}); previous state may not be recoverable",
+                    e,
+                ));
+            }
+            TreeOpEffect::SessionReplaced(msg)
         }
         TreeOp::SwitchSession { id_prefix } => {
             match crate::session::storage::find_sessions_by_prefix(&id_prefix) {
@@ -107,15 +120,20 @@ pub fn apply_tree_op(op: TreeOp, session: &mut Session, input: &mut InputEditor)
                         id_prefix
                     )),
                     1 => {
-                        let _ = crate::session::storage::save_session(session);
+                        let save_err = crate::session::storage::save_session(session).err();
                         let loaded = matches.into_iter().next().expect("len == 1");
                         let new_id = loaded.id.clone();
                         *session = loaded;
                         input.set_text("");
-                        TreeOpEffect::SessionReplaced(format!(
-                            "[plugin] switched to session {}",
-                            short(new_id.as_str()),
-                        ))
+                        let mut msg =
+                            format!("[plugin] switched to session {}", short(new_id.as_str()),);
+                        if let Some(e) = save_err {
+                            msg.push_str(&format!(
+                                "\n  warning: previous session save failed ({}); previous state may not be recoverable",
+                                e,
+                            ));
+                        }
+                        TreeOpEffect::SessionReplaced(msg)
                     }
                     n => {
                         // Surface the first few matches so the plugin

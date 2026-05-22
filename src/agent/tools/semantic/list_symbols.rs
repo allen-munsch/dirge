@@ -87,10 +87,10 @@ impl Tool for ListSymbolsTool {
         let file_path = args.path.as_deref().map(PathBuf::from);
 
         let results = {
-            let mut idx = self
+            let idx = self
                 .index
-                .write()
-                .map_err(|e| ToolError::Msg(format!("Index lock error: {e}")))?;
+                .read()
+                .map_err(|e| ToolError::Msg(format!("Index read-lock error: {e}")))?;
 
             if let Some(ref fp) = file_path {
                 idx.ensure_file(fp).map_err(ToolError::Msg)?;

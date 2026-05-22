@@ -238,13 +238,34 @@ impl Tool for WebFetchTool {
             return Err(ToolError::Msg("maximum 10 URLs per call".to_string()));
         }
 
-        check_perm(
-            &self.permission,
-            &self.ask_tx,
-            "webfetch",
-            &format!("fetch {} urls", args.urls.len()),
-        )
-        .await?;
+        // Audit L12: previously this displayed only the URL count to
+        // the user's permission prompt; for a single-URL fetch the
+        // user had no idea which host was being contacted. Include
+        // each host inline when there are 3 or fewer; for more, just
+        // the count (full list would crowd the alert).
+        let perm_summary = if args.urls.len() <= 3 {
+            let hosts: Vec<&str> = args
+                .urls
+                .iter()
+                .map(|u| {
+                    u.split("://")
+                        .nth(1)
+                        .unwrap_or(u)
+                        .split('/')
+                        .next()
+                        .unwrap_or(u)
+                })
+                .collect();
+            format!(
+                "fetch {} url{} ({})",
+                args.urls.len(),
+                if args.urls.len() == 1 { "" } else { "s" },
+                hosts.join(", "),
+            )
+        } else {
+            format!("fetch {} urls", args.urls.len())
+        };
+        check_perm(&self.permission, &self.ask_tx, "webfetch", &perm_summary).await?;
 
         let client = reqwest::Client::builder()
             .user_agent("dirge/1.0")

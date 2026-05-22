@@ -218,7 +218,13 @@ impl Tool for ReadTool {
         }
         {
             let mut sniffer = tokio::fs::File::open(&resolved_path).await?;
-            let mut sample = vec![0u8; 4096];
+            // Audit L17: don't always allocate 4 KiB. For a tiny file
+            // (e.g. 100-byte config), a 4 KiB zeroed buffer plus
+            // the partial read was wasteful; for hot reads across
+            // thousands of small files it added up. Size the sample
+            // to `min(file_size, 4096)`.
+            let sample_size = (file_size as usize).min(4096);
+            let mut sample = vec![0u8; sample_size];
             let n = sniffer.read(&mut sample).await?;
             sample.truncate(n);
             if is_binary_content(&sample) {
@@ -236,6 +242,17 @@ impl Tool for ReadTool {
         let mut excerpt_lines: Vec<(usize, String)> = Vec::with_capacity(limit);
         let want_end = offset.saturating_add(limit);
         let mut first_line = true;
+        // Audit L11: bail out once we've satisfied the requested
+        // range plus a tiny buffer for the header's `total_lines`.
+        // For a 1GB log with offset=0, limit=100, the previous code
+        // read all 1GB just to populate `total_lines` for the
+        // header. Cap the lookahead at LOOKAHEAD_PAST_WANT_END
+        // lines past the range so the header gets a real count for
+        // most real-world reads, and switch to an `≥N` marker when
+        // we hit the cap.
+        const LOOKAHEAD_PAST_WANT_END: usize = 1024;
+        let lookahead_stop = want_end.saturating_add(LOOKAHEAD_PAST_WANT_END);
+        let mut total_lines_is_lower_bound = false;
         while let Some(line) = lines.next_line().await.transpose() {
             let mut line = line?;
             // F19: strip UTF-8 BOM from the FIRST line only. Old
@@ -267,6 +284,10 @@ impl Tool for ReadTool {
             }
             // Past the requested range — keep counting to compute
             // `total_lines` for the header, but skip allocation.
+            if total_lines >= lookahead_stop {
+                total_lines_is_lower_bound = true;
+                break;
+            }
         }
 
         let end = (offset + limit).min(total_lines);
@@ -288,18 +309,27 @@ impl Tool for ReadTool {
         // - offset past EOF (`offset >= total_lines`): no lines
         //   match; report that explicitly instead of showing the
         //   backwards `X-(X-1)` range.
+        // Format the total-lines value as `≥N` when we stopped
+        // counting at the lookahead cap (audit L11). The LLM treats
+        // this as a lower bound and the user-facing chamber shows
+        // the same hint.
+        let total_label: String = if total_lines_is_lower_bound {
+            format!("≥{}", total_lines)
+        } else {
+            total_lines.to_string()
+        };
         let info = if total_lines == 0 {
             "(empty file)\n".to_string()
         } else if offset >= total_lines {
             format!(
                 "({} lines total; offset {} is past end of file — nothing to show)\n",
-                total_lines,
+                total_label,
                 offset + 1,
             )
         } else {
             format!(
                 "({} lines total, showing lines {}-{})\n\n{}",
-                total_lines,
+                total_label,
                 offset + 1,
                 end,
                 excerpt
@@ -444,11 +474,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let out = result.expect("read of medium file must succeed");
-        // Header reports total_lines as the real count, not capped.
+        // Header reports total_lines as a lower-bound (≥N) when the
+        // file is much longer than offset+limit+lookahead — audit L11
+        // caps scanning to avoid reading 1GB just to populate the
+        // total. For this 10k-line file with limit=5, lookahead=1024
+        // makes the reported count ≥1029. Accept both the exact form
+        // (small files where the whole was scanned) and the
+        // lower-bound form (large files).
+        let header = out.lines().next().unwrap_or("");
         assert!(
-            out.contains("10000 lines total") || out.contains("10001 lines total"),
-            "expected ~10000 line total in header; got: {}",
-            out.lines().next().unwrap_or(""),
+            header.contains("10000 lines total")
+                || header.contains("10001 lines total")
+                || header.contains("≥"),
+            "expected total line count or lower-bound marker in header; got: {}",
+            header,
         );
         // Only the first 5 are in the excerpt.
         let body_lines: Vec<&str> = out.lines().skip(2).collect();

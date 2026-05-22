@@ -465,13 +465,21 @@ where
                 break;
             }
 
-            // Context-length errors aren't retryable without
-            // compaction — the friendly formatter already points the
-            // user at /compress.
+            // Context-length errors aren't retryable in-place — the
+            // history grew past the model's window. Audit H17:
+            // instead of surfacing as a hard `Error`, emit a
+            // distinct `ContextOverflow` carrying the prompt we
+            // were trying to send. The UI handles this by running
+            // `/compress` and respawning a fresh runner with the
+            // same prompt against the now-compacted history,
+            // turning a manual workflow into automatic recovery.
             if kind == ErrorKind::ContextLength {
                 let friendly = recovery::user_facing_error(&msg, attempts + 1);
                 let _ = event_tx
-                    .send(AgentEvent::Error(CompactString::new(friendly)))
+                    .send(AgentEvent::ContextOverflow {
+                        prompt: CompactString::from(prompt.as_str()),
+                        error: CompactString::new(friendly),
+                    })
                     .await;
                 break;
             }
@@ -596,9 +604,9 @@ where
                 }
             };
             match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::Text(text),
-                )) => {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                    text,
+                ))) => {
                     full_response.push_str(&text.text);
                     print!("{}", text.text);
                     let _ = std::io::Write::flush(&mut std::io::stdout());

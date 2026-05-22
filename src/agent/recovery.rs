@@ -194,12 +194,24 @@ fn parse_http_date_retry_after(msg: &str) -> Option<Duration> {
 }
 
 fn pseudo_random(salt: u64) -> u64 {
+    // Audit L16: two callers that hit `pseudo_random` in the same
+    // `subsec_nanos()` slot with the same `salt` (`attempts`)
+    // previously produced identical jitter, defeating the
+    // anti-thundering-herd purpose. The process-local counter below
+    // makes every call within a process unique even when the wall
+    // clock + salt collide.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     // splitmix64 finalizer for decent dispersion
-    let mut z = nanos.wrapping_add(salt).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = nanos
+        .wrapping_add(salt)
+        .wrapping_add(seq.wrapping_mul(0xA240_2A1F_1CE4_E5B9))
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -402,7 +414,9 @@ mod tests {
         );
         // OpenAI o-series + gpt-4o family.
         assert_eq!(
-            classify_error("This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."),
+            classify_error(
+                "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."
+            ),
             ErrorKind::ContextLength
         );
         // Generic "input too long" wording used by several providers.
