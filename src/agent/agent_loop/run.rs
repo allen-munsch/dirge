@@ -294,22 +294,35 @@ pub async fn run_loop(
                     if let Some(new_ctx) = update.context {
                         current_context = new_ctx;
                     }
-                    // Pi lines 229-238: `model: snapshot.model ??
-                    // config.model`. Phase 4 stores the model
-                    // identifier on a placeholder field; phase 4.5
-                    // wires it to the real rig agent. For now we
-                    // capture it so the hook contract is
-                    // honoured even though no behaviour changes
-                    // mid-run.
-                    if update.model.is_some() {
-                        // Placeholder: phase 4.5 routes this to a
-                        // rebuilt rig agent. The hook OBSERVING
-                        // the field is enough for tests.
+                    // Pi lines 229-238 rebuild config with the
+                    // new model / reasoning. Doing that in Rust
+                    // requires re-building the `StreamFn` closure
+                    // (which has the CompletionModel baked in at
+                    // construction by `rig_stream_fn_from_model`).
+                    // The StreamFn isn't part of LoopConfig — it's
+                    // passed to `run_loop` separately — so we
+                    // can't swap it mid-run without restructuring
+                    // the loop's surface.
+                    //
+                    // Surface a warning so users wiring this hook
+                    // know their swap was ignored. Code-review
+                    // gap #3: lift this when a real consumer
+                    // needs mid-run model swap; the fix is to
+                    // accept a `Fn(Context) -> StreamFn` factory
+                    // instead of a single StreamFn.
+                    if let Some(model) = &update.model {
+                        tracing::warn!(
+                            target: "dirge::agent_loop",
+                            requested_model = %model,
+                            "prepareNextTurn returned a new model but mid-run swap is not yet wired — ignoring",
+                        );
                     }
-                    // Pi lines 232-237: thinking level. Same
-                    // phase-4.5 deferral.
-                    if update.thinking_level.is_some() {
-                        // Placeholder.
+                    if let Some(level) = &update.thinking_level {
+                        tracing::warn!(
+                            target: "dirge::agent_loop",
+                            requested_thinking = ?level,
+                            "prepareNextTurn returned a new thinking_level but mid-run swap is not yet wired — ignoring",
+                        );
                     }
                 }
             }

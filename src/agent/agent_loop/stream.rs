@@ -179,19 +179,20 @@ pub async fn stream_assistant_response(
     }
 
     // 6. Defensive: stream closed without Done/Error. Pi has
-    // the same fallback at agent-loop.ts:359 ("stream ended
-    // without done/error"). Synthesise a final message with
-    // whatever partial we accumulated (or empty if no Start
-    // fired).
-    final_message.unwrap_or_else(|| {
-        let empty = AssistantMessage::new(Vec::new(), StopReason::Stop);
-        // Pi pushes the empty final to context if no partial
-        // preceded (line 363).
-        if !added_partial {
-            context.messages.push(serialize_assistant(&empty));
+    // the same fallback at agent-loop.ts:359-366. Synthesise a
+    // Stop-reason message and run it through `finalize` so the
+    // `message_start` (if not added) and `message_end` events
+    // BOTH fire — earlier versions of this code skipped these
+    // events and broke downstream consumers that expect every
+    // assistant turn to be bracketed.
+    match final_message {
+        Some(m) => m,
+        None => {
+            let empty = AssistantMessage::new(Vec::new(), StopReason::Stop);
+            finalize(context, &empty, added_partial, emit).await;
+            empty
         }
-        empty
-    })
+    }
 }
 
 /// Common finalization path used by `Done` and `Error` arms.
@@ -543,17 +544,19 @@ mod tests {
         while let Some(e) = rx.recv().await {
             events.push(e);
         }
-        // Pi's fallback at line 363: push final to context;
-        // emit message_start (no message_end for the empty-
-        // fallback path per pi's agent-loop.ts:364-366 which
-        // emits both).
+        // Pi's fallback at agent-loop.ts:359-366 pushes the
+        // final to context AND emits both message_start (when
+        // no partial preceded) AND message_end. Earlier
+        // versions of this code skipped these events; the
+        // code review caught it as bug #1 and the fallback
+        // now routes through `finalize()` to match pi.
         assert_eq!(final_msg.stop_reason, StopReason::Stop);
         assert_eq!(ctx.messages.len(), 2);
-        // No events emitted in our defensive fallback (we
-        // diverge from pi here: pi emits start+end even when
-        // the stream produced nothing; we don't, since there's
-        // no observable assistant turn). Documented as an
-        // intentional Rust deviation in code review.
-        assert!(events.is_empty(), "expected no events; got {events:?}");
+        let kinds: Vec<_> = events.iter().map(|e| e.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["message_start", "message_end"],
+            "fallback must emit message_start + message_end (pi 363-366)",
+        );
     }
 }

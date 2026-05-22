@@ -406,9 +406,18 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         let event_tx_inner = event_tx.clone();
         let signal_inner = signal_for_task.clone();
 
-        // Spawn the loop itself on a sub-task so we can interleave
-        // its emission with our translation pump.
-        let loop_handle = tokio::spawn(async move {
+        // Code-review bug #4 fix: run the loop AND the
+        // translation pump in the SAME outer task via
+        // `tokio::join!`. The earlier version spawned the loop
+        // as a nested `tokio::spawn`, which meant a
+        // `task.abort()` on the outer task would NOT abort the
+        // nested one — tools could keep running silently after
+        // the user thought they'd cancelled. Putting both
+        // branches in one task gives them shared fate: outer
+        // abort drops the futures at their next .await,
+        // killing both. Tools that poll the AbortSignal still
+        // observe the cancellation cooperatively.
+        let loop_future = async move {
             let _final_messages = run_agent_loop(
                 prompts,
                 context,
@@ -418,28 +427,27 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
                 &stream_fn,
             )
             .await;
-            // Drop the sender so our pump observes channel close.
+            // Drop the sender so the pump observes channel
+            // close and exits naturally.
             drop(loop_tx);
-        });
+        };
 
-        // Translation pump: receive LoopEvents, translate, forward.
-        let mut bridge = EventBridge::new();
-        while let Some(loop_evt) = loop_rx.recv().await {
-            for agent_evt in bridge.translate(loop_evt) {
-                // If the receiver dropped (UI exited), stop
-                // pumping — the loop will still finish naturally
-                // since its emit channel uses `let _ = .send`.
-                if event_tx_inner.send(agent_evt).await.is_err() {
-                    break;
+        let pump_future = async {
+            let mut bridge = EventBridge::new();
+            while let Some(loop_evt) = loop_rx.recv().await {
+                for agent_evt in bridge.translate(loop_evt) {
+                    // If the receiver dropped (UI exited),
+                    // stop pumping — loop_future continues
+                    // naturally because its emit channel
+                    // uses `let _ = .send`.
+                    if event_tx_inner.send(agent_evt).await.is_err() {
+                        return;
+                    }
                 }
             }
-        }
-        // Wait for the loop task to finish; ignore JoinError —
-        // we already drained its events.
-        let _ = loop_handle.await;
-        // Explicitly drop the outer sender so the receiver
-        // observes channel close even if the consumer is slow.
-        drop(event_tx_inner);
+        };
+
+        tokio::join!(loop_future, pump_future);
     });
 
     LoopRunner {
