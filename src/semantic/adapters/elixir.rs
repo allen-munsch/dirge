@@ -32,7 +32,12 @@ impl ElixirAdapter {
     /// Definition keywords recognised as module/function forms.
     const MODULE_DEFS: &[&str] = &["defmodule", "defprotocol", "defimpl"];
     const FUNCTION_DEFS: &[&str] = &[
-        "def", "defp", "defmacro", "defmacrop", "defguard", "defguardp",
+        "def",
+        "defp",
+        "defmacro",
+        "defmacrop",
+        "defguard",
+        "defguardp",
         "defdelegate",
     ];
 
@@ -74,13 +79,16 @@ impl ElixirAdapter {
     fn module_name<'a>(&self, call: Node<'a>, s: &'a [u8]) -> Option<String> {
         let args = self.args(call)?;
         for i in 0..args.named_child_count() {
-            let Some(c) = args.named_child(i) else { continue };
+            let Some(c) = args.named_child(i) else {
+                continue;
+            };
             match c.kind() {
                 "alias" => return Some(self.text(c, s).to_string()),
                 "dot" => {
                     // Dotted module name: `MyApp.User`
                     if let Some(left) = c.child_by_field_name("left") {
-                        let right = c.child_by_field_name("right")
+                        let right = c
+                            .child_by_field_name("right")
                             .map(|n| self.text(n, s))
                             .unwrap_or("");
                         return Some(format!("{}.{right}", self.text(left, s)));
@@ -99,7 +107,9 @@ impl ElixirAdapter {
     fn function_name<'a>(&self, call: Node<'a>, s: &'a [u8]) -> Option<String> {
         let args = self.args(call)?;
         for i in 0..args.named_child_count() {
-            let Some(c) = args.named_child(i) else { continue };
+            let Some(c) = args.named_child(i) else {
+                continue;
+            };
             match c.kind() {
                 "identifier" => return Some(self.text(c, s).to_string()),
                 "call" => {
@@ -127,7 +137,9 @@ impl ElixirAdapter {
         parent: &str,
     ) {
         for i in 0..block.named_child_count() {
-            let Some(c) = block.named_child(i) else { continue };
+            let Some(c) = block.named_child(i) else {
+                continue;
+            };
             if c.kind() == "call" {
                 if !self.walk_call(c, s, symbols, imports, Some(parent)) {
                     self.maybe_import(c, s, imports);
@@ -208,7 +220,9 @@ impl ElixirAdapter {
         let mut names = Vec::new();
         let mut source = String::new();
         for i in 0..args.named_child_count() {
-            let Some(c) = args.named_child(i) else { continue };
+            let Some(c) = args.named_child(i) else {
+                continue;
+            };
             match c.kind() {
                 "alias" => {
                     let name = self.text(c, s).to_string();
@@ -270,7 +284,9 @@ impl LanguageAdapter for ElixirAdapter {
         // imports. We still need the top-level check for bare imports
         // outside any module (rare but valid in .exs scripts).
         for i in 0..root.named_child_count() {
-            let Some(c) = root.named_child(i) else { continue };
+            let Some(c) = root.named_child(i) else {
+                continue;
+            };
             if c.kind() == "call" {
                 if !self.walk_call(c, bytes, &mut symbols, &mut imports, None) {
                     // Not a definition — check for import/alias/require/use.
@@ -338,9 +354,18 @@ impl LanguageAdapter for ElixirAdapter {
 
         /// Keywords that introduce definitions, not real callees.
         const DEF_KW: &[&str] = &[
-            "def", "defp", "defmodule", "defmacro", "defmacrop",
-            "defprotocol", "defimpl", "defguard", "defguardp",
-            "defdelegate", "defstruct", "defexception",
+            "def",
+            "defp",
+            "defmodule",
+            "defmacro",
+            "defmacrop",
+            "defprotocol",
+            "defimpl",
+            "defguard",
+            "defguardp",
+            "defdelegate",
+            "defstruct",
+            "defexception",
         ];
 
         let mut callees = Vec::new();
@@ -436,7 +461,11 @@ defprotocol MyApp.Serialisable do
 end
 "#;
         let f = ElixirAdapter.extract(&pb("protocol.ex"), src).unwrap();
-        let proto = f.symbols.iter().find(|s| s.name == "MyApp.Serialisable").unwrap();
+        let proto = f
+            .symbols
+            .iter()
+            .find(|s| s.name == "MyApp.Serialisable")
+            .unwrap();
         assert!(matches!(proto.kind, SymbolKind::Interface));
         assert!(f.symbols.iter().any(|s| s.name == "to_json"));
         assert!(f.symbols.iter().any(|s| s.name == "from_json"));

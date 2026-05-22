@@ -84,9 +84,10 @@ pub fn rust_workspace_root(file: &Path, stop_at: &Path) -> Option<PathBuf> {
     loop {
         let cargo = cursor.join("Cargo.toml");
         if let Ok(text) = std::fs::read_to_string(&cargo)
-            && text.contains("[workspace]") {
-                return Some(cursor);
-            }
+            && text.contains("[workspace]")
+        {
+            return Some(cursor);
+        }
         if cursor == stop_at_canon {
             break;
         }
