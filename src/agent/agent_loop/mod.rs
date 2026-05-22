@@ -22,6 +22,7 @@
 // nothing imports `crate::agent::agent_loop::Foo` yet — phase 1+ will.
 #![allow(unused_imports)]
 
+pub mod bridge;
 pub mod hooks;
 pub mod message;
 pub mod result;
@@ -33,6 +34,7 @@ pub mod tool;
 pub mod tools;
 pub mod types;
 
+pub use bridge::EventBridge;
 pub use hooks::{
     AfterToolCallContext, AfterToolCallFn, BeforeToolCallContext, BeforeToolCallFn,
     BeforeToolCallReturn, GetFollowupMessagesFn, GetSteeringMessagesFn, PrepareNextTurnFn,
