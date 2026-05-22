@@ -1,10 +1,12 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 
-/// Exa search result item.
+/// One result returned by the DuckDuckGo HTML fallback. The Exa
+/// path returns a single pre-formatted string (Exa formats the
+/// response server-side) so it doesn't need this struct.
 #[derive(Debug, Deserialize)]
 struct ExaResult {
     title: Option<String>,
@@ -13,34 +15,23 @@ struct ExaResult {
     text: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ExaResponse {
-    results: Vec<ExaResult>,
-}
-
-#[derive(Debug, Serialize)]
-struct ExaRequest<'a> {
-    query: &'a str,
-    #[serde(rename = "type")]
-    search_type: &'a str,
-    contents: ExaContents,
-    #[serde(rename = "numResults")]
-    num_results: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct ExaContents {
-    text: bool,
-}
-
 pub struct WebSearchTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
-    api_key: String,
+    /// `Some(key)` → use Exa (paid, high quality, content snippets).
+    /// `None`      → fall back to DuckDuckGo HTML scrape (free, no
+    /// auth, title + URL + short snippet only).
+    /// Match opencode behavior: websearch works out of the box
+    /// without any API key configured.
+    api_key: Option<String>,
 }
 
 impl WebSearchTool {
-    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>, api_key: String) -> Self {
+    pub fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        api_key: Option<String>,
+    ) -> Self {
         Self {
             permission,
             ask_tx,
@@ -93,7 +84,7 @@ impl Tool for WebSearchTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "websearch".to_string(),
-            description: "Search the web using Exa. Returns structured results with titles, URLs, and text snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff."
+            description: "Search the web. Returns titles, URLs, and snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff. Backed by Exa when `EXA_API_KEY` is set (richer snippets), otherwise falls back to DuckDuckGo."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -116,47 +107,338 @@ impl Tool for WebSearchTool {
     async fn call(&self, args: WebSearchArgs) -> Result<String, ToolError> {
         check_perm(&self.permission, &self.ask_tx, "websearch", &args.query).await?;
 
-        // Match webfetch's 15s timeout — without this, a hung Exa
-        // endpoint would stall the agent turn indefinitely.
+        // Shared HTTP client. 15s timeout matches webfetch.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|e| ToolError::Msg(format!("http client init failed: {e}")))?;
-        let body = ExaRequest {
-            query: &args.query,
-            search_type: "auto",
-            contents: ExaContents { text: true },
-            num_results: args.num_results.min(20),
+
+        // Primary: hit Exa's hosted MCP endpoint — same approach
+        // opencode uses. Works without auth (free tier) and
+        // accepts an optional `?exaApiKey=…` for higher rate
+        // limits. Falls back to DuckDuckGo HTML scraping if the
+        // MCP call errors out (network issue, rate-limited, etc.)
+        // so websearch stays useful when Exa is down.
+        match exa_mcp_search(&client, self.api_key.as_deref(), &args).await {
+            Ok(text) => Ok(text),
+            Err(primary_err) => match duckduckgo_search(&client, &args).await {
+                Ok(text) => Ok(text),
+                Err(_) => Err(primary_err),
+            },
+        }
+    }
+}
+
+/// Hit Exa's hosted MCP endpoint over plain HTTP. Mirrors opencode's
+/// approach: POST a JSON-RPC `tools/call` envelope for `web_search_exa`
+/// to `https://mcp.exa.ai/mcp`. The endpoint accepts an optional
+/// `?exaApiKey=<key>` query parameter for higher rate limits; without
+/// it the free tier kicks in (no auth header needed).
+///
+/// The response is either a plain JSON-RPC body or an SSE
+/// (`data: {json}\n\n`) stream depending on what the server picks.
+/// We parse both shapes.
+async fn exa_mcp_search(
+    client: &reqwest::Client,
+    api_key: Option<&str>,
+    args: &WebSearchArgs,
+) -> Result<String, ToolError> {
+    // Build URL — append the API key as a query param when set.
+    let mut url = String::from("https://mcp.exa.ai/mcp");
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+        url.push_str("?exaApiKey=");
+        url.push_str(&urlencode_query(key));
+    }
+
+    // JSON-RPC `tools/call` envelope. Tool name + args match
+    // opencode's `mcp-websearch.ts` so we get the same behavior
+    // on the same backend.
+    let envelope = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "web_search_exa",
+            "arguments": {
+                "query": args.query,
+                "type": "auto",
+                "numResults": args.num_results.min(20),
+                "livecrawl": "fallback",
+            }
+        }
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Accept", "application/json, text/event-stream")
+        .header("Content-Type", "application/json")
+        .json(&envelope)
+        .send()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch request failed: {}", e)))?;
+
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch read failed: {}", e)))?;
+    if !status.is_success() {
+        return Err(ToolError::Msg(format!(
+            "websearch returned {}: {}",
+            status.as_u16(),
+            &body.chars().take(300).collect::<String>()
+        )));
+    }
+
+    parse_mcp_response(&body)
+        .ok_or_else(|| ToolError::Msg("websearch: no parseable result in MCP response".to_string()))
+}
+
+/// Parse an MCP `tools/call` response. The server may return:
+///   a) Plain JSON: `{ "result": { "content": [ { "type": "...", "text": "..." } ] } }`
+///   b) SSE stream: lines of `data: <json>` separated by blank lines.
+///
+/// Returns the first `text` content found, which Exa formats as a
+/// human-readable summary of the results.
+fn parse_mcp_response(body: &str) -> Option<String> {
+    // Try plain-JSON first.
+    let trimmed = body.trim();
+    if trimmed.starts_with('{')
+        && let Some(text) = extract_mcp_text(trimmed)
+    {
+        return Some(text);
+    }
+    // Fall back to SSE: scan each `data: …` line.
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("data: ")
+            && let Some(text) = extract_mcp_text(rest.trim())
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn extract_mcp_text(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = v.get("result")?.get("content")?.as_array()?;
+    for item in arr {
+        if let Some(s) = item.get("text").and_then(|t| t.as_str()) {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+fn urlencode_query(s: &str) -> String {
+    // Minimal query-string encoder: alphanumeric and `-_.~` pass
+    // through, everything else gets %-encoded. Matches RFC 3986
+    // unreserved + safe chars. The API key is typically opaque
+    // hex/base64 so this is mostly a passthrough.
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// DuckDuckGo HTML-endpoint scrape. No API key needed — same
+/// behavior opencode ships with by default. Hits the `html.`
+/// subdomain (sans-JS variant) and parses results out with two
+/// regexes:
+///   - `result__a` anchor → title + URL
+///   - `result__snippet` anchor → snippet text
+/// HTML entities (`&amp;`, `&#x27;` etc.) are decoded inline. URLs
+/// are unwrapped from DDG's `/l/?uddg=…` redirector when present.
+///
+/// Results live up to `args.num_results` (cap 20). Returns the same
+/// markdown shape as `exa_search` so the LLM sees a uniform output
+/// regardless of which backend is active.
+async fn duckduckgo_search(
+    client: &reqwest::Client,
+    args: &WebSearchArgs,
+) -> Result<String, ToolError> {
+    let max_results = args.num_results.min(20);
+    // Build the form body manually since reqwest's `.form()`
+    // helper needs an extra feature flag that isn't enabled.
+    // application/x-www-form-urlencoded is just `key=value&…` with
+    // each value URL-encoded; we have one field, `q`.
+    let body = format!("q={}", urlencode_query(&args.query));
+    let resp = client
+        .post("https://html.duckduckgo.com/html/")
+        .header("User-Agent", "Mozilla/5.0 (compatible; dirge-agent/1.0)")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch (ddg) request failed: {}", e)))?;
+
+    let status = resp.status();
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| ToolError::Msg(format!("websearch (ddg) read failed: {}", e)))?;
+    if !status.is_success() {
+        return Err(ToolError::Msg(format!(
+            "websearch (ddg) returned {}",
+            status.as_u16(),
+        )));
+    }
+
+    let results = parse_ddg_html(&html, max_results);
+    if results.is_empty() {
+        return Ok("No results found.".to_string());
+    }
+    Ok(format_search_results(&results))
+}
+
+/// Extract `(url, title, snippet)` tuples from a DDG HTML response.
+/// Two-pass linear scan: find `class="result__a"` anchors and
+/// matching `class="result__snippet"` anchors, pair them by
+/// position. Tolerant to surrounding markup changes — we only key
+/// off the class names. Returns at most `max` results.
+fn parse_ddg_html(html: &str, max: usize) -> Vec<ExaResult> {
+    let mut out: Vec<ExaResult> = Vec::new();
+    // Title/URL extraction: locate every `result__a` href + visible
+    // text. Use a byte-level scanner since we don't need a full
+    // HTML parser and pulling one in would add a dep.
+    let mut cursor = 0usize;
+    while out.len() < max {
+        let Some(start) = html[cursor..].find("class=\"result__a\"") else {
+            break;
+        };
+        let abs_start = cursor + start;
+        // Walk back to the opening `<a ` of this anchor.
+        let Some(tag_start) = html[..abs_start].rfind("<a ") else {
+            break;
+        };
+        // href= attribute inside the anchor.
+        let href_search = &html[tag_start..abs_start + 32];
+        let href = href_search
+            .find("href=\"")
+            .and_then(|h| {
+                let after = tag_start + h + 6;
+                html[after..].find('"').map(|end| &html[after..after + end])
+            })
+            .unwrap_or("")
+            .to_string();
+        // Title text between `>` and `</a>`.
+        let Some(text_start) = html[abs_start..].find('>') else {
+            break;
+        };
+        let title_open = abs_start + text_start + 1;
+        let Some(close_off) = html[title_open..].find("</a>") else {
+            break;
+        };
+        let title_raw = &html[title_open..title_open + close_off];
+        let title = strip_tags_and_decode(title_raw);
+        let url = unwrap_ddg_redirect(&decode_entities(&href));
+
+        // Snippet: search forward for the NEXT `result__snippet`.
+        cursor = title_open + close_off;
+        let snippet = if let Some(sn_off) = html[cursor..].find("class=\"result__snippet\"") {
+            let sn_abs = cursor + sn_off;
+            let sn_text_start = html[sn_abs..].find('>').map(|p| sn_abs + p + 1);
+            let sn_text =
+                sn_text_start.and_then(|s| html[s..].find("</a>").map(|e| &html[s..s + e]));
+            sn_text.map(strip_tags_and_decode).unwrap_or_default()
+        } else {
+            String::new()
         };
 
-        let resp = client
-            .post("https://api.exa.ai/search")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ToolError::Msg(format!("websearch request failed: {}", e)))?;
-
-        let status = resp.status();
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| ToolError::Msg(format!("websearch read failed: {}", e)))?;
-
-        if !status.is_success() {
-            return Err(ToolError::Msg(format!(
-                "websearch returned {}: {}",
-                status.as_u16(),
-                &body_text.chars().take(300).collect::<String>()
-            )));
+        if !url.is_empty() {
+            out.push(ExaResult {
+                title: Some(title),
+                url: Some(url),
+                text: if snippet.is_empty() {
+                    None
+                } else {
+                    Some(snippet)
+                },
+            });
         }
-
-        let parsed: ExaResponse = serde_json::from_str(&body_text)
-            .map_err(|e| ToolError::Msg(format!("websearch parse error: {}", e)))?;
-
-        Ok(format_search_results(&parsed.results))
     }
+    out
+}
+
+/// DDG wraps result URLs in `//duckduckgo.com/l/?uddg=<urlencoded>`
+/// redirect links. Unwrap to the actual target URL so the LLM gets
+/// a clickable destination, not a tracker hop. If the input doesn't
+/// look like a DDG redirect, return it unchanged.
+fn unwrap_ddg_redirect(href: &str) -> String {
+    let needle = "uddg=";
+    if let Some(idx) = href.find(needle) {
+        let after = &href[idx + needle.len()..];
+        let encoded = after.split('&').next().unwrap_or(after);
+        return urlencoding_decode(encoded);
+    }
+    href.to_string()
+}
+
+/// Minimal URL-encoding decoder for the `uddg=` payload. Handles
+/// `%XX` hex escapes; leaves everything else alone. No allocation
+/// when the input contains no escapes.
+fn urlencoding_decode(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Strip inline tags + decode the most common HTML entities.
+/// Sufficient for DDG's title/snippet shapes (`<b>foo</b>`,
+/// `&amp;`, `&#39;`). Not a full HTML decoder — we don't expect
+/// arbitrary HTML inside these spans.
+fn strip_tags_and_decode(s: &str) -> String {
+    // Pass 1: drop tags.
+    let mut no_tags = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match (in_tag, ch) {
+            (false, '<') => in_tag = true,
+            (true, '>') => in_tag = false,
+            (false, _) => no_tags.push(ch),
+            _ => {}
+        }
+    }
+    decode_entities(no_tags.trim())
+}
+
+fn decode_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
 }
 
 #[cfg(test)]
@@ -204,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_definition_has_correct_name() {
-        let tool = WebSearchTool::new(None, None, "test-key".to_string());
+        let tool = WebSearchTool::new(None, None, Some("test-key".to_string()));
         let def = tool.definition(String::new()).await;
         assert_eq!(def.name, "websearch");
     }

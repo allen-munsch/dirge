@@ -284,25 +284,20 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true)
             || env_true("WEBFETCH_ENABLED");
 
-        // Audit M1: explicit warn when websearch is enabled but
-        // EXA_API_KEY is unset. Without this the tool silently
-        // didn't appear and users wondered why the LLM never used
-        // it. Fires once per agent build.
+        // Websearch now works out of the box without an API key —
+        // mirrors opencode's behavior. Backend: Exa's hosted MCP
+        // endpoint (`https://mcp.exa.ai/mcp`) which accepts unauth'd
+        // calls at a lower rate limit, with DDG HTML scraping as
+        // a fallback if Exa is unreachable. EXA_API_KEY remains
+        // optional — when set, it's appended as `?exaApiKey=…` for
+        // higher rate limits.
         let websearch_tool = if websearch_enabled {
-            match std::env::var("EXA_API_KEY") {
-                Ok(key) if !key.is_empty() => Some(Box::new(tools::WebSearchTool::new(
-                    permission.clone(),
-                    ask_tx.clone(),
-                    key,
-                ))
-                    as Box<dyn rig::tool::ToolDyn>),
-                _ => {
-                    eprintln!(
-                        "warning: websearch tool is enabled but EXA_API_KEY is unset; the tool won't be available to the agent. Set EXA_API_KEY (from exa.ai) or disable via tools.websearch=false in config to silence this."
-                    );
-                    None
-                }
-            }
+            let key = std::env::var("EXA_API_KEY").ok().filter(|k| !k.is_empty());
+            Some(Box::new(tools::WebSearchTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                key,
+            )) as Box<dyn rig::tool::ToolDyn>)
         } else {
             None
         };
