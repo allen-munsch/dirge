@@ -76,9 +76,7 @@ impl SymbolIndex {
             // we're at the cap. Only fires when the path isn't
             // already in the cache (an in-place refresh keeps the
             // existing slot and bumps it to most-recent below).
-            if !self.cache.contains_key(&canonical)
-                && self.cache.len() >= MAX_INDEX_FILES
-            {
+            if !self.cache.contains_key(&canonical) && self.cache.len() >= MAX_INDEX_FILES {
                 self.cache.shift_remove_index(0);
             }
             self.cache.insert(canonical.clone(), extracted);

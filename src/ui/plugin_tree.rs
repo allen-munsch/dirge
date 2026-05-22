@@ -125,10 +125,8 @@ pub fn apply_tree_op(op: TreeOp, session: &mut Session, input: &mut InputEditor)
                         let new_id = loaded.id.clone();
                         *session = loaded;
                         input.set_text("");
-                        let mut msg = format!(
-                            "[plugin] switched to session {}",
-                            short(new_id.as_str()),
-                        );
+                        let mut msg =
+                            format!("[plugin] switched to session {}", short(new_id.as_str()),);
                         if let Some(e) = save_err {
                             msg.push_str(&format!(
                                 "\n  warning: previous session save failed ({}); previous state may not be recoverable",

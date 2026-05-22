@@ -414,7 +414,9 @@ mod tests {
         );
         // OpenAI o-series + gpt-4o family.
         assert_eq!(
-            classify_error("This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."),
+            classify_error(
+                "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."
+            ),
             ErrorKind::ContextLength
         );
         // Generic "input too long" wording used by several providers.
