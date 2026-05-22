@@ -667,8 +667,7 @@ pub async fn run_interactive(
         // signalling, the mutex is released, and the drain runs
         // uncontended.
         loop {
-            if crate::ui::terminal::EVENT_READER_SHUTDOWN
-                .load(std::sync::atomic::Ordering::Relaxed)
+            if crate::ui::terminal::EVENT_READER_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
             {
                 break;
             }
@@ -3948,10 +3947,7 @@ mod tests {
             row_width, 44,
             "row must be exactly inner+4 cells wide; got {row_width} for {row:?}",
         );
-        assert!(
-            row.ends_with(" │"),
-            "right border missing: {row:?}"
-        );
+        assert!(row.ends_with(" │"), "right border missing: {row:?}");
 
         // Long content with mixed wide chars: must truncate by
         // display width and still land at exactly inner+4 cells.

@@ -77,9 +77,9 @@ impl AdapterRegistry {
             // C++-only tokens. Falls through to the regular search if
             // no C++ adapter is registered.
             if let Some(cpp) = self.adapters.iter().find(|a| {
-                a.extensions()
-                    .iter()
-                    .any(|e| e.trim_start_matches('.') == "cpp" || e.trim_start_matches('.') == "hpp")
+                a.extensions().iter().any(|e| {
+                    e.trim_start_matches('.') == "cpp" || e.trim_start_matches('.') == "hpp"
+                })
             }) {
                 return Some(cpp.as_ref());
             }

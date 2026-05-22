@@ -596,9 +596,9 @@ where
                 }
             };
             match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::Text(text),
-                )) => {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                    text,
+                ))) => {
                     full_response.push_str(&text.text);
                     print!("{}", text.text);
                     let _ = std::io::Write::flush(&mut std::io::stdout());

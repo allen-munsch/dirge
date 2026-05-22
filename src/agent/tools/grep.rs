@@ -118,9 +118,10 @@ impl Tool for GrepTool {
         );
 
         if let Some(ref cache) = self.cache
-            && let Some(cached) = cache.get(&cache_key) {
-                return Ok(cached);
-            }
+            && let Some(cached) = cache.get(&cache_key)
+        {
+            return Ok(cached);
+        }
 
         let re = Regex::new(&args.pattern)
             .map_err(|e| ToolError::Msg(format!("Invalid regex pattern: {}", e)))?;

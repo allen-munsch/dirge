@@ -19,9 +19,10 @@ pub fn language_for_path(path: &Path) -> &'static str {
         .to_lowercase();
 
     if let Some(ext) = path.extension().and_then(|s| s.to_str())
-        && let Some(lang) = LANGUAGES.iter().find(|(e, _)| *e == ext.to_lowercase()) {
-            return lang.1;
-        }
+        && let Some(lang) = LANGUAGES.iter().find(|(e, _)| *e == ext.to_lowercase())
+    {
+        return lang.1;
+    }
 
     // Some filenames are themselves the marker (Makefile, Dockerfile, etc).
     if let Some(lang) = FILENAMES.iter().find(|(n, _)| *n == name) {

@@ -1465,8 +1465,7 @@ pub fn copy_to_clipboard(text: &str) {
             // On expiry we SIGKILL the child and move on; the user
             // sees no immediate feedback but the editor stays
             // responsive.
-            const CLIP_WAIT_LIMIT: std::time::Duration =
-                std::time::Duration::from_millis(2000);
+            const CLIP_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_millis(2000);
             let poll_interval = std::time::Duration::from_millis(25);
             let deadline = std::time::Instant::now() + CLIP_WAIT_LIMIT;
             loop {

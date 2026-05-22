@@ -145,12 +145,13 @@ impl Tool for EditTool {
             check_perm_path_resolve(&self.permission, &self.ask_tx, "edit", &args.path).await?;
 
         if let Some(plan) = &self.plan_file
-            && !is_plan_file(plan, &args.path) {
-                return Err(ToolError::Msg(
+            && !is_plan_file(plan, &args.path)
+        {
+            return Err(ToolError::Msg(
                     "Plan mode: edits restricted to PLAN.md only. Use /prompt default to exit plan mode."
                         .to_string(),
                 ));
-            }
+        }
 
         // Pre-check size before reading. The edit tool isn't meant
         // for huge generated artifacts; cap at 100 MiB so an LLM

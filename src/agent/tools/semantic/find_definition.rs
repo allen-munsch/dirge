@@ -76,8 +76,7 @@ impl Tool for FindDefinitionTool {
                 None,
             )
             .map_err(ToolError::Msg)?;
-            idx.find_definition(&args.name)
-                .map_err(ToolError::Msg)?
+            idx.find_definition(&args.name).map_err(ToolError::Msg)?
         };
 
         if results.is_empty() {

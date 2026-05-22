@@ -99,12 +99,13 @@ impl Tool for WriteTool {
             check_perm_path_resolve(&self.permission, &self.ask_tx, "write", &args.path).await?;
 
         if let Some(plan) = &self.plan_file
-            && !is_plan_file(plan, &args.path) {
-                return Err(ToolError::Msg(
+            && !is_plan_file(plan, &args.path)
+        {
+            return Err(ToolError::Msg(
                     "Plan mode: writes restricted to PLAN.md only. Use /prompt default to exit plan mode."
                         .to_string(),
                 ));
-            }
+        }
 
         let path = Path::new(&resolved_path);
         if let Some(parent) = path.parent() {
