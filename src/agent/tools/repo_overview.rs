@@ -227,14 +227,28 @@ fn build_overview(root: &Path, max_depth: usize, want_lines: bool) -> Result<Str
 fn compute_dir_file_counts(
     entries: &[(PathBuf, bool, usize)],
 ) -> std::collections::HashMap<PathBuf, usize> {
+    // Build a set of directories that are actually printed so we
+    // only bump counts for ancestors we will name. Walking
+    // parent.parent() past the crawl root (#9 fix) wasted entries
+    // for paths that never appear in the output.
+    let printed_dirs: std::collections::HashSet<&PathBuf> = entries
+        .iter()
+        .filter(|(_, is_dir, _)| *is_dir)
+        .map(|(p, _, _)| p)
+        .collect();
     let mut counts: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
     for (path, is_dir, _) in entries {
         if *is_dir {
             continue;
         }
-        // Bump every ancestor dir's count.
+        // Bump every ancestor dir's count, but only for ancestors
+        // that are themselves in the crawl set. Stops the walk at
+        // the crawl root rather than carrying up to `/`.
         let mut cur = path.parent();
         while let Some(p) = cur {
+            if !printed_dirs.contains(&p.to_path_buf()) {
+                break;
+            }
             *counts.entry(p.to_path_buf()).or_insert(0) += 1;
             cur = p.parent();
         }

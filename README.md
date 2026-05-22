@@ -23,7 +23,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **MCP support**: connect MCP servers for extended tooling (optional compile-time feature)
 - **Git Worktrees**: `/worktree` to create branch-per-task worktrees, `/wt-merge`, `/wt-exit`
 - **Loop system**: iterative coding loop for long-horizon tasks
-- **ACP support** (gated): Agent Communication Protocol server for editor integration
+- **ACP support** (gated): Agent Communication Protocol server for editor integration. ACP locks the active prompt at launch — use `--prompt <name>` on startup to opt into a restricted mode (the protocol has no mid-session prompt-switch message)
 - **Plugin system** (Janet, on a dedicated worker thread): hooks for the full session/agent/tool lifecycle. Plugins can intercept tool calls (block/mutate/replace), register slash commands, transform user input, post notifications, and prompt the user with blocking `confirm`/`select` dialogs
 
 **NOTE**: Windows support is not tested, but feel free to try and open an issue if you encounter any bugs.
@@ -221,8 +221,20 @@ You are dirge in plan mode. …
 ```
 
 The permission checker refuses any denied tool BEFORE the call leaves dirge
-— even under `--yolo` mode. Applies symmetrically to MCP tools (matched by
-concrete name, `mcp_tool:<server>:<name>`, and the umbrella `mcp_tool`).
+— even under `--yolo` mode. Applies symmetrically to MCP tools: an entry
+in `deny_tools` matches an MCP-exported tool when the entry equals
+**any** of the following:
+
+- the bare tool name as the MCP server registered it (e.g. `edit` matches
+  an MCP `edit` tool from any server — convenient blanket deny, but be
+  aware that `deny_tools: [edit]` intended for the built-in editor will
+  also block an MCP server's `edit` tool)
+- the qualified `mcp_tool:<server>:<name>` form (for narrowly denying a
+  specific server's tool)
+- the umbrella `mcp_tool` (denies every MCP tool from every server)
+
+For surgical control over one MCP tool without affecting the built-in, use
+the qualified form.
 
 Custom prompts can be placed in `$XDG_CONFIG_HOME/dirge/prompts/` as `.md` files.
 

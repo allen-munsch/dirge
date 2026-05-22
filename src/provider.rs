@@ -83,7 +83,15 @@ pub fn resolve_provider_info(
 ) -> Option<ProviderInfo> {
     // Config-declared custom providers win on name collision —
     // user intent always trumps plugin defaults.
-    if let Some(custom) = custom_providers.get(name) {
+    // #2 fix: lowercase-fallback lookup so `--provider My-VLLM` finds
+    // a `custom_providers["my-vllm"]` config entry. parse_provider
+    // (for built-ins) is already case-insensitive; matching the same
+    // convention here removes a silent miss.
+    let lower = name.to_ascii_lowercase();
+    if let Some(custom) = custom_providers
+        .get(name)
+        .or_else(|| custom_providers.get(&lower))
+    {
         let kind = parse_provider(&custom.provider_type)?;
         return Some(ProviderInfo {
             kind,
@@ -94,7 +102,7 @@ pub fn resolve_provider_info(
     // Then plugin-registered providers from `harness/register-provider`.
     // Installed once at startup after plugin load; never mutated again
     // in this process.
-    if let Some(custom) = plugin_provider(name) {
+    if let Some(custom) = plugin_provider(name).or_else(|| plugin_provider(&lower)) {
         let kind = parse_provider(&custom.provider_type)?;
         return Some(ProviderInfo {
             kind,

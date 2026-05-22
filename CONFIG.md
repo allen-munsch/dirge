@@ -174,6 +174,43 @@ plugin pre-hook). If you load third-party plugins, treat them with the same
 care you'd give to executing third-party code in your shell — the plugin's
 trust level effectively equals the user's. There is no sandboxing.
 
+## Streaming timeouts
+
+dirge applies a per-chunk read deadline to streaming LLM responses so a
+silently-dropped TCP connection (which reqwest can't always detect) doesn't
+freeze the agent. The default is 5 minutes (`300s`) — well above any
+legitimate reasoning gap from Claude 3.7 extended thinking, GPT-5 thinking,
+or large-tool-output processing. Bump it if you see false-positive
+`stream chunk timed out` errors in the middle of a turn.
+
+Resolution order (first hit wins):
+
+1. `custom_providers.<name>.stream_chunk_timeout_secs` — per custom endpoint
+2. `providers.<name>.stream_chunk_timeout_secs` — per built-in provider
+3. top-level `stream_chunk_timeout_secs` — applies to every provider
+4. `300s` default
+
+Provider name matching is case-insensitive (`anthropic` matches
+`--provider Anthropic`).
+
+```json
+{
+  "stream_chunk_timeout_secs": 300,
+  "providers": {
+    "anthropic": { "stream_chunk_timeout_secs": 900 },
+    "ollama":    { "stream_chunk_timeout_secs": 60 }
+  },
+  "custom_providers": {
+    "my-vllm": {
+      "provider_type": "openai",
+      "base_url": "http://localhost:8000/v1",
+      "api_key_env": "VLLM_API_KEY",
+      "stream_chunk_timeout_secs": 1200
+    }
+  }
+}
+```
+
 ## Environment variables
 
 | Variable | Purpose |

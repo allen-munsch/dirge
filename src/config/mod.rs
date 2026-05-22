@@ -221,15 +221,20 @@ impl Config {
     /// Passing an unknown / empty provider name falls through past
     /// (1) and (2) to the top-level / default.
     pub fn resolve_stream_chunk_timeout(&self, provider: &str) -> std::time::Duration {
+        // Provider lookup is case-insensitive because `parse_provider`
+        // accepts `--provider Anthropic` (#2 fix). Without this, a
+        // capitalized CLI / config provider name built the client
+        // fine but missed the `providers.anthropic` override silently.
+        let lower = provider.to_ascii_lowercase();
         let from_custom = self
             .custom_providers
             .as_ref()
-            .and_then(|m| m.get(provider))
+            .and_then(|m| m.get(&lower).or_else(|| m.get(provider)))
             .and_then(|c| c.stream_chunk_timeout_secs);
         let from_provider = self
             .providers
             .as_ref()
-            .and_then(|m| m.get(provider))
+            .and_then(|m| m.get(&lower).or_else(|| m.get(provider)))
             .and_then(|p| p.stream_chunk_timeout_secs);
         let secs = from_custom
             .or(from_provider)

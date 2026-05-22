@@ -58,6 +58,52 @@ use crate::permission::checker::{CheckResult, PermCheck};
 pub const MAX_GREP_RESULTS: usize = 200;
 pub const MAX_FIND_RESULTS: usize = 200;
 
+/// Single source of truth for every built-in tool name dirge ships.
+/// Used by:
+///   - `agent/builder.rs` MCP collision filter — refuses to register
+///     an MCP-exported tool with a colliding name.
+///   - `context/prompts.rs` `deny_tools` validation — warns when a
+///     prompt's frontmatter names something not in this set.
+/// Previously these two sites maintained independent lists; review-
+/// batch #7 unified them so adding a new tool only requires one edit.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "grep",
+    "find_files",
+    "glob",
+    "list_dir",
+    "write_todo_list",
+    "apply_patch",
+    "memory",
+    "skill",
+    "task",
+    "task_status",
+    "question",
+    "webfetch",
+    "websearch",
+    "lsp",
+    "repo_overview",
+    "list_symbols",
+    "get_symbol_body",
+    "find_definition",
+    "find_callers",
+    "find_callees",
+    // plan_enter / plan_exit are unconditionally added when plan_tx
+    // is in scope (they manage the plan mode state via plan_tx). An
+    // MCP server exporting either name would shadow them and could
+    // disable / hijack plan mode.
+    "plan_enter",
+    "plan_exit",
+    // `mcp_tool` is the umbrella name McpTool calls go through.
+    // Including it lets a prompt's `deny_tools: [mcp_tool]` deny
+    // every MCP server's tools wholesale; the warn-on-unknown gate
+    // in `context/prompts.rs` then accepts that entry.
+    "mcp_tool",
+];
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("{0}")]

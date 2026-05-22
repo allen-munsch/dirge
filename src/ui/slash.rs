@@ -773,8 +773,25 @@ pub async fn handle_slash(
                         &format!("available prompts (current: {}):", current),
                         c_agent(),
                     )?;
+                    // #3 fix: surface each prompt's `description`
+                    // frontmatter (if present). The field was being
+                    // parsed but never displayed — a user writing a
+                    // description expected it to show up here.
+                    // Computes a single-pass max-name width for
+                    // alignment when descriptions are present.
+                    let max_name = sorted.iter().map(|n| n.len()).max().unwrap_or(0);
                     for name in &sorted {
-                        renderer.write_line(&format!("  {}", name), c_result())?;
+                        let desc = context
+                            .prompts
+                            .get(*name)
+                            .and_then(|p| p.description.as_deref());
+                        match desc {
+                            Some(d) => renderer.write_line(
+                                &format!("  {:<width$}  {}", name, d, width = max_name),
+                                c_result(),
+                            )?,
+                            None => renderer.write_line(&format!("  {}", name), c_result())?,
+                        }
                     }
                     renderer.write_line("", c_agent())?;
                     renderer.write_line("usage: /prompt <name>  |  /prompt default", c_result())?;
@@ -1596,27 +1613,11 @@ pub async fn handle_slash(
                 );
             }
             renderer.write_line(
-                "  /prompt                list available prompts",
+                "  /prompt                list available prompts (plan|code)",
                 c_result(),
             )?;
             renderer.write_line(
                 "  /prompt <name>         activate a prompt by name",
-                c_result(),
-            )?;
-            renderer.write_line(
-                "  /prompt plan           switch to plan mode (writes restricted to PLAN.md)",
-                c_result(),
-            )?;
-            renderer.write_line(
-                "  /prompt code           switch back to code mode (full tool access)",
-                c_result(),
-            )?;
-            renderer.write_line(
-                "                         the agent can also suggest plan/code switches via",
-                c_result(),
-            )?;
-            renderer.write_line(
-                "                         plan_enter / plan_exit tools — you confirm each time",
                 c_result(),
             )?;
             renderer.write_line(

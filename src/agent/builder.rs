@@ -369,51 +369,23 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 // names clash, and dirge adds built-ins first.
                 // Better to warn loudly and refuse to shadow than
                 // to let an arbitrary MCP server replace core tools.
-                const BUILTIN_TOOL_NAMES: &[&str] = &[
-                    "read",
-                    "write",
-                    "edit",
-                    "bash",
-                    "grep",
-                    "find_files",
-                    "glob",
-                    "list_dir",
-                    "write_todo_list",
-                    "apply_patch",
-                    "memory",
-                    "skill",
-                    "task",
-                    "task_status",
-                    "question",
-                    "webfetch",
-                    "websearch",
-                    "lsp",
-                    // R2 audit O1 — new structural-overview tool.
-                    "repo_overview",
-                    // Audit H1: semantic tools were missing from
-                    // this list, so an MCP server exporting any of
-                    // these names silently shadowed the built-in
-                    // (last-write-wins favored the semantic version
-                    // but no warning fired). Adding them surfaces
-                    // the collision symmetrically with the others.
-                    "list_symbols",
-                    "get_symbol_body",
-                    "find_definition",
-                    "find_callers",
-                    "find_callees",
-                    // plan_enter / plan_exit are unconditionally
-                    // added by the agent builder (they manage the
-                    // plan mode state via plan_tx). An MCP server
-                    // exporting either name would shadow them and
-                    // could disable / hijack plan mode.
-                    "plan_enter",
-                    "plan_exit",
-                ];
+                // Review-batch #7: single source of truth for the
+                // built-in tool registry is `tools::BUILTIN_TOOL_NAMES`.
+                // Previously this list was hand-maintained here AND
+                // in `context/prompts.rs` (KNOWN_TOOLS), so adding a
+                // tool required editing both — drift meant either
+                // a spurious "unknown tool in deny_tools" warning OR
+                // an unsafe shadowable name. Now both sites read the
+                // same const. `mcp_tool` itself is in the list, but
+                // we don't filter against it because no MCP server
+                // exports a tool literally named "mcp_tool" — the
+                // umbrella name is internal to dirge.
+                let builtin_names: &[&str] = tools::BUILTIN_TOOL_NAMES;
                 let filtered: Vec<crate::extras::mcp::tool::McpTool> = mcp_tools
                     .into_iter()
                     .filter(|t| {
                         let name = t.definition.name.as_ref();
-                        if BUILTIN_TOOL_NAMES.contains(&name) {
+                        if builtin_names.contains(&name) {
                             eprintln!(
                                 "warning: MCP server '{}' exports tool '{}' which collides with a dirge built-in; skipping MCP version",
                                 t.server_name, name,

@@ -69,6 +69,11 @@ pub(crate) fn is_path_tool_name(tool: &str) -> bool {
             | "list_symbols"
             | "get_symbol_body"
             | "find_callees"
+            // #1 fix: repo_overview's arg is a directory path; user
+            // rules like `"/etc/**": "deny"` need path-glob semantics
+            // for `**` to span subpaths. Was missed when the tool
+            // was added.
+            | "repo_overview"
     )
 }
 
