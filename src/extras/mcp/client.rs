@@ -4,25 +4,88 @@ use std::sync::Arc;
 
 use rmcp::service::{Peer, RoleClient, RunningService, serve_client};
 use tokio::process::{ChildStderr, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::config::McpServerConfig;
 
-/// Shared, swappable peer reference for an MCP server. Cloned by
-/// every `McpTool` from the same server so that an auto-reconnect
-/// triggered by ANY tool call updates the peer for ALL tools.
-/// Previously each `McpTool` stored a direct `Peer<RoleClient>`
-/// clone, leaving them orphaned the moment the underlying transport
-/// died (audit dirge-dvi).
-pub type SharedPeer = Arc<RwLock<Peer<RoleClient>>>;
-
-pub struct McpClientHandle {
+/// Co-owned (peer, running_service) pair for one MCP server.
+///
+/// Every `McpTool` from the same server holds the same
+/// `Arc<SharedConnection>`. On reconnect — manager-side OR
+/// tool-side — `replace` atomically swaps in a fresh peer +
+/// running_service. The OLD `RunningService` drops at the end of
+/// the swap, which cancels its cancellation_token, closes the
+/// transport, and (for child-process transports) kills the dead
+/// child. This was the M-R1 review finding: the prior code did
+/// `mem::forget(RunningService)` which leaked the spawned process.
+///
+/// Lock order to avoid deadlock: always take `running_service`
+/// before `peer`. Readers take a single lock at a time.
+pub struct SharedConnection {
+    /// Kept for debugging / tracing — every error path logs the
+    /// server name, so the structured field stays for log
+    /// correlation even when no code reads it directly.
+    #[allow(dead_code)]
     pub server_name: String,
-    pub running_service: RunningService<RoleClient, ()>,
-    /// The shared peer ref. Updated in place by `replace_peer`
-    /// when the manager reconnects, so already-handed-out McpTool
-    /// instances pick up the new peer transparently.
-    peer_ref: SharedPeer,
+    peer: RwLock<Peer<RoleClient>>,
+    /// `Option` so the consuming-`Drop` of `RunningService::cancel`
+    /// can take it out cleanly during shutdown. `None` after the
+    /// connection has been explicitly shut down.
+    running_service: Mutex<Option<RunningService<RoleClient, ()>>>,
+}
+
+impl SharedConnection {
+    /// Wrap a freshly-built (peer, running_service) pair. Pub-crate so
+    /// the manager's reconnect path can create a SharedConnection for
+    /// servers that failed initial connect but succeed later.
+    pub(crate) fn new(
+        server_name: String,
+        peer: Peer<RoleClient>,
+        rs: RunningService<RoleClient, ()>,
+    ) -> Self {
+        Self {
+            server_name,
+            peer: RwLock::new(peer),
+            running_service: Mutex::new(Some(rs)),
+        }
+    }
+
+    /// Snapshot the current peer. Cheap — `Peer` is an `mpsc::Sender`
+    /// wrapper, cloning bumps a refcount.
+    pub async fn current_peer(&self) -> Peer<RoleClient> {
+        self.peer.read().await.clone()
+    }
+
+    /// Atomically swap in a fresh (peer, running_service). The OLD
+    /// `RunningService` drops as `_old` falls out of scope, cancelling
+    /// its background task + closing its transport.
+    pub async fn replace(
+        &self,
+        new_peer: Peer<RoleClient>,
+        new_rs: RunningService<RoleClient, ()>,
+    ) {
+        // Order: take running_service first (Option swap), then peer
+        // (RwLock write). Both consumed before the OLD running_service
+        // is dropped so the new one is fully wired before the cleanup
+        // signal fires on the old transport.
+        let _old = {
+            let mut rs_guard = self.running_service.lock().await;
+            std::mem::replace(&mut *rs_guard, Some(new_rs))
+        };
+        *self.peer.write().await = new_peer;
+        // `_old` drops here. If it was `Some`, that `RunningService`'s
+        // `DropGuard` cancels its cancellation_token; the background
+        // task observes the cancel + closes the transport; the
+        // TokioChildProcess transport's drop reaps the child.
+    }
+
+    /// Explicit shutdown — drops the running service synchronously
+    /// (via `Drop`'s async-cancellation guard) and renders the
+    /// connection dead. Called by `McpClientManager::shutdown`.
+    pub async fn shutdown(&self) {
+        let mut rs = self.running_service.lock().await;
+        rs.take(); // dropping the Some(...) here triggers cleanup
+    }
 }
 
 /// Upper bound on how long we'll wait for an MCP server to complete
@@ -33,130 +96,88 @@ pub struct McpClientHandle {
 /// binaries respond in <100ms. Past the cap we abort and log.
 const MCP_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-impl McpClientHandle {
-    pub async fn connect(server_name: String, config: &McpServerConfig) -> anyhow::Result<Self> {
-        // Wrap the entire connect in a timeout so a wedged server
-        // doesn't block startup forever. Returns a clean
-        // "init timeout" error past the cap.
-        let inner = Self::connect_inner(server_name.clone(), config);
-        match tokio::time::timeout(MCP_INIT_TIMEOUT, inner).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
-                "MCP server {server_name:?} did not initialize within {}s — skipping",
-                MCP_INIT_TIMEOUT.as_secs(),
-            )),
-        }
-    }
-
-    async fn connect_inner(server_name: String, config: &McpServerConfig) -> anyhow::Result<Self> {
-        match config {
-            McpServerConfig::Command { command, args, env } => {
-                let mut cmd = Command::new(command);
-                cmd.args(args);
-                for (k, v) in env {
-                    cmd.env(k, v);
-                }
-                // CRITICAL: capture stderr instead of inheriting it.
-                // rmcp's default `TokioChildProcess::new` uses
-                // `Stdio::inherit()` for stderr, which gives the MCP
-                // server (and its descendants) direct access to
-                // dirge's controlling terminal. If the server (or
-                // any library it uses) emits terminal queries — OSC
-                // 11 for bg-color detection, `\x1b[c` for DA1,
-                // `\x1b[6n` for CPR — those queries reach the
-                // terminal, which replies via the TTY's INPUT side
-                // (dirge's stdin). Crossterm's event parser doesn't
-                // recognize those reply shapes, so the bytes sit in
-                // the OS stdin buffer until exit, when the shell
-                // inherits them and renders the literal escape
-                // payload as visible garbage at the prompt.
-                //
-                // Pipe stderr instead. The child's logs are still
-                // surfaced — we line-read them and forward to
-                // dirge's stderr via tracing — but the child no
-                // longer has a route to send escape queries that
-                // can elicit a reply on dirge's stdin.
-                let (transport, stderr) =
-                    rmcp::transport::child_process::TokioChildProcess::builder(cmd)
-                        .stderr(Stdio::piped())
-                        .spawn()?;
-                if let Some(child_stderr) = stderr {
-                    spawn_stderr_forwarder(server_name.clone(), child_stderr);
-                }
-                let running_service = serve_client((), transport).await.map_err(|e| {
-                    anyhow::anyhow!("MCP connection failed for '{server_name}': {e}")
-                })?;
-                let peer = running_service.peer().clone();
-                Ok(Self {
-                    server_name,
-                    running_service,
-                    peer_ref: Arc::new(RwLock::new(peer)),
-                })
-            }
-            McpServerConfig::Url { url, headers } => {
-                let custom_headers = parse_headers(headers)?;
-                let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
-                    .custom_headers(custom_headers);
-                type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
-                let transport = HttpClient::from_config(cfg);
-                let running_service = serve_client((), transport).await.map_err(|e| {
-                    anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-                })?;
-                let peer = running_service.peer().clone();
-                Ok(Self {
-                    server_name,
-                    running_service,
-                    peer_ref: Arc::new(RwLock::new(peer)),
-                })
-            }
-        }
-    }
-
-    /// Direct peer clone (legacy path). Prefer [`shared_peer`] in
-    /// new code so auto-reconnect updates flow through.
-    #[allow(dead_code)]
-    pub fn peer(&self) -> rmcp::service::Peer<RoleClient> {
-        self.running_service.peer().clone()
-    }
-
-    /// Shared, swappable peer ref. Cloning this `Arc` is cheap; the
-    /// inner peer is mutated in place when the server is
-    /// reconnected, so every cloned holder sees the fresh peer
-    /// on its next read.
-    pub fn shared_peer(&self) -> SharedPeer {
-        Arc::clone(&self.peer_ref)
-    }
-
-    /// Replace the inner peer with a fresh one. Called when the
-    /// manager (or a self-reconnecting McpTool) builds a new
-    /// connection — write-locks briefly, swaps, drops the lock.
-    /// Existing McpTool clones holding the same Arc see the new
-    /// peer on their next read.
-    pub async fn replace_peer(&self, new_peer: Peer<RoleClient>) {
-        let mut guard = self.peer_ref.write().await;
-        *guard = new_peer;
-    }
-
-    pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>, rmcp::ServiceError> {
-        self.running_service.peer().list_all_tools().await
+/// Connect to one MCP server and wrap the connection in a
+/// shared, swappable container. Returns the `Arc<SharedConnection>`
+/// the manager + every McpTool clone holds.
+pub async fn connect(
+    server_name: String,
+    config: &McpServerConfig,
+) -> anyhow::Result<Arc<SharedConnection>> {
+    let inner = connect_inner(server_name.clone(), config);
+    match tokio::time::timeout(MCP_INIT_TIMEOUT, inner).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "MCP server {server_name:?} did not initialize within {}s — skipping",
+            MCP_INIT_TIMEOUT.as_secs(),
+        )),
     }
 }
 
-/// Build a fresh `RunningService` for an existing server using its
-/// config. Used by the McpTool auto-reconnect path on transport
-/// failure: returns just the new peer; the caller swaps it into a
-/// `SharedPeer` and drops the old RunningService.
+async fn connect_inner(
+    server_name: String,
+    config: &McpServerConfig,
+) -> anyhow::Result<Arc<SharedConnection>> {
+    let (peer, rs) = raw_connect(&server_name, config).await?;
+    Ok(Arc::new(SharedConnection::new(server_name, peer, rs)))
+}
+
+/// Build a new `RunningService` + extract its peer, without wrapping
+/// in `SharedConnection`. Used by `SharedConnection::replace` callers
+/// (manager + tool-side auto-reconnect) which already own the
+/// container they want to swap into.
 ///
-/// This is `pub` so the tool side can call it without owning a full
-/// `McpClientHandle`. Wraps `connect_inner` directly to skip the
-/// init-timeout layer (caller already times out the whole reconnect).
-pub async fn fresh_peer_for(
+/// Does NOT wrap in `MCP_INIT_TIMEOUT` — the caller times out the
+/// whole reconnect operation.
+pub async fn raw_connect(
     server_name: &str,
     config: &McpServerConfig,
 ) -> anyhow::Result<(Peer<RoleClient>, RunningService<RoleClient, ()>)> {
-    let handle = McpClientHandle::connect(server_name.to_string(), config).await?;
-    let peer = handle.running_service.peer().clone();
-    Ok((peer, handle.running_service))
+    match config {
+        McpServerConfig::Command { command, args, env } => {
+            let mut cmd = Command::new(command);
+            cmd.args(args);
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+            // CRITICAL: capture stderr instead of inheriting it.
+            // See lengthy explanation below at the original
+            // call site — terminal-query bytes from the child must
+            // not reach dirge's stdin via the controlling TTY.
+            let (transport, stderr) =
+                rmcp::transport::child_process::TokioChildProcess::builder(cmd)
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+            if let Some(child_stderr) = stderr {
+                spawn_stderr_forwarder(server_name.to_string(), child_stderr);
+            }
+            let rs = serve_client((), transport)
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP connection failed for '{server_name}': {e}"))?;
+            let peer = rs.peer().clone();
+            Ok((peer, rs))
+        }
+        McpServerConfig::Url { url, headers } => {
+            let custom_headers = parse_headers(headers)?;
+            let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                .custom_headers(custom_headers);
+            type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+            let transport = HttpClient::from_config(cfg);
+            let rs = serve_client((), transport).await.map_err(|e| {
+                anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+            })?;
+            let peer = rs.peer().clone();
+            Ok((peer, rs))
+        }
+    }
+}
+
+/// List the tools the server advertises. Called once at startup
+/// (or after manual reconnect) to build the agent's tool registry.
+pub async fn list_tools(
+    conn: &SharedConnection,
+) -> Result<Vec<rmcp::model::Tool>, rmcp::ServiceError> {
+    let peer = conn.current_peer().await;
+    peer.list_all_tools().await
 }
 
 /// Forward an MCP child's stderr line-by-line to dirge's tracing

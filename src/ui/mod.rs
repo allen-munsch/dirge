@@ -289,9 +289,9 @@ fn build_panel_data(
     #[cfg(feature = "mcp")]
     let mcp: Vec<(String, bool)> = mcp_manager
         .map(|m| {
-            m.handles
-                .iter()
-                .map(|h| (h.server_name.clone(), true))
+            m.connections_snapshot()
+                .into_iter()
+                .map(|(name, _conn)| (name, true))
                 .collect()
         })
         .unwrap_or_default();

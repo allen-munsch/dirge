@@ -626,21 +626,22 @@ pub async fn handle_slash(
                 renderer.write_line("no MCP servers configured", c_agent())?;
                 return Ok(());
             };
-            if mgr.handles.is_empty() {
+            let connections = mgr.connections_snapshot();
+            if connections.is_empty() {
                 renderer.write_line("no MCP servers connected", c_agent())?;
             } else if parts.len() == 1 {
                 renderer.write_line("MCP servers:", c_agent())?;
-                for handle in &mgr.handles {
-                    match handle.list_tools().await {
+                for (server_name, conn) in &connections {
+                    match crate::extras::mcp::client::list_tools(conn).await {
                         Ok(tools) => {
                             renderer.write_line(
-                                &format!("  {} ({} tools)", handle.server_name, tools.len()),
+                                &format!("  {} ({} tools)", server_name, tools.len()),
                                 c_result(),
                             )?;
                         }
                         Err(e) => {
                             renderer.write_line(
-                                &format!("  {} (error: {})", handle.server_name, e),
+                                &format!("  {} (error: {})", server_name, e),
                                 c_error(),
                             )?;
                         }
@@ -648,8 +649,8 @@ pub async fn handle_slash(
                 }
             } else {
                 let name = parts[1].trim();
-                if let Some(handle) = mgr.handles.iter().find(|h| h.server_name == name) {
-                    match handle.list_tools().await {
+                if let Some(conn) = connections.iter().find(|(n, _)| n == name).map(|(_, c)| c) {
+                    match crate::extras::mcp::client::list_tools(conn).await {
                         Ok(tools) => {
                             if tools.is_empty() {
                                 renderer.write_line(

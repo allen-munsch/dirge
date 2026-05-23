@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rig::completion::ToolDefinition;
 use rig::tool::{ToolDyn, ToolError};
@@ -10,7 +11,7 @@ use rmcp::model::{CallToolRequestParams, JsonObject, RawContent};
 use tokio::sync::Mutex;
 
 use crate::agent::tools::check_perm;
-use crate::extras::mcp::client::{SharedPeer, fresh_peer_for};
+use crate::extras::mcp::client::{SharedConnection, raw_connect};
 use crate::extras::mcp::config::McpServerConfig;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
@@ -29,43 +30,48 @@ impl std::error::Error for McpToolError {}
 pub struct McpTool {
     pub server_name: String,
     pub definition: rmcp::model::Tool,
-    /// Shared, swappable peer ref — see `crate::extras::mcp::client::SharedPeer`.
-    /// Updated by either the manager's manual reconnect or this
-    /// tool's own auto-reconnect path on transport failure
-    /// (audit dirge-dvi).
-    pub peer: SharedPeer,
+    /// Shared connection — peer + running_service co-owned with the
+    /// manager and every other McpTool from this server. M-R1 review
+    /// fix: previously each tool held a bare `Peer<RoleClient>` clone
+    /// + a separately leaked `RunningService`; the new shape keeps
+    /// the running_service alive THROUGH the swap so reconnects
+    /// don't leak the spawned child process.
+    pub connection: Arc<SharedConnection>,
     /// Server config retained so a transport-class failure can
     /// trigger a self-reconnect without going through the manager.
     /// `None` for tools constructed by callers that don't supply
     /// the config (e.g. tests); auto-reconnect is skipped in that
     /// case and a clear error surfaces instead.
     pub config: Option<Arc<McpServerConfig>>,
-    /// Per-server lock + generation counter. Multiple in-flight
-    /// tool calls failing concurrently all wait on this; the
-    /// generation lets the first reconnect mark the swap done so
-    /// later callers re-read the peer without redundant
-    /// reconnects. Cloned across all McpTools from the same
-    /// server.
+    /// Per-server lock + generation counter. Multiple in-flight tool
+    /// calls failing concurrently all wait on this; the gen lets the
+    /// first reconnect mark the swap done so later callers re-read
+    /// the peer without redundant reconnects. M-R2 review fix:
+    /// constructed once per server at manager startup, not per
+    /// `collect_tools` call, so the gen counter is canonical for
+    /// the entire process lifetime.
     pub reconnect_lock: Arc<Mutex<u64>>,
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
 }
 
-/// Decide whether a [`ServiceError`] looks like the transport died
-/// (worth a reconnect) versus an application-level error from the
-/// MCP server's tool implementation (surface to the LLM as-is).
-/// `TransportSend` and `TransportClosed` are the canonical transport
-/// failure variants; `UnexpectedResponse` and `Timeout` are also
-/// good candidates since both typically indicate the server is
-/// wedged. `McpError` is the actual tool-returned-an-error case —
-/// reconnecting wouldn't help.
+/// Classify a [`ServiceError`] as transport-class (worth reconnecting)
+/// versus everything else (surface as-is). M-R5 review tightening:
+/// narrowed from the original aggressive set. Only the two unambiguous
+/// transport-failure variants reconnect:
+///
+/// - `TransportSend` — the underlying writer failed.
+/// - `TransportClosed` — the receiver task on our side observed EOF.
+///
+/// `UnexpectedResponse` (protocol mismatch — server is alive but
+/// buggy), `Timeout` (a slow tool legitimately running long), and
+/// `Cancelled` (user-driven abort) intentionally fall through to the
+/// surface-as-is path. Reconnecting on those would mask real bugs or
+/// tear down healthy connections mid-run.
 fn is_transport_failure(err: &ServiceError) -> bool {
     matches!(
         err,
-        ServiceError::TransportSend(_)
-            | ServiceError::TransportClosed
-            | ServiceError::UnexpectedResponse
-            | ServiceError::Timeout { .. }
+        ServiceError::TransportSend(_) | ServiceError::TransportClosed
     )
 }
 
@@ -103,7 +109,7 @@ impl ToolDyn for McpTool {
     fn call(&self, args: String) -> WasmBoxedFuture<'_, Result<String, ToolError>> {
         let server_name = self.server_name.clone();
         let tool_name = self.definition.name.to_string();
-        let peer_ref = self.peer.clone();
+        let connection = Arc::clone(&self.connection);
         let config = self.config.clone();
         let reconnect_lock = self.reconnect_lock.clone();
         let permission = self.permission.clone();
@@ -170,23 +176,23 @@ impl ToolDyn for McpTool {
             // loop, lost stdin pipe), the await never resolves and
             // the agent turn stalls indefinitely. Cap at 120s to
             // match `bash`'s default timeout — anything longer is
-            // clearly broken on the server side. The error message
-            // names the server + tool so the user can identify
-            // which MCP server is misbehaving.
-            const MCP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+            // clearly broken on the server side.
+            //
+            // The cap is a TOTAL budget for the whole try-reconnect-
+            // retry cycle (M-R3 review fix), not per-attempt. Worst
+            // case the user waits 120s for everything; previously the
+            // budget was 240s = 2 × 120s.
+            const MCP_CALL_BUDGET: Duration = Duration::from_secs(120);
+            let started = Instant::now();
 
-            // Auto-reconnect path (audit dirge-dvi): try once; on
-            // transport-class failure, swap the shared peer and
-            // retry once. Tool-application errors (`ServiceError::
-            // McpError`) bypass the retry — the server is alive,
-            // the tool just refused.
             let result = match try_call_with_reconnect(
                 &server_name,
-                &peer_ref,
+                &connection,
                 config.as_deref(),
                 &reconnect_lock,
-                params.clone(),
-                MCP_CALL_TIMEOUT,
+                params,
+                started,
+                MCP_CALL_BUDGET,
             )
             .await
             {
@@ -266,35 +272,42 @@ impl ToolDyn for McpTool {
 }
 
 /// Try `peer.call_tool` once; on transport-class failure, swap the
-/// shared peer for a freshly-reconnected one and retry exactly
-/// once. Tool-level errors (server returned an error response)
-/// surface verbatim without retry — reconnecting wouldn't help.
+/// shared connection for a freshly-reconnected one and retry exactly
+/// once. Tool-level errors (server returned an error response) and
+/// non-transport ServiceErrors surface verbatim — reconnecting
+/// wouldn't help.
+///
+/// `started` + `total_budget` define the deadline for the WHOLE
+/// try-reconnect-retry cycle (M-R3 fix). Each `call_once` invocation
+/// receives whatever budget remains, so the worst-case latency
+/// matches the prior single-attempt timeout.
 ///
 /// The reconnect_lock + gen counter serializes concurrent callers
 /// failing against the same dead transport: the first reconnects,
 /// later callers see the bumped gen and skip the redundant work.
-/// Config is required for the reconnect path; without it (caller
-/// didn't supply one), the transport error surfaces immediately.
+/// Config is required for the reconnect path; without it the
+/// transport error surfaces immediately.
 async fn try_call_with_reconnect(
     server_name: &str,
-    peer_ref: &SharedPeer,
+    connection: &Arc<SharedConnection>,
     config: Option<&McpServerConfig>,
     reconnect_lock: &Arc<Mutex<u64>>,
     params: CallToolRequestParams,
-    timeout: std::time::Duration,
+    started: Instant,
+    total_budget: Duration,
 ) -> Result<rmcp::model::CallToolResult, String> {
-    // Snapshot the generation BEFORE the first call so we can
-    // detect after-the-fact reconnects below.
+    // Snapshot the generation BEFORE the first call so we can detect
+    // after-the-fact reconnects below.
     let gen_before = *reconnect_lock.lock().await;
 
-    let first = call_once(server_name, peer_ref, params.clone(), timeout).await;
+    let remaining = remaining_budget(started, total_budget);
+    let first = call_once(server_name, connection, params.clone(), remaining).await;
     let err = match first {
         Ok(r) => return Ok(r),
         Err(e) => e,
     };
 
-    // Non-transport error → surface as-is (server is alive but the
-    // tool refused).
+    // Non-transport error → surface as-is.
     let Some(svc_err) = err.as_service_error() else {
         return Err(err.message);
     };
@@ -302,10 +315,7 @@ async fn try_call_with_reconnect(
         return Err(err.message);
     }
 
-    // Transport failure. Without config we can't reconnect — and
-    // without a retry, the user just sees the original error.
-    // That's still better than the pre-fix behaviour where every
-    // subsequent call would also fail until they restarted dirge.
+    // Transport failure. Without config we can't reconnect.
     let Some(cfg) = config else {
         return Err(format!(
             "{}\n(auto-reconnect unavailable — no config retained for server '{}')",
@@ -322,38 +332,34 @@ async fn try_call_with_reconnect(
                 server = %server_name,
                 "transport failure detected — attempting auto-reconnect",
             );
-            match fresh_peer_for(server_name, cfg).await {
-                Ok((new_peer, _new_running_service)) => {
-                    *peer_ref.write().await = new_peer;
+            // Bound the reconnect at the remaining budget so a wedged
+            // server doesn't burn the whole thing without leaving any
+            // for the retry call.
+            let reconnect_budget = remaining_budget(started, total_budget);
+            let reconnect_result =
+                tokio::time::timeout(reconnect_budget, raw_connect(server_name, cfg)).await;
+            match reconnect_result {
+                Ok(Ok((new_peer, new_rs))) => {
+                    connection.replace(new_peer, new_rs).await;
                     *gen_guard += 1;
                     tracing::info!(
                         target: "dirge::mcp",
                         server = %server_name,
                         "MCP server reconnected after transport failure",
                     );
-                    // NB: we drop `_new_running_service` after this
-                    // scope. That looks like it'd kill the
-                    // child immediately, but rmcp's RunningService
-                    // keeps the spawned process alive only while
-                    // SOMEONE holds the service. We need to retain
-                    // it for the lifetime of the connection —
-                    // otherwise the new peer points at a process
-                    // we just terminated. Leak it intentionally so
-                    // the connection stays up; the manager-side
-                    // reconnect path replaces the manager's
-                    // RunningService cleanly, but the tool-side
-                    // auto-reconnect path doesn't have access to
-                    // the manager. This leaks 1 RunningService per
-                    // auto-reconnect — bounded by reconnect
-                    // frequency. Acceptable for a P3 follow-up;
-                    // a tighter design routes reconnects through
-                    // the manager via a channel.
-                    std::mem::forget(_new_running_service);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     return Err(format!(
                         "{}\n(auto-reconnect to '{}' also failed: {})",
                         err.message, server_name, e,
+                    ));
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "{}\n(auto-reconnect to '{}' timed out within the {}s budget)",
+                        err.message,
+                        server_name,
+                        total_budget.as_secs(),
                     ));
                 }
             }
@@ -363,13 +369,29 @@ async fn try_call_with_reconnect(
     }
 
     // Second attempt with the fresh peer.
-    match call_once(server_name, peer_ref, params, timeout).await {
+    let remaining = remaining_budget(started, total_budget);
+    if remaining.is_zero() {
+        return Err(format!(
+            "MCP tool {}::{} budget ({}s) exhausted before retry",
+            server_name,
+            params.name,
+            total_budget.as_secs(),
+        ));
+    }
+    match call_once(server_name, connection, params, remaining).await {
         Ok(r) => Ok(r),
         Err(e) => Err(format!(
-            "{}\n(after auto-reconnect retry; original failure: transport-class)",
+            "{}\n(reconnected but the retry also failed)",
             e.message,
         )),
     }
+}
+
+/// Time left in the budget. Returns `Duration::ZERO` (NOT a negative)
+/// when the deadline has passed; `tokio::time::timeout(ZERO, _)` then
+/// fires immediately and surfaces the budget-exhausted state.
+fn remaining_budget(started: Instant, total: Duration) -> Duration {
+    total.saturating_sub(started.elapsed())
 }
 
 /// Tagged error for `try_call_with_reconnect` — distinguishes
@@ -388,14 +410,16 @@ impl CallErr {
 
 async fn call_once(
     server_name: &str,
-    peer_ref: &SharedPeer,
+    connection: &Arc<SharedConnection>,
     params: CallToolRequestParams,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> Result<rmcp::model::CallToolResult, CallErr> {
     let tool_name = params.name.to_string();
-    // Take a short read-lock so the peer can be swapped between
-    // calls but the call itself doesn't hold the lock.
-    let peer = peer_ref.read().await.clone();
+    // Snapshot the current peer. Held briefly across the read-lock;
+    // the actual call doesn't hold the lock so another caller can
+    // swap the peer (manager-side or tool-side reconnect) without
+    // blocking on us.
+    let peer = connection.current_peer().await;
     match tokio::time::timeout(timeout, peer.call_tool(params)).await {
         Ok(Ok(r)) => Ok(r),
         Ok(Err(svc_err)) => {
@@ -419,30 +443,46 @@ async fn call_once(
 mod tests {
     use super::*;
 
-    /// Classification matrix for `is_transport_failure`. Locks in
-    /// the audit dirge-dvi contract: only transport-class errors
-    /// trigger auto-reconnect; tool-application errors surface
-    /// directly to the agent.
+    /// Classification matrix for `is_transport_failure`. M-R5 review
+    /// tightening: ONLY the two unambiguous transport-failure
+    /// variants reconnect. `UnexpectedResponse`, `Timeout`,
+    /// `McpError`, `Cancelled` surface as-is — previously
+    /// `UnexpectedResponse`+`Timeout` reconnected too, which would
+    /// tear down healthy connections on a slow tool or a buggy
+    /// server reply.
     #[test]
     fn is_transport_failure_classifies_correctly() {
-        // Transport-class → reconnect candidate
+        // Transport-class → reconnect
         assert!(is_transport_failure(&ServiceError::TransportClosed));
-        assert!(is_transport_failure(&ServiceError::UnexpectedResponse));
-        assert!(is_transport_failure(&ServiceError::Timeout {
-            timeout: std::time::Duration::from_secs(1),
-        }));
 
-        // Tool-application error → NOT a reconnect candidate
+        // Non-transport → surface as-is.
+        assert!(!is_transport_failure(&ServiceError::UnexpectedResponse));
+        assert!(!is_transport_failure(&ServiceError::Timeout {
+            timeout: Duration::from_secs(1),
+        }));
         let mcp_err = rmcp::ErrorData::new(
             rmcp::model::ErrorCode::INTERNAL_ERROR,
             "the tool refused",
             None,
         );
         assert!(!is_transport_failure(&ServiceError::McpError(mcp_err)));
-
-        // Cancelled → not a reconnect trigger (caller-driven, not transport)
         assert!(!is_transport_failure(&ServiceError::Cancelled {
             reason: Some("user".into()),
         }));
+    }
+
+    /// `remaining_budget` decays as time passes and saturates at
+    /// zero past the deadline (no negative durations / underflow).
+    #[test]
+    fn remaining_budget_decays_and_saturates() {
+        let now = Instant::now();
+        let total = Duration::from_millis(100);
+        // Fresh start — full budget available.
+        let r1 = remaining_budget(now, total);
+        assert!(r1 > Duration::from_millis(90));
+        // Past the deadline — saturates to ZERO, not negative.
+        std::thread::sleep(Duration::from_millis(110));
+        let r2 = remaining_budget(now, total);
+        assert_eq!(r2, Duration::ZERO);
     }
 }
