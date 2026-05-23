@@ -4,9 +4,7 @@ use tokio::process::Command;
 use tokio::time::Duration;
 
 use crate::agent::tools::cache::ToolCache;
-#[cfg(feature = "semantic-bash")]
-use crate::agent::tools::check_perm_path;
-use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError, check_perm};
+use crate::agent::tools::{AskSender, BashArgs, PermCheck, Scope, ToolError, enforce};
 
 use crate::sandbox::Sandbox;
 #[cfg(feature = "semantic-bash")]
@@ -326,29 +324,47 @@ async fn check_bash_segments(
     ask_tx: &Option<AskSender>,
     command: &str,
 ) -> Result<(), ToolError> {
+    // M3 (dirge-6ab): every bash permission decision routes through
+    // the `enforce` chokepoint. Each compound-statement segment is
+    // checked independently so `git diff && rm -rf /` gets BOTH `git`
+    // AND `rm` checked against the user's bash rules — not just the
+    // leading command. Redirect targets (`> file`) additionally route
+    // through the `write` tool rules so write/edit path rules apply,
+    // closing the C4 audit gap where targets hit bash rules with
+    // path-string inputs and fell through to default Allow.
     #[cfg(feature = "semantic-bash")]
     {
         let (segments, complex) = bash::parse_bash_segments_full(command)
             .unwrap_or_else(|_| (vec![command.to_string()], false));
 
         if complex {
-            return check_perm(permission, ask_tx, "bash", command).await;
+            // Subshell / command substitution / process substitution /
+            // arithmetic expansion: tree-sitter declined to split.
+            // Force a prompt on the WHOLE command so the user
+            // confirms the unfamiliar shape. Maki does the same
+            // (maki-agent/src/permissions.rs:441-455).
+            enforce(permission, ask_tx, "bash", Scope::Raw(command)).await?;
+            return Ok(());
         }
 
         for segment in &segments {
-            check_perm(permission, ask_tx, "bash", segment).await?;
+            enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
         }
 
-        // C4 (audit fix): the segment loop above only checks each
-        // *command*. Output redirections (`> /etc/something`,
-        // `>> ~/.ssh/authorized_keys`) write files that the path
-        // permission gate would otherwise refuse. Route every
-        // redirect target through `check_perm_path` so write/edit's
-        // path rules also apply to redirects. False-positive prompts
-        // (read-side `< file`) are acceptable; bypassing the path
-        // gate via `echo … > sensitive` is not.
+        // M3 fix to the C4 redirect-target gap: route targets through
+        // the `write` tool name (not `bash`), since redirection
+        // semantically writes files. Previously this was routed as
+        // `check_perm_path(tool="bash", path=&target)`, looking the
+        // target up in BASH rules — command-style globs that don't
+        // match path strings, falling through to default Allow. With
+        // `tool="write"` the user's write rules govern: deny lists
+        // (`/etc/**`, `~/.ssh/**`, `~/.aws/credentials`) now fire on
+        // bash redirects too. Falsely-prompting `< file` (read-side)
+        // is acceptable; the `extract_redirect_targets` walker
+        // intentionally skips heredoc / herestring and only emits
+        // write-side targets (`>`, `>>`, `&>`, `1>`, `2>`).
         for target in bash::extract_redirect_targets(command) {
-            check_perm_path(permission, ask_tx, "bash", &target).await?;
+            enforce(permission, ask_tx, "write", Scope::PathResolve(&target)).await?;
         }
         Ok(())
     }
@@ -390,10 +406,11 @@ async fn check_bash_segments(
             || command.contains(">(")
             || command.contains("$'");
         if has_substitution {
-            return check_perm(permission, ask_tx, "bash", command).await;
+            enforce(permission, ask_tx, "bash", Scope::Raw(command)).await?;
+            return Ok(());
         }
         for segment in &segments {
-            check_perm(permission, ask_tx, "bash", segment).await?;
+            enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
         }
         Ok(())
     }
@@ -686,5 +703,104 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert!(segments[0].contains("a; b"));
         assert_eq!(segments[1], "ls");
+    }
+
+    // M3 (dirge-6ab) — segment-level bash gating regression tests.
+    // These pin the "every command in a compound gets checked
+    // separately" invariant the user asked about
+    // ("agent runs `git diff && rm -rf /`, what happens?").
+
+    /// `git diff && rm -rf /` must be denied — the second segment
+    /// hits the default `rm -rf /**` deny rule even though the
+    /// first segment is allowlisted. Pre-this-test, the path was
+    /// covered by the parser test in `semantic::adapters::bash`,
+    /// but nothing end-to-end pinned that `check_bash_segments`
+    /// actually walks the segments through the perm checker.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn compound_command_denies_dangerous_segment() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result =
+            check_bash_segments(&Some(perm), &None, "git diff && rm -rf /").await;
+        assert!(
+            result.is_err(),
+            "compound: rm segment must hit deny rule even after safe git segment; got {result:?}",
+        );
+        let msg = format!("{:?}", result);
+        assert!(
+            msg.contains("denied") || msg.contains("Denied"),
+            "expected 'denied' in error: {msg}",
+        );
+    }
+
+    /// Output redirect targets route through the `write` tool rules
+    /// (M3 fix to the C4 audit). Pre-fix: `tool="bash"` lookup with a
+    /// path string, no matching command pattern, fell through to
+    /// default Allow — `echo hi > /etc/passwd` ran without prompting.
+    /// Post-fix: routes through write rules.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn redirect_target_routes_through_write_rules() {
+        use crate::permission::{
+            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+        };
+        use std::collections::HashMap;
+
+        // Configure write to deny everywhere; without an explicit
+        // rule the M2/M4-pre default is still Allow, so we set an
+        // explicit deny to make the test robust against the
+        // default-flip.
+        let mut write_rules = HashMap::new();
+        write_rules.insert("/etc/**".to_string(), Action::Deny);
+        let config = PermissionConfig {
+            write: Some(ToolPerm::Granular(write_rules)),
+            ..Default::default()
+        };
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result =
+            check_bash_segments(&Some(perm), &None, "echo hi > /etc/passwd").await;
+        assert!(
+            result.is_err(),
+            "redirect to /etc/passwd should be denied by write rules; got {result:?}",
+        );
+    }
+
+    /// Sibling check: a redirect target inside the working directory
+    /// (non-external) passes the write-rules check. Without this, a
+    /// regression that over-broadly denied all redirects could pass
+    /// the negative case above and ship.
+    ///
+    /// Uses an in-cwd path because the catch-all at
+    /// `permission/checker.rs:434` upgrades unmatched-Allow to Ask
+    /// for EXTERNAL paths — so `/tmp/x` (external to the test's cwd
+    /// of the dirge repo) would test the external-path catch-all,
+    /// not the write-rules-allow path we want to exercise here.
+    /// M3 is intentionally tightening external bash-redirects to
+    /// prompt; this test pins the in-cwd happy path.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn redirect_target_allowed_when_write_permits() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        // Use the cwd-relative target so the external-path Ask
+        // upgrade doesn't fire. `target/test-out.txt` is inside
+        // any cargo-test invocation's working directory.
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result =
+            check_bash_segments(&Some(perm), &None, "echo hi > target/test-out.txt").await;
+        assert!(
+            result.is_ok(),
+            "redirect to in-cwd target should pass; got {result:?}",
+        );
     }
 }
