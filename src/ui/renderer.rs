@@ -29,6 +29,13 @@ pub const MAX_INPUT_VISIBLE_LINES: usize = 8;
 /// permission prompts both live INSIDE the frame.
 pub const ALERT_FRAME_ROWS: u16 = 2;
 
+/// ui-redesign: chat area is wrapped in a heavy double-line frame
+/// titled `[AGENT LOG STREAM]`. Two reserved rows = top border
+/// (row 0) + bottom border (row 1 + visible_lines). Side borders
+/// (║ … ║) are painted at the chat-band edges on every visible
+/// chat row when there's room (content_indent >= 1).
+pub const CHAT_FRAME_ROWS: u16 = 2;
+
 /// Width of the optional right-hand info panel content area, in columns.
 /// Plus one column for the vertical divider gives `PANEL_RESERVE`.
 const PANEL_WIDTH: u16 = 32;
@@ -523,7 +530,7 @@ impl Renderer {
     /// Subtracts the input box (`input_rows`) and the status line (1 row).
     pub fn visible_lines(&self) -> usize {
         let (_, rows) = self.terminal_size();
-        rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS) as usize
+        rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS) as usize
     }
 
     /// The screen row index where the input box starts. Overlays that need
@@ -567,9 +574,19 @@ impl Renderer {
 
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
         let (_, rows) = self.terminal_size();
-        let visible = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS) as usize;
+        let visible = rows
+            .saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS)
+            as usize;
         let total = self.buffer.len();
         if total == 0 {
+            return None;
+        }
+        // ui-redesign: row 0 is the chat top frame; chat rows start
+        // at row 1. Map screen row → chat-content row by subtracting
+        // the frame offset; rows above the chat area have no buffer
+        // line.
+        let chat_row = row.checked_sub(1)? as usize;
+        if chat_row >= visible {
             return None;
         }
         let start = if self.scroll_offset == 0 {
@@ -578,7 +595,7 @@ impl Renderer {
             total.saturating_sub(self.scroll_offset + visible)
         };
         let start = start.min(total.saturating_sub(visible));
-        let idx = start + row as usize;
+        let idx = start + chat_row;
         if idx < total { Some(idx) } else { None }
     }
 
@@ -775,9 +792,11 @@ impl Renderer {
     }
 
     pub fn render_viewport(&mut self) -> io::Result<()> {
-        let (_, rows) = self.terminal_size();
+        let (cols, rows) = self.terminal_size();
         let content_cols = self.content_cols();
-        let visible = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS) as usize;
+        let visible = rows
+            .saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS)
+            as usize;
         let total = self.buffer.len();
         let mut stdout = io::stdout();
         // Keep the cursor hidden while we paint many rows; draw_bottom is
@@ -802,8 +821,12 @@ impl Renderer {
         // the divider/panel.
         let indent = self.content_indent();
         let line_cap = content_band.saturating_sub(indent);
+        // ui-redesign: row 0 is the chat top frame; rows 1..1+visible
+        // are chat content. Offset chat painting by CHAT_FRAME_ROWS/2
+        // (= 1) so frame top has its own row.
+        let chat_y0: u16 = 1;
         for i in 0..visible {
-            stdout.execute(MoveTo(0, i as u16))?;
+            stdout.execute(MoveTo(0, chat_y0 + i as u16))?;
             // Paint indent spaces (no color) so any stale text on the
             // left edge from a wider previous line gets wiped.
             if indent > 0 {
@@ -906,6 +929,59 @@ impl Renderer {
             }
         }
 
+        // ui-redesign: paint the chat frame around the visible chat
+        // area. Frame brackets the centered content_width band so
+        // the left subagent gutter + right panel stay outside.
+        // Skips when the content band sits flush against col 0
+        // (terminal too narrow for the frame) so the chat doesn't
+        // lose width unnecessarily.
+        let chat_width = self.content_width();
+        if indent >= 1 && chat_width > 0 {
+            let frame_left = indent.saturating_sub(1) as u16;
+            let frame_right = (indent + chat_width) as u16;
+            let frame_span = (frame_right - frame_left + 1) as usize; // inclusive
+            let header_color = self.color(crate::ui::theme::header());
+            // Top border with centered `[AGENT LOG STREAM]` title.
+            let title = "[AGENT LOG STREAM]";
+            let title_w = title.chars().count();
+            let inner_span = frame_span.saturating_sub(2); // minus corners
+            let fill = inner_span.saturating_sub(title_w);
+            let l = fill / 2;
+            let r = fill - l;
+            stdout.execute(MoveTo(frame_left, 0))?;
+            write!(stdout, "{}", SetForegroundColor(header_color))?;
+            write!(
+                stdout,
+                "╔{}{}{}╗",
+                "═".repeat(l),
+                title,
+                "═".repeat(r),
+            )?;
+            write!(stdout, "{}", ResetColor)?;
+            // Side borders on every chat content row.
+            for i in 0..visible {
+                let row = chat_y0 + i as u16;
+                stdout.execute(MoveTo(frame_left, row))?;
+                write!(stdout, "{}", SetForegroundColor(header_color))?;
+                write!(stdout, "║")?;
+                if frame_right < cols {
+                    stdout.execute(MoveTo(frame_right, row))?;
+                    write!(stdout, "║")?;
+                }
+                write!(stdout, "{}", ResetColor)?;
+            }
+            // Bottom border directly above the input frame.
+            let bot_row = chat_y0 + visible as u16;
+            stdout.execute(MoveTo(frame_left, bot_row))?;
+            write!(stdout, "{}", SetForegroundColor(header_color))?;
+            write!(
+                stdout,
+                "╚{}╝",
+                "═".repeat(inner_span),
+            )?;
+            write!(stdout, "{}", ResetColor)?;
+        }
+
         if self.scroll_offset > 0 {
             let pct = if total > visible {
                 ((total - self.scroll_offset - visible) * 100 / (total - visible)).min(100)
@@ -914,7 +990,9 @@ impl Renderer {
             };
             let indicator = format!(" SCROLL {}% ", pct);
             let x = content_cols.saturating_sub(indicator.len() as u16);
-            stdout.execute(MoveTo(x, 0))?;
+            // Row 1 — just below the top frame so the indicator doesn't
+            // overwrite `[AGENT LOG STREAM]`.
+            stdout.execute(MoveTo(x, 1))?;
             write!(
                 stdout,
                 "{}",
@@ -2663,10 +2741,10 @@ mod tests {
     #[test]
     fn buffer_pos_at_clamps_past_eol() {
         let r = fresh_with_text(&["short"]);
-        // With one buffer line and scroll_offset=0,
-        // `buffer_line_at_row` returns Some(0) for row 0 (start = 0
-        // after saturating, idx = row).
-        let pos = r.buffer_pos_at(0, 999);
+        // Row 0 is the chat top frame in the ui-redesign; row 1 is
+        // the first chat content row. `buffer_line_at_row` returns
+        // Some(0) for row 1 (start = 0 after saturating, idx = 0).
+        let pos = r.buffer_pos_at(1, 999);
         assert_eq!(pos, Some((0, 5)));
     }
 
@@ -2722,8 +2800,9 @@ mod tests {
             color: Color::Reset,
         });
         // Click well past the visible end. content_indent() is 0
-        // in the default test renderer, so col == char_col.
-        let pos = r.buffer_pos_at(0, 999).expect("must resolve");
+        // in the default test renderer, so col == char_col. Row 1
+        // is the first chat content row (row 0 is the chat frame).
+        let pos = r.buffer_pos_at(1, 999).expect("must resolve");
         assert_eq!(pos.1, 15, "clamp should hit visible length 15, not raw 25");
     }
 
@@ -2840,6 +2919,7 @@ mod tests {
             lsp: Vec::new(),
             todos: Vec::new(),
             modified: entries,
+            sysload: None,
         });
         // Force a known terminal height; width irrelevant to this test.
         let lines = r.build_panel_lines(30, 50);
@@ -2877,6 +2957,7 @@ mod tests {
             lsp: Vec::new(),
             todos: Vec::new(),
             modified: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+            sysload: None,
         });
         let lines = r.build_panel_lines(30, 50);
         let footer_present = lines
@@ -2898,6 +2979,7 @@ mod tests {
             lsp: vec![("rust".into(), "/r".into(), true)],
             todos: vec![("[~]".into(), "t".into())],
             modified: vec!["x.rs".into()],
+            sysload: None,
         });
         // Very short — cwd + MCP + LSP + TODOS already eat most of it.
         let lines = r.build_panel_lines(30, 12);

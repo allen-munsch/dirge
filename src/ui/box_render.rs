@@ -153,16 +153,19 @@ pub fn top(style: BoxStyle, title: &str, total_w: usize) -> String {
         BoxStyle::Rounded => {
             // Legacy: `╭─ TITLE ─────╮` — left-anchored, single-
             // line shape. Tool chambers + inline alerts use this.
+            // Layout: corner + hch + ' ' + title + ' ' + hch + fill
+            //         + hch + corner = 7 fixed + title + fill cells.
             let title_w = UnicodeWidthStr::width(title);
             const OVERHEAD: usize = 7;
             let fill = total_w.saturating_sub(OVERHEAD).saturating_sub(title_w);
             format!(
-                "{}{} {} {}{}{}",
+                "{}{} {} {}{}{}{}",
                 style.top_left(),
                 hstr,
                 title,
                 hstr,
                 hstr.repeat(fill),
+                hstr,
                 style.top_right(),
             )
         }
