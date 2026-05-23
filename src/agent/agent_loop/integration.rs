@@ -850,6 +850,7 @@ mod tests {
             AgentEvent::TurnStart { .. } => "TurnStart",
             AgentEvent::TurnEnd { .. } => "TurnEnd",
             AgentEvent::Interjected { .. } => "Interjected",
+            AgentEvent::CustomMessage { .. } => "CustomMessage",
         }
     }
 

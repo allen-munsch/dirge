@@ -145,6 +145,9 @@ fn dump_events(events: &[AgentEvent]) {
                 eprintln!("\n[context_overflow] {error}");
             }
             AgentEvent::Interjected { .. } => eprintln!("\n[interjected]"),
+            AgentEvent::CustomMessage { payload } => {
+                eprintln!("\n[custom_message] {payload}");
+            }
         }
     }
     eprintln!();

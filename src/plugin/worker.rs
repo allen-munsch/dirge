@@ -361,6 +361,25 @@ const HARNESS_INIT: &str = r#"
   (when (string? session-id)
     (harness/-push-op "switch-session" session-id)))
 
+# Plugin-registered renderers for `LoopMessage::Custom` events (P9d).
+# Mirrors pi's `api.registerMessageRenderer(customType, renderer)`
+# (extensions/types.ts:1171). Plugins call
+#   (harness/register-message-renderer type-name handler)
+# to provide a Janet function that the UI invokes when it sees a
+# custom message whose JSON payload's `type` field matches. The
+# handler receives the payload as a JSON string and returns the
+# text to display. Distinct from `harness/register-renderer`, which
+# is for session-timeline plugin entries (bookmarks, etc.) — message
+# renderers fire mid-conversation as the agent loop emits Custom
+# messages plugins queued via `harness/add-custom-message`.
+(var harness-msg-renderers-list "")
+(defn harness/register-message-renderer [type-name handler]
+  (when (and (string? type-name) (string? handler))
+    (set harness-msg-renderers-list
+         (string harness-msg-renderers-list
+                 (harness/-escape type-name) "\t"
+                 (harness/-escape handler) "\n"))))
+
 # Plugin-registered keyboard shortcuts (P9c). Plugins call
 #   (harness/register-shortcut keys handler &opt description)
 # to bind a key combination to a Janet handler the host invokes in

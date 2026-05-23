@@ -124,6 +124,16 @@ pub enum AgentEvent {
     TurnEnd {
         index: u32,
     },
+    /// Plugin-emitted custom message reaching the UI mid-stream.
+    /// Carries the raw JSON payload the plugin queued via
+    /// `harness/add-custom-message`. The UI looks up a registered
+    /// renderer (see `PluginManager::list_message_renderers`) by
+    /// the payload's `type` field; without one it falls back to a
+    /// default formatter. Port of pi's `LoopMessage::Custom` →
+    /// `registerMessageRenderer` lookup (extensions/types.ts:1171).
+    CustomMessage {
+        payload: serde_json::Value,
+    },
     /// The runner observed an interjection request at a tool-result boundary
     /// and stopped the stream cleanly. Whatever assistant text had streamed
     /// so far is captured in `partial_response`. The UI is expected to

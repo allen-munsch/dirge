@@ -978,6 +978,72 @@ mod tests {
         assert!(err.contains("kaboom"), "got: {err}");
     }
 
+    // --- P9d: plugin-registered message renderers -----------------------
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_message_renderer_records_pair() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-message-renderer "status" "render-status")"#)
+            .unwrap();
+        let r = mgr.list_message_renderers();
+        assert_eq!(
+            r,
+            vec![("status".to_string(), "render-status".to_string())]
+        );
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_message_renderer_multiple_in_load_order() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-message-renderer "a" "ra")"#).unwrap();
+        mgr.eval(r#"(harness/register-message-renderer "b" "rb")"#).unwrap();
+        let r = mgr.list_message_renderers();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0, "a");
+        assert_eq!(r[1].0, "b");
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_message_renderer_ignores_non_string_args() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-message-renderer 1 "h")"#).unwrap();
+        mgr.eval(r#"(harness/register-message-renderer "t" :sym)"#).unwrap();
+        assert!(mgr.list_message_renderers().is_empty());
+    }
+
+    /// `invoke_message_renderer` calls the named handler with the
+    /// raw payload string and returns its stringified output. The
+    /// handler can parse the JSON itself (or just use the string
+    /// verbatim for display).
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_message_renderer_dispatches() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn render-status [payload] (string ">>" payload))"#)
+            .unwrap();
+        let out = mgr
+            .invoke_message_renderer("render-status", r#"{"type":"status","content":"ok"}"#)
+            .unwrap();
+        assert_eq!(
+            out.unwrap(),
+            r#">>{"type":"status","content":"ok"}"#
+        );
+    }
+
+    /// Handler errors swallow to `Ok(None)` — pi semantics keep
+    /// message dispatch alive even when a renderer is buggy.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_invoke_message_renderer_swallows_handler_error() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn boom [payload] (error "kaboom"))"#).unwrap();
+        let out = mgr.invoke_message_renderer("boom", "{}").unwrap();
+        assert_eq!(out, None);
+    }
+
     // --- P9c: plugin-registered keyboard shortcuts ---------------------
 
     #[cfg(feature = "plugin")]
@@ -2473,6 +2539,66 @@ impl PluginManager {
             return Vec::new();
         }
         raw.lines().filter_map(parse_plugin_tool_line).collect()
+    }
+
+    /// Snapshot plugin-registered message renderers (P9d). Each
+    /// entry is `(type-name, handler-fn-name)`. The UI looks up the
+    /// `type` field of a `LoopMessage::Custom` payload here when
+    /// rendering; no entry means the default formatter is used.
+    pub fn list_message_renderers(&mut self) -> Vec<(String, String)> {
+        let raw = match self.worker.eval("harness-msg-renderers-list") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        raw.lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let t = unescape_harness_field(parts.next()?);
+                let h = unescape_harness_field(parts.next()?);
+                if t.is_empty() || h.is_empty() {
+                    None
+                } else {
+                    Some((t, h))
+                }
+            })
+            .collect()
+    }
+
+    /// Invoke a Janet message-renderer handler with the raw JSON
+    /// payload string. The handler is called as `(handler payload)`
+    /// and may return any value `(string ...)` can render. Returns
+    /// `Ok(Some(text))` when the handler produced a non-empty string,
+    /// `Ok(None)` when it returned nil/empty or when the handler
+    /// raised (errors swallowed so a broken renderer doesn't tear
+    /// down message dispatch). Catastrophic Janet failures still
+    /// surface as `Err`.
+    pub fn invoke_message_renderer(
+        &mut self,
+        handler: &str,
+        payload_json: &str,
+    ) -> Result<Option<String>, String> {
+        let escaped_payload = escape_janet_string(payload_json);
+        let escaped_fn = escape_janet_string(handler);
+        let code = format!(
+            r#"(try
+                 (let [f (get (curenv) (symbol "{fname}"))]
+                   (if (and f (function? (f :value)))
+                     (let [r ((f :value) "{payload}")]
+                       (if (string? r) r (string r)))
+                     nil))
+                 ([err fib] nil))"#,
+            fname = escaped_fn,
+            payload = escaped_payload,
+        );
+        let result = self.worker.eval(&code)?;
+        if result == "nil" || result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
     }
 
     /// Snapshot plugin-registered keyboard shortcuts (P9c). Each

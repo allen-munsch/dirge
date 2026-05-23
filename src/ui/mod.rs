@@ -2730,6 +2730,56 @@ pub async fn run_interactive(
                             is_running = true;
                         }
                     }
+                    AgentEvent::CustomMessage { payload } => {
+                        // Plugin-emitted custom message reaching the
+                        // UI (P9d). Look up a registered renderer
+                        // by the payload's `type` field; fall back
+                        // to extracting `content` or pretty-printing
+                        // the whole payload when none is registered.
+                        let type_name = payload
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        #[cfg(feature = "plugin")]
+                        let rendered: Option<String> = if let Some(pm) = plugin_manager {
+                            let handler = {
+                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                mgr.list_message_renderers()
+                                    .into_iter()
+                                    .find(|(t, _)| t == &type_name)
+                                    .map(|(_, h)| h)
+                            };
+                            if let Some(h) = handler {
+                                let payload_str = payload.to_string();
+                                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                                mgr.invoke_message_renderer(&h, &payload_str)
+                                    .ok()
+                                    .flatten()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        #[cfg(not(feature = "plugin"))]
+                        let rendered: Option<String> = None;
+
+                        let text = rendered.unwrap_or_else(|| {
+                            payload
+                                .get("content")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .unwrap_or_else(|| payload.to_string())
+                        });
+                        let safe = sanitize_output(&text);
+                        let label = if type_name.is_empty() {
+                            "plugin".to_string()
+                        } else {
+                            format!("plugin:{type_name}")
+                        };
+                        renderer.write_line(&format!("[{label}] {safe}"), theme::dim())?;
+                    }
                     AgentEvent::Interjected { partial_response, tokens } => {
                         was_reasoning = false;
                         close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;

@@ -303,6 +303,13 @@ async fn run_prompt(
             // turn tracker + interjection queue. ACP doesn't have a
             // mid-stream interjection concept (the client owns
             // submission), so we treat these as no-ops.
+            AgentEvent::CustomMessage { .. } => {
+                // Plugin-emitted custom message. ACP doesn't have a
+                // first-class concept for these; the interactive UI
+                // is the renderer. Drop on the ACP path so a Custom
+                // message from a plugin doesn't break the structured
+                // stream.
+            }
             AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. } => {}
             AgentEvent::Interjected { .. } => {
                 // An interjected turn shouldn't reach the ACP bridge —

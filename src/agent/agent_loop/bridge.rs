@@ -196,12 +196,20 @@ impl EventBridge {
 
             LoopEvent::MessageStart { message } => {
                 // User / Assistant / ToolResult / Custom message
-                // starts. None of them map to a dirge AgentEvent
-                // — token streaming flows from MessageUpdate,
-                // tool results flow from ToolExecutionEnd, user
-                // messages aren't AgentEvents at all.
-                let _ = message;
-                Vec::new()
+                // starts. User/Assistant/ToolResult don't map to a
+                // dirge AgentEvent (token streaming flows from
+                // MessageUpdate, tool results flow from
+                // ToolExecutionEnd, user messages aren't AgentEvents
+                // at all). `Custom` carries plugin-queued payloads;
+                // we surface those as `AgentEvent::CustomMessage` so
+                // the UI can look up a registered renderer (P9d).
+                if let LoopMessage::Custom(payload) = message {
+                    vec![AgentEvent::CustomMessage {
+                        payload: payload.clone(),
+                    }]
+                } else {
+                    Vec::new()
+                }
             }
 
             LoopEvent::MessageEnd { message } => {
@@ -764,6 +772,24 @@ mod tests {
 
     /// `MessageStart` / `MessageEnd` are no-ops at the AgentEvent
     /// boundary (dirge handles user-message rendering / done
+    /// `LoopMessage::Custom` flowing through `MessageStart` becomes
+    /// an `AgentEvent::CustomMessage` carrying the same JSON payload
+    /// — the bridge keeps the payload opaque so the UI's renderer
+    /// lookup gets the full structure.
+    #[test]
+    fn message_start_custom_emits_custom_message_event() {
+        let mut bridge = EventBridge::new();
+        let payload = serde_json::json!({"type": "status", "content": "hello"});
+        let events = bridge.translate(LoopEvent::MessageStart {
+            message: LoopMessage::Custom(payload.clone()),
+        });
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::CustomMessage { payload: out } => assert_eq!(out, &payload),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
     /// finalization separately).
     #[test]
     fn message_start_end_are_no_ops() {
@@ -903,6 +929,7 @@ mod tests {
                 AgentEvent::Error(_) => "Error",
                 AgentEvent::ContextOverflow { .. } => "ContextOverflow",
                 AgentEvent::Interjected { .. } => "Interjected",
+                AgentEvent::CustomMessage { .. } => "CustomMessage",
             })
             .collect();
         assert_eq!(
