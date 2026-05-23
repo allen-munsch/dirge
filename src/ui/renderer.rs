@@ -58,6 +58,18 @@ pub struct PanelData {
     pub modified: Vec<String>,
 }
 
+/// dirge-gek: one row in the left-gutter subagent panel. Rendered as
+/// `<status-glyph> <short-id> <truncated-prompt>` so a quick glance
+/// shows what's running. The UI loop rebuilds these from
+/// `bg_store.list()` on each lifecycle event and pushes via
+/// `Renderer::set_subagent_status`.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentStatusRow {
+    pub id_short: String,
+    pub state: String,
+    pub prompt_short: String,
+}
+
 /// Per-chat state saved while a chat is INACTIVE. Mirrors the fields
 /// the active chat uses on the `Renderer` itself; switching chats
 /// swaps state in/out via `save_active` / `load_active`. Keeps the
@@ -113,6 +125,12 @@ pub struct Renderer {
     /// before each redraw so render_viewport/draw_bottom can repaint the
     /// panel along with the rest of the screen.
     panel_data: PanelData,
+    /// dirge-gek: subagent task summary rows for the LEFT gutter
+    /// panel. Each entry surfaces one in-flight or recently-finished
+    /// subagent so the user can glance at activity without switching
+    /// chat windows. Set by the UI loop on each lifecycle event;
+    /// rendered above the bottom-row avatar in `draw_left_panel`.
+    subagent_status: Vec<SubagentStatusRow>,
     /// What the agent is doing — drives the bottom-left ASCII avatar.
     avatar_state: crate::ui::avatar::AvatarState,
     /// Animation flip; toggled by `tick_avatar()` so the avatar's
@@ -142,6 +160,7 @@ impl Renderer {
             selection_end: None,
             panel_mode: PanelMode::Auto,
             panel_data: PanelData::default(),
+            subagent_status: Vec::new(),
             avatar_state: crate::ui::avatar::AvatarState::Idle,
             avatar_tick: false,
         })
