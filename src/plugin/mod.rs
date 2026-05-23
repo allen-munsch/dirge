@@ -978,6 +978,40 @@ mod tests {
         assert!(err.contains("kaboom"), "got: {err}");
     }
 
+    // --- P9c: plugin-registered keyboard shortcuts ---------------------
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_shortcut_records_spec_and_description() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-shortcut "ctrl-x" "save-handler" "Save buffer")"#)
+            .unwrap();
+        let shortcuts = mgr.list_shortcuts();
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0].keys, "ctrl-x");
+        assert_eq!(shortcuts[0].handler, "save-handler");
+        assert_eq!(shortcuts[0].description, "Save buffer");
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_shortcut_description_optional() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-shortcut "f5" "refresh")"#).unwrap();
+        let shortcuts = mgr.list_shortcuts();
+        assert_eq!(shortcuts.len(), 1);
+        assert!(shortcuts[0].description.is_empty());
+    }
+
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_register_shortcut_ignores_non_string_args() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-shortcut 42 "h")"#).unwrap();
+        mgr.eval(r#"(harness/register-shortcut "f5" :sym)"#).unwrap();
+        assert!(mgr.list_shortcuts().is_empty());
+    }
+
     /// Non-string args silently drop instead of crashing the plugin.
     #[cfg(feature = "plugin")]
     #[test]
@@ -2441,6 +2475,24 @@ impl PluginManager {
         raw.lines().filter_map(parse_plugin_tool_line).collect()
     }
 
+    /// Snapshot plugin-registered keyboard shortcuts (P9c). Each
+    /// entry has the raw key-spec string (e.g. "ctrl-x"), the Janet
+    /// handler name, and an optional description for UI listing.
+    /// The UI key-dispatch path reads this once and matches against
+    /// incoming `KeyEvent`s before built-in handling. Plugins that
+    /// load after the first snapshot need a host restart for new
+    /// bindings to take effect (kept simple for now).
+    pub fn list_shortcuts(&mut self) -> Vec<PluginShortcutMeta> {
+        let raw = match self.worker.eval("harness-shortcuts-list") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        raw.lines().filter_map(parse_plugin_shortcut_line).collect()
+    }
+
     /// Invoke a Janet tool handler with the raw JSON args string the
     /// LLM produced. The handler is called as `(handler args)` and may
     /// return any value `(string ...)` can render. Returns the tool's
@@ -2680,6 +2732,37 @@ fn parse_plugin_tool_line(line: &str) -> Option<PluginToolMeta> {
         parameters,
         handler,
         execution_mode,
+    })
+}
+
+/// Snapshot of a plugin-registered keyboard shortcut (P9c). The key
+/// spec is the raw plugin-supplied string (e.g. `"ctrl-x"`); the UI
+/// layer parses it into a `(KeyCode, KeyModifiers)` pair lazily so
+/// PluginManager itself doesn't depend on crossterm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+pub struct PluginShortcutMeta {
+    /// Raw key spec — `"ctrl-x"`, `"alt-shift-f"`, `"f5"`, `"enter"`,
+    /// etc. Parsed by `extension::parse_key_spec`.
+    pub keys: String,
+    /// Janet function the host invokes when the key fires.
+    pub handler: String,
+    /// Optional human-readable description for UI listing.
+    pub description: String,
+}
+
+fn parse_plugin_shortcut_line(line: &str) -> Option<PluginShortcutMeta> {
+    let mut parts = line.split('\t');
+    let keys = unescape_harness_field(parts.next()?);
+    let handler = unescape_harness_field(parts.next()?);
+    let description = unescape_harness_field(parts.next().unwrap_or(""));
+    if keys.is_empty() || handler.is_empty() {
+        return None;
+    }
+    Some(PluginShortcutMeta {
+        keys,
+        handler,
+        description,
     })
 }
 

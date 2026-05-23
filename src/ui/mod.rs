@@ -729,6 +729,18 @@ pub async fn run_interactive(
     let mut search_matches: Vec<usize> = Vec::new();
     let mut search_selected = 0usize;
 
+    // Snapshot plugin-registered shortcuts (P9c). Read once at UI
+    // startup; plugin reloads require a host restart for new bindings
+    // to take effect. Plugins that ship invalid key specs get a
+    // tracing::warn and the binding is dropped (see parse_shortcuts).
+    #[cfg(feature = "plugin")]
+    let plugin_shortcuts: Vec<crate::plugin::extension::ParsedShortcut> = {
+        let metas = crate::plugin::hook::global()
+            .map(|pm| pm.lock().unwrap_or_else(|e| e.into_inner()).list_shortcuts())
+            .unwrap_or_default();
+        crate::plugin::extension::parse_shortcuts(metas)
+    };
+
     let perm_mode = || -> Option<String> {
         permission.as_ref().map(|p| {
             p.lock()
@@ -1497,6 +1509,41 @@ pub async fn run_interactive(
                                 }
                                 continue;
                             }
+
+                        // Plugin-registered shortcuts (P9c). Matched
+                        // AFTER reserved keys (Ctrl+C/D, search, rewind,
+                        // selection) and built-in chrome bindings, but
+                        // BEFORE input text capture — so plugins can
+                        // bind any unused key combination without
+                        // shadowing critical UX. First load-order match
+                        // wins; the handler runs synchronously on the
+                        // worker thread and its return value (if any)
+                        // surfaces as a chat line.
+                        #[cfg(feature = "plugin")]
+                        if !plugin_shortcuts.is_empty() {
+                            if let Some(hit) = crate::plugin::extension::match_shortcut(&key, &plugin_shortcuts) {
+                                let handler = hit.handler.clone();
+                                let spec = hit.spec.clone();
+                                if let Some(pm_arc) = crate::plugin::hook::global() {
+                                    let result = {
+                                        let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                        mgr.invoke_command(&handler, &spec)
+                                    };
+                                    if let Ok(Some(msg)) = result {
+                                        renderer.write_line(
+                                            &format!("[plugin] {}", sanitize_output(&msg)),
+                                            theme::dim(),
+                                        )?;
+                                    }
+                                }
+                                renderer.draw_bottom(
+                                    &input,
+                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                    is_running,
+                                )?;
+                                continue;
+                            }
+                        }
 
                         if let Some(text) = input.handle_key(key) {
                             // Review #4: any submission starts a new

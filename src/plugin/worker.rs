@@ -361,6 +361,24 @@ const HARNESS_INIT: &str = r#"
   (when (string? session-id)
     (harness/-push-op "switch-session" session-id)))
 
+# Plugin-registered keyboard shortcuts (P9c). Plugins call
+#   (harness/register-shortcut keys handler &opt description)
+# to bind a key combination to a Janet handler the host invokes in
+# interactive mode. `keys` is a string like "ctrl-x", "alt-shift-f",
+# "f5", or "enter"; the host parses it via parse_key_spec and matches
+# against incoming KeyEvents BEFORE built-in dispatch. Handler is a
+# Janet function name; it's called with the key string as a single
+# argument so one handler can serve multiple shortcuts and discriminate.
+(var harness-shortcuts-list "")
+(defn harness/register-shortcut [keys handler &opt description]
+  (when (and (string? keys) (string? handler))
+    (let [desc (if (and description (string? description)) description "")]
+      (set harness-shortcuts-list
+           (string harness-shortcuts-list
+                   (harness/-escape keys) "\t"
+                   (harness/-escape handler) "\t"
+                   (harness/-escape desc) "\n")))))
+
 # Plugin-registered LLM-callable tools (P9a). Plugins call
 #   (harness/register-tool name description label parameters handler &opt execution-mode)
 # at load time to make a new tool available to the LLM alongside

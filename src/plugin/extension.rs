@@ -20,13 +20,123 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
 use crate::agent::agent_loop::tool::{AbortSignal, LoopTool, LoopToolUpdate};
 use crate::agent::agent_loop::result::LoopToolResult;
 use crate::agent::agent_loop::types::ToolExecutionMode;
 
-use super::{PluginManager, PluginToolMeta};
+use super::{PluginManager, PluginShortcutMeta, PluginToolMeta};
+
+/// Parse a plugin key spec string into a `(KeyCode, KeyModifiers)`
+/// pair. Spec grammar (case-insensitive):
+///   `(modifier "-")* key-name`
+/// where modifier ∈ { ctrl, control, alt, meta, shift } and key-name
+/// is one of: a single character, `f1`..`f12`, or one of the named
+/// keys (`enter`, `esc`, `tab`, `backspace`, `space`, `up`, `down`,
+/// `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `delete`,
+/// `insert`). Returns `None` for malformed input so an unknown spec
+/// drops the binding silently rather than crashing.
+pub fn parse_key_spec(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let lower = spec.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = lower.split('-').collect();
+    let (key_part, mod_parts) = parts.split_last()?;
+    let mut mods = KeyModifiers::NONE;
+    for p in mod_parts {
+        match *p {
+            "ctrl" | "control" => mods |= KeyModifiers::CONTROL,
+            "alt" | "meta" => mods |= KeyModifiers::ALT,
+            "shift" => mods |= KeyModifiers::SHIFT,
+            _ => return None,
+        }
+    }
+    let code = match *key_part {
+        "enter" | "return" => KeyCode::Enter,
+        "esc" | "escape" => KeyCode::Esc,
+        "tab" => KeyCode::Tab,
+        "backspace" | "bs" => KeyCode::Backspace,
+        "space" => KeyCode::Char(' '),
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "pgdn" => KeyCode::PageDown,
+        "delete" | "del" => KeyCode::Delete,
+        "insert" | "ins" => KeyCode::Insert,
+        s if s.starts_with('f') && s.len() > 1 => {
+            let n: u8 = s[1..].parse().ok()?;
+            if (1..=12).contains(&n) {
+                KeyCode::F(n)
+            } else {
+                return None;
+            }
+        }
+        s if s.chars().count() == 1 => KeyCode::Char(s.chars().next()?),
+        _ => return None,
+    };
+    Some((code, mods))
+}
+
+/// Pre-parsed shortcut entry the UI layer holds across key events.
+/// Carries the original key spec for round-trip handler dispatch
+/// (handlers receive the spec as a single string argument so one
+/// Janet fn can serve many bindings).
+#[derive(Debug, Clone)]
+pub struct ParsedShortcut {
+    pub code: KeyCode,
+    pub modifiers: KeyModifiers,
+    pub spec: String,
+    pub handler: String,
+}
+
+/// Materialize plugin shortcuts into the UI-layer form. Specs that
+/// fail to parse are dropped with a `tracing::warn!` so plugin
+/// authors get visibility without the host crashing on a typo.
+pub fn parse_shortcuts(metas: Vec<PluginShortcutMeta>) -> Vec<ParsedShortcut> {
+    metas
+        .into_iter()
+        .filter_map(|m| {
+            let (code, modifiers) = match parse_key_spec(&m.keys) {
+                Some(pair) => pair,
+                None => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        spec = %m.keys,
+                        handler = %m.handler,
+                        "plugin shortcut key spec did not parse — binding dropped",
+                    );
+                    return None;
+                }
+            };
+            Some(ParsedShortcut {
+                code,
+                modifiers,
+                spec: m.keys,
+                handler: m.handler,
+            })
+        })
+        .collect()
+}
+
+/// Resolve a `KeyEvent` against a list of parsed plugin shortcuts.
+/// Returns the matching shortcut's handler + spec so the UI can
+/// dispatch via `PluginManager::invoke_command`. First match wins
+/// (load order); later bindings to the same key do not stack.
+pub fn match_shortcut<'a>(
+    key: &KeyEvent,
+    shortcuts: &'a [ParsedShortcut],
+) -> Option<&'a ParsedShortcut> {
+    shortcuts
+        .iter()
+        .find(|s| s.code == key.code && s.modifiers == key.modifiers)
+}
 
 /// `LoopTool` impl backed by a Janet handler. The execute path
 /// briefly locks the PluginManager mutex, dispatches into Janet via
@@ -220,6 +330,103 @@ mod tests {
         let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
         assert_eq!(tool.execution_mode(), Some(ToolExecutionMode::Sequential));
     }
+
+    // --- P9c: shortcut parser ----------------------------------------
+
+    #[test]
+    fn parse_key_spec_plain_char() {
+        let (code, mods) = parse_key_spec("x").unwrap();
+        assert_eq!(code, KeyCode::Char('x'));
+        assert!(mods.is_empty());
+    }
+
+    #[test]
+    fn parse_key_spec_ctrl_char_case_insensitive() {
+        let a = parse_key_spec("ctrl-x").unwrap();
+        let b = parse_key_spec("CTRL-X").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.0, KeyCode::Char('x'));
+        assert_eq!(a.1, KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn parse_key_spec_multi_modifier() {
+        let (code, mods) = parse_key_spec("ctrl-alt-shift-f").unwrap();
+        assert_eq!(code, KeyCode::Char('f'));
+        assert_eq!(
+            mods,
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT
+        );
+    }
+
+    #[test]
+    fn parse_key_spec_named_keys() {
+        assert_eq!(parse_key_spec("enter").unwrap().0, KeyCode::Enter);
+        assert_eq!(parse_key_spec("esc").unwrap().0, KeyCode::Esc);
+        assert_eq!(parse_key_spec("space").unwrap().0, KeyCode::Char(' '));
+        assert_eq!(parse_key_spec("backspace").unwrap().0, KeyCode::Backspace);
+        assert_eq!(parse_key_spec("pgdn").unwrap().0, KeyCode::PageDown);
+    }
+
+    #[test]
+    fn parse_key_spec_function_keys() {
+        assert_eq!(parse_key_spec("f1").unwrap().0, KeyCode::F(1));
+        assert_eq!(parse_key_spec("F12").unwrap().0, KeyCode::F(12));
+        // F0 and F13 are out of range.
+        assert!(parse_key_spec("f0").is_none());
+        assert!(parse_key_spec("f13").is_none());
+    }
+
+    #[test]
+    fn parse_key_spec_rejects_unknown_modifier_or_key() {
+        assert!(parse_key_spec("hyper-x").is_none());
+        assert!(parse_key_spec("ctrl-mumble").is_none());
+        assert!(parse_key_spec("").is_none());
+    }
+
+    #[test]
+    fn match_shortcut_returns_first_load_order_match() {
+        let shortcuts = parse_shortcuts(vec![
+            PluginShortcutMeta {
+                keys: "ctrl-x".into(),
+                handler: "first".into(),
+                description: String::new(),
+            },
+            PluginShortcutMeta {
+                keys: "ctrl-x".into(),
+                handler: "second".into(),
+                description: String::new(),
+            },
+        ]);
+        let ev = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        let hit = match_shortcut(&ev, &shortcuts).unwrap();
+        assert_eq!(hit.handler, "first");
+
+        // A non-matching event returns None.
+        let ev2 = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert!(match_shortcut(&ev2, &shortcuts).is_none());
+    }
+
+    /// Bad specs drop silently and don't poison the rest of the list.
+    #[test]
+    fn parse_shortcuts_drops_bad_specs_but_keeps_good_ones() {
+        let parsed = parse_shortcuts(vec![
+            PluginShortcutMeta {
+                keys: "bogus-key".into(),
+                handler: "drop-me".into(),
+                description: String::new(),
+            },
+            PluginShortcutMeta {
+                keys: "ctrl-x".into(),
+                handler: "keep-me".into(),
+                description: String::new(),
+            },
+        ]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].handler, "keep-me");
+    }
+
+    // --- back to JanetLoopTool tests --------------------------------
 
     /// Handler errors propagate as `Err(_)`, NOT as an Ok result with
     /// the error text inlined. The loop's error path is what surfaces
