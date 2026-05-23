@@ -729,6 +729,17 @@ async fn main() -> anyhow::Result<()> {
         // manager state, which is what we need for shutdown.
         #[cfg(feature = "lsp")]
         let lsp_manager_for_shutdown = lsp_manager.clone();
+
+        // dirge-ov2 Phase D: subagent chat event channel. The
+        // `task` tool emits Spawn / Complete / Failed events here
+        // when it dispatches subagents; the UI loop receives them
+        // and creates / writes to chat windows. Process-global
+        // sink so the TaskTool doesn't need plumbing through the
+        // 13-site builder pipeline.
+        let (subagent_chat_tx, subagent_chat_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::agent::tools::task::SubagentChatEvent>();
+        crate::agent::tools::task::set_subagent_chat_sink(subagent_chat_tx);
+
         ui::run_interactive(
             client,
             agent,
@@ -755,6 +766,7 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(feature = "plugin")]
             plugin_manager.as_ref(),
             dialog_rx,
+            subagent_chat_rx,
         )
         .await?;
 

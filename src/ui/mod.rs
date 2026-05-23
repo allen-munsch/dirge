@@ -757,6 +757,13 @@ pub async fn run_interactive(
     // Option so the `tokio::select!` arm can be unconditional —
     // `tokio::select!` doesn't accept `cfg` attributes on its arms.
     mut dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::plugin::DialogRequest>>,
+    // dirge-ov2 Phase D: subagent chat events. The `task` tool sends
+    // Spawn / Complete / Failed events here; the UI loop creates /
+    // updates a dedicated chat window per subagent so the user can
+    // switch to it via Ctrl-N/P/X.
+    mut subagent_chat_rx: tokio::sync::mpsc::UnboundedReceiver<
+        crate::agent::tools::task::SubagentChatEvent,
+    >,
 ) -> anyhow::Result<()> {
     let _guard = TerminalGuard::new()?;
 
@@ -884,6 +891,13 @@ pub async fn run_interactive(
     // `chat_ui_states[0]` mirrors the main chat from the start;
     // subagent chats added later push new entries.
     let mut chat_ui_states: Vec<ChatUiState> = vec![ChatUiState::empty()];
+
+    // dirge-ov2 Phase E: map subagent task id → chat index so
+    // Complete / Failed events can find the right chat window.
+    // Spawn creates the entry; Complete / Failed write to it but
+    // don't remove (so the user can scroll back later).
+    let mut subagent_chat_map: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // Last collapsed tool result, re-printable by Ctrl+O. Each
     // `render_tool_output` call that truncates the body stashes the
@@ -4251,6 +4265,76 @@ pub async fn run_interactive(
                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
                     is_running,
                 )?;
+            }
+            Some(chat_evt) = subagent_chat_rx.recv() => {
+                // dirge-ov2 Phase E: subagent chat lifecycle.
+                // Spawn → create a new chat window for the subagent
+                // and write the prompt into it. Complete → write
+                // the result. Failed → write the error in red.
+                //
+                // All writes go through `write_line_to_chat(idx, ...)`
+                // so the active chat's on-screen state is undisturbed.
+                // The user surfaces the subagent chat via Ctrl-N/P/X
+                // — or sees it scroll into view if they're already
+                // on that chat when the event fires.
+                use crate::agent::tools::task::SubagentChatEvent as E;
+                match chat_evt {
+                    E::Spawn { id, prompt } => {
+                        // Truncate the prompt to a short chat name
+                        // so the picker / Ctrl-X cycle reads
+                        // cleanly. Use the first 40 chars of the
+                        // prompt's first line.
+                        let short: String = prompt
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(40)
+                            .collect();
+                        let name = if short.is_empty() {
+                            format!("subagent {}", id.chars().take(8).collect::<String>())
+                        } else {
+                            format!("task: {}", short)
+                        };
+                        let idx = renderer.add_chat(name);
+                        // Grow chat_ui_states to mirror the new chat.
+                        while chat_ui_states.len() < renderer.chat_count() {
+                            chat_ui_states.push(ChatUiState::empty());
+                        }
+                        subagent_chat_map.insert(id, idx);
+                        // Seed the new chat with the prompt so when
+                        // the user switches to it they can see what
+                        // the subagent was asked to do.
+                        let _ = renderer.write_line_to_chat(
+                            idx,
+                            &format!("<you> {}", sanitize_output(&prompt)),
+                            theme::user(),
+                        );
+                        let _ = renderer.write_line_to_chat(
+                            idx,
+                            "(subagent running…)",
+                            theme::dim(),
+                        );
+                    }
+                    E::Complete { id, result } => {
+                        if let Some(&idx) = subagent_chat_map.get(&id) {
+                            let _ = renderer.write_line_to_chat(
+                                idx,
+                                &format!("<dirge> {}", sanitize_output(&result)),
+                                c_agent(),
+                            );
+                        }
+                    }
+                    E::Failed { id, error } => {
+                        if let Some(&idx) = subagent_chat_map.get(&id) {
+                            let _ = renderer.write_line_to_chat(
+                                idx,
+                                &format!("subagent error: {}", sanitize_output(&error)),
+                                c_error(),
+                            );
+                        }
+                    }
+                }
             }
             Some(question_req) = async {
                 if let Some(rx) = &mut question_rx {

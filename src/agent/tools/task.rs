@@ -1,17 +1,78 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::agent::tools::background::{BackgroundStore, TaskState};
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
 use crate::provider::AnyModel;
 
+/// dirge-ov2 Phase D: subagent chat-window event. Sent by `TaskTool`
+/// when it spawns / completes a subagent so the UI loop can surface
+/// the subagent's lifecycle as a chat-window (Ctrl-N/P/X to switch
+/// to it via the multi-chat infrastructure landed in Phases A-C).
+///
+/// `id` is the subagent's task id (UUID for background tasks; a
+/// freshly-generated UUID for foreground tasks). The UI loop keys
+/// chat windows on this id so multiple concurrent subagents get
+/// distinct windows.
+///
+/// First-pass design: prompt + final result are emitted; per-token
+/// streaming isn't wired through. A follow-up will route the full
+/// agent-loop event stream once `TaskTool` migrates from `btw_query`
+/// (one-shot, tool-less) to a proper sub-runner with the parent's
+/// tool set. Phase A-C laid the multi-chat infrastructure that
+/// rewrite needs; Phase D ships visibility today.
+#[derive(Debug, Clone)]
+pub enum SubagentChatEvent {
+    /// A new subagent is starting. UI loop creates a chat window
+    /// named after a short truncation of the prompt and writes the
+    /// prompt as the first line.
+    Spawn { id: String, prompt: String },
+    /// Subagent finished successfully. UI loop writes `result` to
+    /// the matching chat window.
+    Complete { id: String, result: String },
+    /// Subagent errored or timed out. UI loop writes the failure
+    /// reason in error color.
+    Failed { id: String, error: String },
+}
+
+pub type SubagentChatSender = mpsc::UnboundedSender<SubagentChatEvent>;
+pub type SubagentChatReceiver = mpsc::UnboundedReceiver<SubagentChatEvent>;
+
+/// dirge-ov2 Phase D: process-global sender for subagent chat
+/// events. Set once at interactive-session startup; every TaskTool
+/// reads it lazily so the builder doesn't need to thread the
+/// channel through 13 call sites.
+///
+/// A follow-up could replace this with proper threading through
+/// `BuilderContext` — for now the global keeps the Phase D diff
+/// small and the test path (no global set) behaves like pre-ov2.
+static SUBAGENT_CHAT_SINK: std::sync::OnceLock<SubagentChatSender> = std::sync::OnceLock::new();
+
+pub fn set_subagent_chat_sink(sink: SubagentChatSender) {
+    // OnceLock — first writer wins. Re-set is a no-op (logged via
+    // tracing for visibility but not fatal because tests / hot
+    // reload may try to set twice).
+    if SUBAGENT_CHAT_SINK.set(sink).is_err() {
+        tracing::debug!("subagent chat sink already set; ignoring re-set");
+    }
+}
+
+pub fn subagent_chat_sink() -> Option<SubagentChatSender> {
+    SUBAGENT_CHAT_SINK.get().cloned()
+}
+
 pub struct TaskTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     model: AnyModel,
     bg_store: BackgroundStore,
+    /// dirge-ov2: send-side of the subagent-chat-event channel.
+    /// `Option` so `--no-tools` paths / tests can omit the UI sink
+    /// without forcing every TaskTool builder to manufacture one.
+    chat_sink: Option<SubagentChatSender>,
 }
 
 impl TaskTool {
@@ -26,6 +87,32 @@ impl TaskTool {
             ask_tx,
             model,
             bg_store,
+            chat_sink: None,
+        }
+    }
+
+    /// dirge-ov2: wire the subagent-chat-event sender. Called by the
+    /// agent builder when constructing the TaskTool for an
+    /// interactive session. Headless / test paths skip this so the
+    /// tool behaves identically to the pre-ov2 implementation.
+    pub fn with_chat_sink(mut self, sink: SubagentChatSender) -> Self {
+        self.chat_sink = Some(sink);
+        self
+    }
+
+    /// dirge-ov2 helper: fire-and-forget a chat event. Prefers the
+    /// instance-bound sink (set via `with_chat_sink`); falls back
+    /// to the process-global sink set at UI-loop startup. If
+    /// neither is installed (headless / tests) the event is
+    /// silently discarded — never block the subagent or fail the
+    /// tool call on UI plumbing trouble.
+    fn emit_chat(&self, event: SubagentChatEvent) {
+        if let Some(sink) = &self.chat_sink {
+            let _ = sink.send(event);
+            return;
+        }
+        if let Some(sink) = subagent_chat_sink() {
+            let _ = sink.send(event);
         }
     }
 }
@@ -92,10 +179,18 @@ impl Tool for TaskTool {
             self.bg_store.insert(task_id.clone());
             self.bg_store.notify_started(&task_id);
 
+            // dirge-ov2 Phase D: announce the subagent so the UI
+            // loop creates a chat window for it.
+            self.emit_chat(SubagentChatEvent::Spawn {
+                id: task_id.clone(),
+                prompt: args.prompt.clone(),
+            });
+
             let model = self.model.clone();
             let prompt = args.prompt;
             let store = self.bg_store.clone();
             let tid = task_id.clone();
+            let chat_sink = self.chat_sink.clone();
 
             // Cap the background subagent at 10 minutes. Without a
             // timeout, a stuck subagent (provider hang, runaway
@@ -114,14 +209,39 @@ impl Tool for TaskTool {
                     prompt
                 ));
                 let result = tokio::time::timeout(SUBAGENT_TIMEOUT, fut).await;
-                let state = match result {
-                    Ok(Ok(text)) => TaskState::Completed(text),
-                    Ok(Err(e)) => TaskState::Failed(e.to_string()),
-                    Err(_) => TaskState::Failed(format!(
-                        "subagent timed out after {}s",
-                        SUBAGENT_TIMEOUT.as_secs(),
-                    )),
+                let (state, chat_event) = match result {
+                    Ok(Ok(text)) => (
+                        TaskState::Completed(text.clone()),
+                        SubagentChatEvent::Complete {
+                            id: tid_for_task.clone(),
+                            result: text,
+                        },
+                    ),
+                    Ok(Err(e)) => {
+                        let msg = e.to_string();
+                        (
+                            TaskState::Failed(msg.clone()),
+                            SubagentChatEvent::Failed {
+                                id: tid_for_task.clone(),
+                                error: msg,
+                            },
+                        )
+                    }
+                    Err(_) => {
+                        let msg =
+                            format!("subagent timed out after {}s", SUBAGENT_TIMEOUT.as_secs(),);
+                        (
+                            TaskState::Failed(msg.clone()),
+                            SubagentChatEvent::Failed {
+                                id: tid_for_task.clone(),
+                                error: msg,
+                            },
+                        )
+                    }
                 };
+                if let Some(sink) = chat_sink {
+                    let _ = sink.send(chat_event);
+                }
                 store_for_task.notify(&tid_for_task, state);
             });
             // Register the handle so `BackgroundStore::cancel_all` (called
@@ -135,16 +255,40 @@ impl Tool for TaskTool {
                 task_id
             ))
         } else {
+            // dirge-ov2 Phase D: foreground subagent. Emit Spawn /
+            // Complete / Failed so the UI surfaces the call as a
+            // chat window (Ctrl-N/P/X to view). Foreground tasks
+            // still block the parent agent's tool call; the chat
+            // window populates with prompt + final result.
+            let task_id = Uuid::new_v4().to_string();
+            self.emit_chat(SubagentChatEvent::Spawn {
+                id: task_id.clone(),
+                prompt: args.prompt.clone(),
+            });
             let result = self
                 .model
                 .btw_query(format!(
                     "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
                     args.prompt
                 ))
-                .await
-                .map_err(|e| ToolError::Msg(format!("Subagent error: {}", e)))?;
-
-            Ok(result)
+                .await;
+            match result {
+                Ok(text) => {
+                    self.emit_chat(SubagentChatEvent::Complete {
+                        id: task_id,
+                        result: text.clone(),
+                    });
+                    Ok(text)
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.emit_chat(SubagentChatEvent::Failed {
+                        id: task_id,
+                        error: msg.clone(),
+                    });
+                    Err(ToolError::Msg(format!("Subagent error: {}", msg)))
+                }
+            }
         }
     }
 }

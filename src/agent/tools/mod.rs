@@ -18,7 +18,7 @@ mod repo_overview;
 #[cfg(feature = "semantic")]
 pub mod semantic;
 mod skill;
-mod task;
+pub mod task;
 mod task_status;
 pub(crate) mod todo;
 mod webfetch;

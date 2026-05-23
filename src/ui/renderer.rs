@@ -244,6 +244,29 @@ impl Renderer {
     // (continuation marker — methods below this block remain unchanged)
     fn _ov2_phase_a_anchor() {}
 
+    /// dirge-ov2 Phase E: append a line to a SPECIFIC chat's buffer
+    /// without disturbing the active chat's on-screen state. If
+    /// `idx` is the active chat, falls through to the regular
+    /// `write_line` so the line is also painted to stdout. For
+    /// inactive chats the line is pushed to the snapshot's buffer
+    /// only — visible the next time the user switches to that
+    /// chat via Ctrl-N/P/X.
+    pub fn write_line_to_chat(&mut self, idx: usize, text: &str, color: Color) -> io::Result<()> {
+        if idx == self.active_chat {
+            return self.write_line(text, color);
+        }
+        if let Some(slot) = self.chats.get_mut(idx) {
+            for line in text.split('\n') {
+                slot.buffer.push(LineEntry {
+                    text: CompactString::from(line),
+                    color,
+                });
+                slot.lines = slot.lines.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
     /// Update the avatar state and trigger a repaint of the bottom-left
     /// pixels. Cheap when the state hasn't changed — only the existing
     /// 3-row × 5-col patch is re-drawn.
