@@ -77,6 +77,11 @@ reqwest = "0.13"
 # its scrollback fuzzy search; matches by score with smart-case +
 # Unicode normalization, no need to roll our own ranking.
 nucleo-matcher = "0.3"
+# UI-redesign branch: system CPU / MEM gauges for the [SYSTEM LOAD]
+# sub-panel. `default-features = false` + only the modules we use
+# keeps the dep small (no disks / networks / processes — just CPU
+# + memory polling).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 dirs = "6"
 compact_str = { version = "0.9", features = ["serde"] }
 smallvec = "1"

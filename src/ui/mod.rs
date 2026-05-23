@@ -1,6 +1,7 @@
 pub(crate) mod ansi;
 pub(crate) mod avatar;
 pub(crate) mod box_render;
+pub(crate) mod sysload;
 mod events;
 mod highlight;
 pub(crate) mod input;
