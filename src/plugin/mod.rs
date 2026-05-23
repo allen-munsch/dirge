@@ -1077,6 +1077,119 @@ mod tests {
         );
     }
 
+    // --- H4: dedup duplicate registrations -----------------------------
+
+    /// Registering two tools with the same name resolves last-wins —
+    /// matches pi's `Map.set` semantics. The dropped entry triggers
+    /// a `tracing::warn` (not asserted here; just confirm only the
+    /// last survives).
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_plugin_tools_dedups_last_wins() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-tool "same" "v1" "L1" "{}" "h1")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-tool "same" "v2" "L2" "{}" "h2")"#)
+            .unwrap();
+        let tools = mgr.list_plugin_tools();
+        assert_eq!(tools.len(), 1, "duplicates should collapse to one entry");
+        assert_eq!(tools[0].description, "v2");
+        assert_eq!(tools[0].handler, "h2");
+    }
+
+    /// Multiple distinct names + one duplicate: distinct entries
+    /// retained, duplicate collapses.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_plugin_tools_preserves_distinct_entries_while_deduping() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-tool "a" "" "" "{}" "ha")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-tool "b" "" "" "{}" "hb")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-tool "a" "" "" "{}" "ha2")"#)
+            .unwrap();
+        let tools = mgr.list_plugin_tools();
+        assert_eq!(tools.len(), 2);
+        // Surviving "a" entry uses the second handler.
+        let a = tools.iter().find(|t| t.name == "a").unwrap();
+        assert_eq!(a.handler, "ha2");
+        let b = tools.iter().find(|t| t.name == "b").unwrap();
+        assert_eq!(b.handler, "hb");
+    }
+
+    /// Shortcut dedup matches the same last-wins rule.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_shortcuts_dedups_last_wins() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-shortcut "ctrl-x" "h1")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-shortcut "ctrl-x" "h2" "second binding")"#)
+            .unwrap();
+        let shortcuts = mgr.list_shortcuts();
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0].handler, "h2");
+        assert_eq!(shortcuts[0].description, "second binding");
+    }
+
+    /// Message-renderer dedup.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_message_renderers_dedups_last_wins() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-message-renderer "status" "r1")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-message-renderer "status" "r2")"#)
+            .unwrap();
+        let r = mgr.list_message_renderers();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], ("status".to_string(), "r2".to_string()));
+    }
+
+    // --- H5: invoke_command surfaces handler errors via notif queue ------
+
+    /// A handler that raises an exception causes invoke_command to
+    /// return Ok(None) (caller-surface unchanged for backwards compat)
+    /// AND queue a `[plugin] command <handler> errored:` notification
+    /// so the user gets visible feedback on the next UI tick.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn invoke_command_surfaces_handler_errors_via_notification() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn boom [args] (error "intentional"))"#)
+            .unwrap();
+        let out = mgr.invoke_command("boom", "args").unwrap();
+        assert_eq!(out, None, "handler error must return Ok(None)");
+
+        let notifs = mgr.drain_notifications();
+        assert_eq!(notifs.len(), 1);
+        assert_eq!(notifs[0].0, "error");
+        assert!(
+            notifs[0].1.contains("command boom errored"),
+            "got: {:?}",
+            notifs[0].1
+        );
+        assert!(
+            notifs[0].1.contains("intentional"),
+            "got: {:?}",
+            notifs[0].1
+        );
+    }
+
+    /// Successful handler invocations don't pollute the notification
+    /// queue — the H5 fix only fires on the catch arm.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn invoke_command_success_does_not_emit_notification() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn ok-cmd [args] (string "got: " args))"#)
+            .unwrap();
+        let out = mgr.invoke_command("ok-cmd", "hi").unwrap();
+        assert_eq!(out, Some("got: hi".to_string()));
+        assert!(mgr.drain_notifications().is_empty());
+    }
+
     // --- P9d (C1 fix): custom-message wrapper shape ---------------------
 
     /// Single-string `(harness/add-custom-message "...")` form is
@@ -2635,8 +2748,11 @@ impl PluginManager {
     /// when the handler produced a non-nil string, `Ok(None)` when it
     /// returned nil/empty or when the handler raised inside Janet. The
     /// caller-visible error path is reserved for catastrophic Janet
-    /// failures (VM dead, etc.) — handler-level errors are swallowed so a
-    /// broken plugin doesn't tear down the slash dispatch.
+    /// failures (VM dead, etc.) — handler-level errors are surfaced as
+    /// a chat notification via `harness/push-hook-err` and a
+    /// `tracing::warn` (so plugin authors get visible feedback) but the
+    /// caller still sees `Ok(None)` to avoid tearing down the slash /
+    /// shortcut dispatch on a buggy plugin (H5 fix).
     pub fn invoke_command(
         &mut self,
         handler_fn: &str,
@@ -2647,17 +2763,41 @@ impl PluginManager {
         // Use `(get (curenv) (symbol ...))` to look up the handler so a
         // missing fn doesn't print Janet's "unknown symbol" error to
         // stderr. Then call it via `apply` if found.
+        //
+        // Error handling matches dispatch()'s pattern: on Janet
+        // exception, queue a `[plugin] command <name> errored: <err>`
+        // notification AND return `DIRGE_HOOK_ERR:<msg>` so the Rust
+        // side can also tracing::warn. Caller still sees Ok(None).
         let code = format!(
             r#"(try
                  (let [f (get (curenv) (symbol "{fname}"))]
                    (if (and f (function? (f :value)))
                      ((f :value) "{args}")
                      nil))
-                 ([err fib] nil))"#,
+                 ([err fib]
+                   (do
+                     (def sanitized
+                       (harness/sanitize-hook-err
+                         (string "[plugin] command "
+                                 {fname_lit}
+                                 " errored: "
+                                 err)))
+                     (harness/push-hook-err sanitized)
+                     (string "DIRGE_HOOK_ERR:" err))))"#,
             fname = escaped_fn,
             args = escaped_args,
+            fname_lit = format!("\"{}\"", escape_janet_string(handler_fn)),
         );
         let result = self.eval(&code)?;
+        if let Some(msg) = result.strip_prefix("DIRGE_HOOK_ERR:") {
+            tracing::warn!(
+                target: "dirge::plugin",
+                handler = %handler_fn,
+                error = %msg,
+                "plugin command/shortcut handler errored — surfaced via notification",
+            );
+            return Ok(None);
+        }
         if result == "nil" || result.is_empty() {
             Ok(None)
         } else {
@@ -2706,6 +2846,11 @@ impl PluginManager {
     /// an optional execution-mode override. Read once after all plugins
     /// load; the host wraps each entry in a `JanetLoopTool` adapter and
     /// appends them to the agent loop's tool registry.
+    ///
+    /// H4: duplicate `name` registrations resolve last-wins (matches
+    /// pi's `extension.tools.set(name, ...)` Map semantics — second
+    /// `set` replaces first). Each drop emits a `tracing::warn` so
+    /// plugin authors see the collision.
     pub fn list_plugin_tools(&mut self) -> Vec<PluginToolMeta> {
         let raw = match self.worker.eval("harness-tools-list") {
             Ok(s) => s,
@@ -2714,13 +2859,16 @@ impl PluginManager {
         if raw.is_empty() {
             return Vec::new();
         }
-        raw.lines().filter_map(parse_plugin_tool_line).collect()
+        let parsed: Vec<PluginToolMeta> = raw.lines().filter_map(parse_plugin_tool_line).collect();
+        dedup_last_wins(parsed, "plugin tool", |t| t.name.clone())
     }
 
     /// Snapshot plugin-registered message renderers (P9d). Each
     /// entry is `(type-name, handler-fn-name)`. The UI looks up the
     /// `type` field of a `LoopMessage::Custom` payload here when
     /// rendering; no entry means the default formatter is used.
+    ///
+    /// H4: duplicate `type-name` registrations resolve last-wins.
     pub fn list_message_renderers(&mut self) -> Vec<(String, String)> {
         let raw = match self.worker.eval("harness-msg-renderers-list") {
             Ok(s) => s,
@@ -2729,7 +2877,8 @@ impl PluginManager {
         if raw.is_empty() {
             return Vec::new();
         }
-        raw.lines()
+        let parsed: Vec<(String, String)> = raw
+            .lines()
             .filter_map(|line| {
                 let mut parts = line.split('\t');
                 let t = unescape_harness_field(parts.next()?);
@@ -2740,7 +2889,8 @@ impl PluginManager {
                     Some((t, h))
                 }
             })
-            .collect()
+            .collect();
+        dedup_last_wins(parsed, "message renderer", |(t, _)| t.clone())
     }
 
     /// Invoke a Janet message-renderer handler with the raw JSON
@@ -2792,7 +2942,12 @@ impl PluginManager {
         if raw.is_empty() {
             return Vec::new();
         }
-        raw.lines().filter_map(parse_plugin_shortcut_line).collect()
+        // H4: duplicate key-specs resolve last-wins (matches pi's
+        // Map.set behaviour for shortcut registration). Pi also emits
+        // a shortcut diagnostic; dirge surfaces via tracing::warn.
+        let parsed: Vec<PluginShortcutMeta> =
+            raw.lines().filter_map(parse_plugin_shortcut_line).collect();
+        dedup_last_wins(parsed, "plugin shortcut", |s| s.keys.clone())
     }
 
     /// Invoke a Janet tool handler with the raw JSON args string the
@@ -3053,6 +3208,54 @@ pub struct CustomMessageEntry {
     /// keeps the message in the transcript (where plugin handlers
     /// can still observe it) but suppresses the visible row.
     pub display: bool,
+}
+
+/// Generic last-add-wins deduplicator for plugin registries.
+///
+/// Pi keeps each registry as a `Map<key, value>`, so the second
+/// `.set(key, …)` replaces the first. Dirge's append-only line
+/// format produces a `Vec<entry>` instead; this helper restores the
+/// same semantics. Each dropped entry emits a `tracing::warn` carrying
+/// the registry name and the collided key — surfaces in `RUST_LOG`
+/// tail so plugin authors notice typos / accidental dual registration.
+///
+/// Order: the surviving entry occupies the LAST position the key
+/// appeared at. Stable across the kept items.
+#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
+fn dedup_last_wins<T, K, F>(entries: Vec<T>, kind: &str, key_of: F) -> Vec<T>
+where
+    T: Clone,
+    K: Eq + std::hash::Hash + std::fmt::Display + Clone,
+    F: Fn(&T) -> K,
+{
+    use std::collections::HashMap;
+    // Two-pass: count occurrences, then keep only the last entry
+    // per key. Warn on the dropped occurrences.
+    let mut last_index: HashMap<K, usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        last_index.insert(key_of(e), i);
+    }
+    let mut out = Vec::with_capacity(last_index.len());
+    let mut seen_drops: HashMap<K, usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        let k = key_of(e);
+        let last = *last_index.get(&k).expect("populated above");
+        if i == last {
+            out.push(e);
+        } else {
+            *seen_drops.entry(k.clone()).or_insert(0) += 1;
+        }
+    }
+    for (k, dropped) in seen_drops {
+        tracing::warn!(
+            target: "dirge::plugin",
+            kind = %kind,
+            key = %k,
+            dropped = dropped,
+            "duplicate plugin registration — keeping last-load-wins entry",
+        );
+    }
+    out.into_iter().cloned().collect()
 }
 
 fn parse_custom_message_line(line: &str) -> Option<CustomMessageEntry> {
