@@ -205,16 +205,19 @@ const HARNESS_INIT: &str = r#"
                      (harness/-escape b) "\t"
                      d "\n")))))
 
-# Slash-command registry. Plugins register at load time;
-# the host reads the list once after all plugins load and
-# dispatches matching /cmd input back to the named handler.
-# Stored as a `name|handler\n` blob to keep the read side
-# easy (single Janet -> Rust string roundtrip).
+# Slash-command registry (9b — wire format aligned with the other
+# tab-separated harness blobs). Plugins register at load time; the
+# host reads the list once after all plugins load and dispatches
+# matching /cmd input back to the named handler. Last-load-wins on
+# name collision (matches pi's Map.set + the dedup_last_wins helper
+# applied to all the other plugin registries).
 (var harness-cmd-list "")
 (defn harness/register-command [name handler]
   (when (and (string? name) (string? handler))
     (set harness-cmd-list
-         (string harness-cmd-list name "|" handler "\n"))))
+         (string harness-cmd-list
+                 (harness/-escape name) "\t"
+                 (harness/-escape handler) "\n"))))
 
 # Replace the user's prompt for the current turn. Plugins
 # call this from on-prompt hooks. Distinct from
@@ -333,19 +336,23 @@ const HARNESS_INIT: &str = r#"
                  (string color) "\t"
                  (harness/-escape text) "\n"))))
 
-# Plugin-registered LLM providers (P1). Plugins call
+# Plugin-registered LLM providers (P1; 9b — wire format aligned with
+# the other harness blobs). Plugins call
 # (harness/register-provider name type base-url &opt api-key-env)
 # at load time to make a custom provider available alongside the
-# ones in config. Stored as `name|type|base-url|api-key-env\n`
-# so the host's list_providers can parse with a single
-# Janet -> Rust round-trip after all plugins finish loading.
+# ones in config. Stored as tab-separated, escape-encoded fields so
+# a single Janet -> Rust round-trip surfaces them all. Last-load-wins
+# on name collision via dedup_last_wins.
 (var harness-providers-list "")
 (defn harness/register-provider [name type base-url &opt api-key-env]
   (when (and (string? name) (string? type) (string? base-url))
     (let [env (if (and api-key-env (string? api-key-env)) api-key-env "")]
       (set harness-providers-list
            (string harness-providers-list
-                   name "|" type "|" base-url "|" env "\n")))))
+                   (harness/-escape name) "\t"
+                   (harness/-escape type) "\t"
+                   (harness/-escape base-url) "\t"
+                   (harness/-escape env) "\n")))))
 
 # Session-tree mutation ops queued from plugins (P4d). Mirrors pi's
 # ctx.setLabel / ctx.fork / ctx.navigateTree / ctx.newSession /

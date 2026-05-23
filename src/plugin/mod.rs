@@ -1079,6 +1079,70 @@ mod tests {
         );
     }
 
+    // --- 9b: register-command + register-provider wire alignment -------
+
+    /// Duplicate command name resolves last-wins (matches H4 semantics
+    /// for the phase-9 registries). Plugin authors using the reload
+    /// pattern now get the same predictable behavior across all
+    /// register-* APIs.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_commands_dedups_last_wins() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-command "echo" "h1")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-command "echo" "h2")"#)
+            .unwrap();
+        let cmds = mgr.list_commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], ("echo".to_string(), "h2".to_string()));
+    }
+
+    /// Command names with characters that would have broken the old
+    /// pipe-separated wire format (embedded `|`) now round-trip
+    /// through harness/-escape just like the other registries.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_commands_round_trips_special_chars() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        // Tabs and newlines escape; `|` is fine now too.
+        mgr.eval(r#"(harness/register-command "cmd|with|pipes" "h")"#)
+            .unwrap();
+        let cmds = mgr.list_commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].0, "cmd|with|pipes");
+    }
+
+    /// Duplicate provider name resolves last-wins.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_providers_dedups_last_wins() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-provider "local" "openai" "http://a")"#)
+            .unwrap();
+        mgr.eval(r#"(harness/register-provider "local" "anthropic" "http://b" "API_KEY")"#)
+            .unwrap();
+        let providers = mgr.list_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].0, "local");
+        assert_eq!(providers[0].1, "anthropic");
+        assert_eq!(providers[0].2, "http://b");
+        assert_eq!(providers[0].3, Some("API_KEY".to_string()));
+    }
+
+    /// Provider base-urls with `|` in query params (previously
+    /// would have corrupted the pipe-separated parser) now
+    /// round-trip cleanly.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn list_providers_round_trips_pipe_in_url() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(harness/register-provider "p" "openai" "http://x?a=1|b=2")"#)
+            .unwrap();
+        let providers = mgr.list_providers();
+        assert_eq!(providers[0].2, "http://x?a=1|b=2");
+    }
+
     // --- L5: tool-name charset validation ------------------------------
 
     /// Tool names with spaces, dots, slashes, etc. drop with a
@@ -2874,28 +2938,32 @@ impl PluginManager {
     /// handler-fn-name)` pairs in load order. Read once after all plugins
     /// finish loading; subsequent registrations require a reload to take
     /// effect (kept simple for now — Phase 5 will add hot-reload).
+    ///
+    /// 9b: wire format is tab-separated, escape-encoded — matches the
+    /// other phase-9 registries. Last-load-wins on cmd-name collision
+    /// via `dedup_last_wins`.
     pub fn list_commands(&mut self) -> Vec<(String, String)> {
-        // harness-cmd-list is a `name|handler\n` blob populated by the
-        // (harness/register-command ...) calls in plugin scripts. Janet
-        // stringifies strings without quotes, so the raw read is parseable
-        // as-is — no escaping concerns because plugins only ever pass
-        // alphanumeric command/handler names through here.
         let raw = match self.worker.eval("harness-cmd-list") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        raw.lines()
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let parsed: Vec<(String, String)> = raw
+            .lines()
             .filter_map(|line| {
-                let mut parts = line.splitn(2, '|');
-                let cmd = parts.next()?.trim();
-                let handler = parts.next()?.trim();
+                let mut parts = line.split('\t');
+                let cmd = unescape_harness_field(parts.next()?);
+                let handler = unescape_harness_field(parts.next()?);
                 if cmd.is_empty() || handler.is_empty() {
                     None
                 } else {
-                    Some((cmd.to_string(), handler.to_string()))
+                    Some((cmd, handler))
                 }
             })
-            .collect()
+            .collect();
+        dedup_last_wins(parsed, "slash command", |(c, _)| c.clone())
     }
 
     /// Invoke a registered handler fn by name with the user-provided args
@@ -2967,33 +3035,36 @@ impl PluginManager {
     /// all plugins load and merged into the host's resolver via
     /// [`crate::provider::install_plugin_providers`].
     pub fn list_providers(&mut self) -> Vec<(String, String, String, Option<String>)> {
+        // 9b: wire format is tab-separated, escape-encoded — matches
+        // the other phase-9 registries. Last-load-wins on provider
+        // name collision via dedup_last_wins.
         let raw = match self.worker.eval("harness-providers-list") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        raw.lines()
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let parsed: Vec<(String, String, String, Option<String>)> = raw
+            .lines()
             .filter_map(|line| {
-                let mut parts = line.splitn(4, '|');
-                let name = parts.next()?.trim();
-                let ptype = parts.next()?.trim();
-                let base_url = parts.next()?.trim();
-                let env_raw = parts.next()?.trim();
+                let mut parts = line.split('\t');
+                let name = unescape_harness_field(parts.next()?);
+                let ptype = unescape_harness_field(parts.next()?);
+                let base_url = unescape_harness_field(parts.next()?);
+                let env_raw = unescape_harness_field(parts.next()?);
                 if name.is_empty() || ptype.is_empty() || base_url.is_empty() {
                     return None;
                 }
                 let env = if env_raw.is_empty() {
                     None
                 } else {
-                    Some(env_raw.to_string())
+                    Some(env_raw)
                 };
-                Some((
-                    name.to_string(),
-                    ptype.to_string(),
-                    base_url.to_string(),
-                    env,
-                ))
+                Some((name, ptype, base_url, env))
             })
-            .collect()
+            .collect();
+        dedup_last_wins(parsed, "plugin provider", |(n, _, _, _)| n.clone())
     }
 
     /// Snapshot plugin-registered LLM tools (P9a). Each entry has the
