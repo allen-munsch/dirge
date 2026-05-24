@@ -2,11 +2,48 @@ use std::io::{self, Write};
 
 use compact_str::CompactString;
 use crossterm::ExecutableCommand;
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
-use crossterm::terminal::{Clear, ClearType, ScrollUp};
+use crossterm::cursor::MoveTo;
+use crossterm::style::Color;
+use crossterm::terminal::{Clear, ClearType};
+// `MoveTo` / `Clear` / `ExecutableCommand` are still used by
+// `clear_content` (resets the alt screen on `/clear`). The
+// streaming + viewport paint no longer touches stdout directly —
+// that's all routed through `tui_redraw` (ratatui).
 
 use super::resolve_color;
+
+/// Output sink for ratatui's CrosstermBackend. Prefers a fresh
+/// `/dev/tty` handle (so painting is isolated from the process's
+/// fd 1 — see `TerminalGuard`'s fd redirection); falls back to
+/// stdout when there's no controlling terminal (CI tests).
+pub enum BackendWriter {
+    Tty(std::fs::File),
+    Stdout(std::io::Stdout),
+}
+
+impl std::io::Write for BackendWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        match self {
+            BackendWriter::Tty(f) => f.write(b),
+            BackendWriter::Stdout(s) => s.write(b),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            BackendWriter::Tty(f) => f.flush(),
+            BackendWriter::Stdout(s) => s.flush(),
+        }
+    }
+}
+
+fn build_tui_terminal()
+-> Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>> {
+    let writer = match crate::ui::terminal::open_tty_for_write() {
+        Some(f) => BackendWriter::Tty(f),
+        None => BackendWriter::Stdout(std::io::stdout()),
+    };
+    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(writer)).ok()
+}
 
 #[derive(Clone)]
 pub struct LineEntry {
@@ -19,13 +56,26 @@ pub struct LineEntry {
 /// the chat-history viewport would be unreasonably squashed.
 pub const MAX_INPUT_VISIBLE_LINES: usize = 8;
 
-/// Width of the optional right-hand info panel content area, in columns.
-/// Plus one column for the vertical divider gives `PANEL_RESERVE`.
-const PANEL_WIDTH: u16 = 32;
-/// Total columns the panel costs the chat area when visible (panel + divider).
-const PANEL_RESERVE: u16 = PANEL_WIDTH + 1;
-/// Minimum terminal width at which `PanelMode::Auto` decides to show the
-/// panel. Below this the chat content would be too cramped.
+/// ui-redesign: the bottom [ALERT] panel wraps the input area in a
+/// double-line frame. Two reserved rows = top border (with title)
+/// + bottom border. Side borders (║ ... ║) are painted on every
+/// input row so the entire input area reads as one framed card,
+/// matching the mockup's bottom strip.
+///
+/// The frame title is `[ALERT]` permanently — input text and
+/// permission prompts both live INSIDE the frame.
+pub const ALERT_FRAME_ROWS: u16 = 2;
+
+/// ui-redesign: chat area is wrapped in a heavy double-line frame
+/// titled `[AGENT LOG STREAM]`. Two reserved rows = top border
+/// (row 0) + bottom border (row 1 + visible_lines). Side borders
+/// (║ … ║) are painted at the chat-band edges on every visible
+/// chat row when there's room (content_indent >= 1).
+pub const CHAT_FRAME_ROWS: u16 = 2;
+
+/// Minimum terminal width at which `PanelMode::Auto` decides to show
+/// the side panels. Below this the chat is too narrow to spare any
+/// margin for the AGENT STATUS / SYSTEM gutters.
 const PANEL_AUTO_MIN_COLS: u16 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,8 +93,6 @@ pub enum PanelMode {
 /// is mutated by the agent and we don't want stale reads.
 #[derive(Default, Clone)]
 pub struct PanelData {
-    /// Short directory name to show at the top of the panel.
-    pub cwd: String,
     /// (server name, connected) — connected currently always true because the
     /// MCP manager drops failed connections at connect time; future health
     /// tracking can flip this to false.
@@ -56,6 +104,11 @@ pub struct PanelData {
     pub todos: Vec<(String, String)>,
     /// Recent modified file paths, shortened relative to cwd when possible.
     pub modified: Vec<String>,
+    /// ui-redesign: latest system load snapshot for the
+    /// [SYSTEM LOAD] sub-panel. `None` when the polling task hasn't
+    /// produced a reading yet (very early startup) — painter skips
+    /// the section in that case.
+    pub sysload: Option<crate::ui::sysload::SysLoadSnapshot>,
 }
 
 /// dirge-gek: one row in the left-gutter subagent panel. Rendered as
@@ -68,6 +121,17 @@ pub struct SubagentStatusRow {
     pub id_short: String,
     pub state: String,
     pub prompt_short: String,
+}
+
+/// ui-redesign: idle-state info for the left panel. When no
+/// subagents are active, the left gutter paints this card: ASCII
+/// DIRGE logo + agent metadata. Updated at session-start (and on
+/// `/model` switch / `/prompt` switch) by the UI loop.
+#[derive(Debug, Clone, Default)]
+pub struct LeftPanelInfo {
+    pub agent_id: String,
+    pub model: String,
+    pub focus: String,
 }
 
 /// Per-chat state saved while a chat is INACTIVE. Mirrors the fields
@@ -131,11 +195,53 @@ pub struct Renderer {
     /// chat windows. Set by the UI loop on each lifecycle event;
     /// rendered above the bottom-row avatar in `draw_left_panel`.
     subagent_status: Vec<SubagentStatusRow>,
+    /// ui-redesign: idle-state info for the left panel. Painted when
+    /// `subagent_status` is empty so the gutter never looks dead.
+    left_panel_info: LeftPanelInfo,
+    /// ui-redesign Phase 6: when set, `draw_bottom` paints these
+    /// lines inside the bottom frame INSTEAD of the input editor.
+    /// Used by permission prompts and questionnaire prompts so the
+    /// user can see the prompt without the input box obscuring it.
+    /// Cleared after the ask handler resolves. Each entry is
+    /// (text, color); painter centers text horizontally within the
+    /// frame's inner band.
+    alert_overlay: Option<Vec<(String, Color)>>,
+    /// ui-redesign: title shown in the bottom-frame's top border
+    /// when the alert overlay is active. Empty when no overlay (the
+    /// idle input has no title, per the mockup). Caller of
+    /// `set_alert_overlay` is expected to push this via
+    /// `set_alert_title` so the frame label matches the prompt
+    /// type (`[ALERT]`, `[QUESTION]`, etc.).
+    alert_title: String,
     /// What the agent is doing — drives the bottom-left ASCII avatar.
     avatar_state: crate::ui::avatar::AvatarState,
     /// Animation flip; toggled by `tick_avatar()` so the avatar's
     /// eyes / mouth alternate between two poses per state.
     avatar_tick: bool,
+
+    // ── ratatui migration (Phase 6) ────────────────────────────────
+    /// The ratatui Terminal driving the new paint pipeline. `Option`
+    /// because tests construct Renderer without a real stdout and
+    /// must skip the actual draw call (the legacy paint paths kept
+    /// no terminal handle either — this preserves the same testable
+    /// shape).
+    tui_terminal:
+        Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>>,
+    /// Cached input editor snapshot used when `write_line` / `write`
+    /// trigger a redraw — they don't have the editor reference at
+    /// hand, but the last `draw_bottom` did. Stored as pre-wrapped
+    /// rows (one per visual line) so the widget can render multi-
+    /// line input without re-wrapping each frame.
+    cached_input_rows: Vec<String>,
+    /// Cursor row within `cached_input_rows`.
+    cached_input_cursor_row: u16,
+    /// Cursor column on `cached_input_rows[cached_input_cursor_row]`,
+    /// in display cells.
+    cached_input_cursor_col: u16,
+    /// Status string from the most recent `draw_bottom` call.
+    cached_status: String,
+    /// `is_running` from the most recent `draw_bottom` call.
+    cached_is_running: bool,
 }
 
 impl Renderer {
@@ -161,9 +267,150 @@ impl Renderer {
             panel_mode: PanelMode::Auto,
             panel_data: PanelData::default(),
             subagent_status: Vec::new(),
+            left_panel_info: LeftPanelInfo::default(),
+            alert_overlay: None,
+            alert_title: String::new(),
             avatar_state: crate::ui::avatar::AvatarState::Idle,
             avatar_tick: false,
+            // ratatui's backend writes to /dev/tty (a fresh fd
+            // pointing at the controlling terminal) rather than the
+            // process's stdout. With stdout/stderr redirected to
+            // the log file by TerminalGuard, this is the only path
+            // that can paint the screen — no rogue (print …),
+            // println!, panic, or child-process output can reach
+            // the TTY anymore. Falls back to stdout when /dev/tty
+            // isn't available (CI tests, headless).
+            tui_terminal: build_tui_terminal(),
+            cached_input_rows: vec![String::new()],
+            cached_input_cursor_row: 0,
+            cached_input_cursor_col: 0,
+            cached_status: String::new(),
+            cached_is_running: false,
         })
+    }
+
+/// Phase 6 paint entry point. Builds a `Scene` from current
+    /// Renderer state and calls `render_frame` through the ratatui
+    /// Terminal. Every legacy paint method funnels here.
+    ///
+    /// Returns `Ok(())` (no-op) when no ratatui Terminal was
+    /// initialised — keeps tests that construct `Renderer::new()`
+    /// against captured stdout from blowing up on `draw`.
+    pub(crate) fn tui_redraw(&mut self) -> io::Result<()> {
+        use crate::ui::avatar;
+        use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
+        use crate::ui::tui::scene::{Scene, render_frame};
+
+        // panel_visible() borrows &self via terminal_size, so compute
+        // it BEFORE we take the split mutable borrow on tui_terminal.
+        let show_side_panels = self.panel_visible();
+        let frame_color = crate::ui::theme::header();
+
+        // Split borrows on Self so we can hold &mut tui_terminal
+        // and immutable references to the data fields at the same
+        // time. Rust's borrow checker requires we name each field
+        // we intend to read here.
+        let Self {
+            buffer,
+            scroll_offset,
+            input_rows,
+            panel_data,
+            left_panel_info,
+            subagent_status,
+            alert_overlay,
+            alert_title,
+            avatar_state,
+            avatar_tick,
+            cached_input_rows,
+            cached_input_cursor_row,
+            cached_input_cursor_col,
+            cached_status,
+            cached_is_running,
+            tui_terminal,
+            ..
+        } = self;
+
+        let Some(terminal) = tui_terminal.as_mut() else {
+            return Ok(());
+        };
+
+        let face = avatar::art(*avatar_state, *avatar_tick);
+        let avatar_color =
+            crate::ui::tui::chat::crossterm_to_ratatui(avatar::color(*avatar_state));
+        let avatar = Some(AvatarSpec {
+            face,
+            color: avatar_color,
+        });
+
+        let body = if let Some(lines) = alert_overlay.as_ref() {
+            BottomBody::Overlay {
+                title: alert_title.as_str(),
+                lines: lines.as_slice(),
+            }
+        } else {
+            BottomBody::Editor {
+                rows: cached_input_rows.as_slice(),
+                cursor_row: *cached_input_cursor_row,
+                cursor_col: *cached_input_cursor_col,
+                is_running: *cached_is_running,
+            }
+        };
+
+        // Size the input box to fit the overlay (or, for the
+        // editor, the wrapped editor row count). For overlays we
+        // bypass MAX_INPUT_VISIBLE_LINES because the user
+        // **must** see the action keys row regardless of how
+        // long the alert body is — clipping at 8 was hiding
+        // [y]/[a]/[n]/[ESC]. The chat shrinks to accommodate, with
+        // a floor of 4 rows so the user still sees recent context
+        // above the alert. The editor stays clamped at MAX so the
+        // user can't accidentally crowd the chat by pasting a 50-
+        // line block.
+        let (cols_q, rows_q) = crate::ui::terminal::tty_size();
+        let effective_input_rows = if let Some(lines) = alert_overlay.as_ref() {
+            let probe = crate::ui::tui::layout::Layout::new(cols_q, rows_q, 1);
+            let wrapped = crate::ui::tui::bottom::overlay_wrapped_row_count(
+                lines,
+                probe.input_box.width,
+            );
+            // Leave at least 4 rows for the chat (+ 5 fixed rows
+            // of frames/status), so input_rows ≤ rows - 9.
+            let ceiling = (rows_q as i32 - 9).max(1) as u16;
+            (wrapped as u16).clamp(1, ceiling)
+        } else {
+            *input_rows
+        };
+
+        let scene = Scene {
+            chat_buffer: buffer,
+            scroll_offset: *scroll_offset,
+            input_rows: effective_input_rows,
+            panel_data,
+            left_info: left_panel_info,
+            subagents: subagent_status,
+            avatar,
+            body,
+            status: cached_status.as_str(),
+            show_side_panels,
+            frame_color,
+        };
+
+        // Wrap the draw in Begin/EndSynchronizedUpdate. Modern
+        // terminals (iTerm2, kitty, foot, recent xterm, Windows
+        // Terminal) buffer the bracketed escape sequences and
+        // present the resulting frame atomically — eliminates the
+        // flicker we'd otherwise see as ratatui emits one escape
+        // per changed cell sequentially. Terminals that don't
+        // implement the sequence ignore it (it's a private DECSET
+        // ?2026), so the bracket is harmless backwards-compat.
+        use crossterm::ExecutableCommand as _;
+        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+        let mut stdout = std::io::stdout();
+        let _ = stdout.execute(BeginSynchronizedUpdate);
+        let draw_result = terminal.draw(|f| render_frame(&scene, f));
+        let _ = stdout.execute(EndSynchronizedUpdate);
+        draw_result?;
+        Ok(())
     }
 
     /// dirge-ov2: append a new chat (typically a subagent) with the
@@ -312,6 +559,52 @@ impl Renderer {
         self.subagent_status = rows;
     }
 
+    /// ui-redesign: set the idle-state info shown in the left panel
+    /// (DIRGE logo + agent metadata). The UI loop calls this at
+    /// session start + on `/model` / `/prompt` switches so the
+    /// gutter stays current.
+    pub fn set_left_panel_info(&mut self, info: LeftPanelInfo) {
+        self.left_panel_info = info;
+    }
+
+    /// ui-redesign Phase 6: set the alert overlay. While `Some`, the
+    /// `[ALERT]` frame contains the supplied lines instead of the
+    /// input editor. The ask handler builds the lines, pushes them
+    /// here on prompt-open, and calls `clear_alert_overlay` on
+    /// response.
+    ///
+    /// Lines are painted centered horizontally within the frame's
+    /// inner band. Caller is responsible for keeping line count
+    /// within `MAX_INPUT_VISIBLE_LINES` — taller overlays clip.
+    pub fn set_alert_overlay(&mut self, rows: Vec<(String, Color)>) {
+        self.alert_overlay = Some(rows);
+        if self.alert_title.is_empty() {
+            self.alert_title = "[ALERT]".to_string();
+        }
+    }
+
+    /// Set both overlay content and the title shown in the frame's
+    /// top border. Use this instead of `set_alert_overlay` when the
+    /// prompt is something other than a generic alert (e.g.
+    /// `[QUESTION]`).
+    pub fn set_alert_overlay_with_title(
+        &mut self,
+        title: impl Into<String>,
+        rows: Vec<(String, Color)>,
+    ) {
+        self.alert_title = title.into();
+        self.alert_overlay = Some(rows);
+    }
+
+    pub fn clear_alert_overlay(&mut self) {
+        self.alert_overlay = None;
+        self.alert_title.clear();
+    }
+
+    pub fn alert_overlay_active(&self) -> bool {
+        self.alert_overlay.is_some()
+    }
+
     pub fn set_panel_data(&mut self, data: PanelData) {
         self.panel_data = data;
     }
@@ -323,21 +616,21 @@ impl Renderer {
         let (cols, _) = self.terminal_size();
         match self.panel_mode {
             PanelMode::Off => false,
-            PanelMode::On => cols >= PANEL_RESERVE + 20,
-            PanelMode::Auto => cols >= PANEL_AUTO_MIN_COLS,
+            // Show side panels only when there's enough margin to
+            // host them — content_indent reflects each side's width
+            // in the centered layout, so require ~15 cols min.
+            PanelMode::On => self.content_indent() >= 15,
+            PanelMode::Auto => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
         }
     }
 
-    /// Content-area width in columns: terminal width minus the panel and
-    /// divider when the panel is visible. All chat/input width math uses
-    /// this so wrapping/clipping respects the panel.
+    /// Content-area width in columns. With the centered chat layout,
+    /// the chat fills the middle and the side panels split the
+    /// remainder symmetrically — so chat width math uses the full
+    /// terminal width (minus 2 for the chat ║ borders).
     fn content_cols(&self) -> u16 {
         let (cols, _) = self.terminal_size();
-        if self.panel_visible() {
-            cols.saturating_sub(PANEL_RESERVE)
-        } else {
-            cols
-        }
+        cols
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -349,7 +642,7 @@ impl Renderer {
     }
 
     fn terminal_size(&self) -> (u16, u16) {
-        crossterm::terminal::size().unwrap_or((80, 24))
+        crate::ui::terminal::tty_size()
     }
 
     /// Width chat text wraps to before pushing into the buffer. Uses
@@ -362,14 +655,14 @@ impl Renderer {
         self.content_width()
     }
 
-    /// Raw width of the chat band (terminal minus panel reserve,
-    /// minus 1 col for the rightmost gutter). Used for *positioning*
-    /// math (`content_indent`, panel divider layout) where the actual
-    /// available column count matters; chat text wrapping should go
-    /// through `max_line_width` / `content_width` instead so it
+    /// Raw width of the chat band (terminal width minus 2 cols for
+    /// the chat frame's left + right ║). Used for *positioning*
+    /// math (`content_indent`, panel widths) — chat text wrapping
+    /// should go through `max_line_width` / `content_width` so it
     /// honors the 120-col cap.
     pub fn line_width(&self) -> usize {
-        self.content_cols().saturating_sub(1) as usize
+        let (cols, _) = self.terminal_size();
+        cols.saturating_sub(2) as usize
     }
 
     /// Target width for chat content. Caps at 120 cols so wide
@@ -430,7 +723,7 @@ impl Renderer {
     /// Subtracts the input box (`input_rows`) and the status line (1 row).
     pub fn visible_lines(&self) -> usize {
         let (_, rows) = self.terminal_size();
-        rows.saturating_sub(self.input_rows + 1) as usize
+        rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS) as usize
     }
 
     /// The screen row index where the input box starts. Overlays that need
@@ -438,7 +731,12 @@ impl Renderer {
     /// this as their bottom limit.
     pub fn input_top_row(&self) -> u16 {
         let (_, rows) = self.terminal_size();
-        rows.saturating_sub(self.input_rows + 1)
+        // ui-redesign: input_top sits BELOW the [ALERT] top border
+        // and ABOVE the bottom border + status row. Reserve
+        // input_rows for input + 1 for status + (ALERT_FRAME_ROWS - 1)
+        // for the bottom border; subtracting (input_rows +
+        // ALERT_FRAME_ROWS) puts us right after the top border row.
+        rows.saturating_sub(self.input_rows + ALERT_FRAME_ROWS)
     }
 
     /// Map a screen `(row, col)` to a `(line_idx, char_col)` anchor for
@@ -469,9 +767,19 @@ impl Renderer {
 
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
         let (_, rows) = self.terminal_size();
-        let visible = rows.saturating_sub(self.input_rows + 1) as usize;
+        let visible = rows
+            .saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS)
+            as usize;
         let total = self.buffer.len();
         if total == 0 {
+            return None;
+        }
+        // ui-redesign: row 0 is the chat top frame; chat rows start
+        // at row 1. Map screen row → chat-content row by subtracting
+        // the frame offset; rows above the chat area have no buffer
+        // line.
+        let chat_row = row.checked_sub(1)? as usize;
+        if chat_row >= visible {
             return None;
         }
         let start = if self.scroll_offset == 0 {
@@ -480,7 +788,7 @@ impl Renderer {
             total.saturating_sub(self.scroll_offset + visible)
         };
         let start = start.min(total.saturating_sub(visible));
-        let idx = start + row as usize;
+        let idx = start + chat_row;
         if idx < total { Some(idx) } else { None }
     }
 
@@ -677,294 +985,12 @@ impl Renderer {
     }
 
     pub fn render_viewport(&mut self) -> io::Result<()> {
-        let (_, rows) = self.terminal_size();
-        let content_cols = self.content_cols();
-        let visible = rows.saturating_sub(self.input_rows + 1) as usize;
-        let total = self.buffer.len();
-        let mut stdout = io::stdout();
-        // Keep the cursor hidden while we paint many rows; draw_bottom is
-        // the only path that re-shows it at the input position.
-        stdout.execute(Hide)?;
-
-        let start = if self.scroll_offset == 0 {
-            total.saturating_sub(visible)
-        } else {
-            total.saturating_sub(self.scroll_offset + visible)
-        };
-        let start = start.min(total.saturating_sub(visible));
-        let end = (start + visible).min(total);
-
-        // Width of the content band (excluding the divider column at
-        // `content_cols`). All chat text is clipped here; the remaining
-        // columns belong to the divider + panel.
-        let content_band = content_cols.saturating_sub(1) as usize;
-        // Left indent in columns to horizontally center chat content
-        // inside the band. We then clip the per-line text to
-        // `content_band - indent` so wide content can't spill into
-        // the divider/panel.
-        let indent = self.content_indent();
-        let line_cap = content_band.saturating_sub(indent);
-        for i in 0..visible {
-            stdout.execute(MoveTo(0, i as u16))?;
-            // Paint indent spaces (no color) so any stale text on the
-            // left edge from a wider previous line gets wiped.
-            if indent > 0 {
-                write!(stdout, "{}", " ".repeat(indent))?;
-            }
-            let text_chars: usize = if start + i < end {
-                let entry = &self.buffer[start + i];
-                let line_idx = start + i;
-                let chars: Vec<char> = entry.text.chars().take(line_cap).collect();
-                let actual_chars = chars.len();
-
-                // Resolve the per-row selection span as char indices
-                // `[sel_lo, sel_hi)` within this row's `chars` slice.
-                // None when this row has no selected chars.
-                let sel_span: Option<(usize, usize)> = if self.selection_active
-                    && self.selection_start.is_some()
-                    && self.selection_end.is_some()
-                {
-                    let s = self.selection_start.unwrap();
-                    let e = self.selection_end.unwrap();
-                    // Normalize so `lo` comes before `hi` in row-major
-                    // order: earlier row wins; same row → earlier col.
-                    let (lo, hi) = if (s.0, s.1) <= (e.0, e.1) {
-                        (s, e)
-                    } else {
-                        (e, s)
-                    };
-                    if line_idx < lo.0 || line_idx > hi.0 {
-                        None
-                    } else {
-                        let from = if line_idx == lo.0 { lo.1 } else { 0 };
-                        let to = if line_idx == hi.0 {
-                            hi.1.min(actual_chars)
-                        } else {
-                            actual_chars
-                        };
-                        if from < to { Some((from, to)) } else { None }
-                    }
-                } else {
-                    None
-                };
-
-                let bloom = crate::ui::theme::is_bright(entry.color);
-                // Paint the row in up to three runs: pre-selection,
-                // selected (reverse-video), post-selection. When no
-                // selection touches this row, we just paint the whole
-                // run once.
-                let paint_run = |stdout: &mut std::io::Stdout,
-                                 slice: &[char],
-                                 reverse: bool|
-                 -> io::Result<()> {
-                    if slice.is_empty() {
-                        return Ok(());
-                    }
-                    if reverse {
-                        write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
-                    }
-                    if bloom {
-                        write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-                    }
-                    write!(stdout, "{}", SetForegroundColor(self.color(entry.color)))?;
-                    let s: String = slice.iter().collect();
-                    write!(stdout, "{}", s)?;
-                    if bloom {
-                        write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-                    }
-                    if reverse {
-                        write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
-                    }
-                    write!(stdout, "{}", ResetColor)?;
-                    Ok(())
-                };
-
-                match sel_span {
-                    None => paint_run(&mut stdout, &chars, false)?,
-                    Some((from, to)) => {
-                        paint_run(&mut stdout, &chars[..from], false)?;
-                        paint_run(&mut stdout, &chars[from..to], true)?;
-                        paint_run(&mut stdout, &chars[to..], false)?;
-                    }
-                }
-                actual_chars
-            } else {
-                0
-            };
-            if self.panel_visible() {
-                // Pad to fill the content band so stale chars from
-                // wider previous lines get wiped. With centering,
-                // the written length per row is `indent + text_chars`;
-                // the trailing pad fills `content_band - (indent + text)`.
-                let written = indent + text_chars;
-                let pad = content_band.saturating_sub(written);
-                if pad > 0 {
-                    write!(stdout, "{}", " ".repeat(pad))?;
-                }
-            } else {
-                // No panel — safe to use the cheaper clear-to-end-of-line so
-                // stale chars at the very last column also get wiped.
-                write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
-            }
-        }
-
-        if self.scroll_offset > 0 {
-            let pct = if total > visible {
-                ((total - self.scroll_offset - visible) * 100 / (total - visible)).min(100)
-            } else {
-                0
-            };
-            let indicator = format!(" SCROLL {}% ", pct);
-            let x = content_cols.saturating_sub(indicator.len() as u16);
-            stdout.execute(MoveTo(x, 0))?;
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(crate::ui::theme::warn()))
-            )?;
-            write!(stdout, "{}", indicator)?;
-            write!(stdout, "{}", ResetColor)?;
-        }
-
-        if self.panel_visible() {
-            self.draw_panel(&mut stdout, rows)?;
-        }
-
-        // dirge-gek: paint the LEFT subagent panel after the chat
-        // content + right panel. Painting last keeps the gutter
-        // current with the chat scroll without forcing an extra
-        // full redraw on every chat update.
-        self.draw_left_panel(&mut stdout, rows)?;
-
-        stdout.flush()?;
-        Ok(())
-    }
-
-    /// dirge-gek: paint the subagent overview in the left gutter.
-    /// Uses the area between col 0 and `content_indent`, rows 0
-    /// through `input_top - 3` (leaving the bottom 3 rows free for
-    /// the avatar). No-op when the gutter is too narrow (< 16 cols)
-    /// or there are no subagents to surface.
-    ///
-    /// One row per subagent: `<glyph> <id> <prompt>` where glyph
-    /// signals state (running=⋯, completed=✓, failed=✗). Each
-    /// field is truncated to fit the gutter width.
-    fn draw_left_panel(&self, stdout: &mut io::Stdout, rows: u16) -> io::Result<()> {
-        if self.subagent_status.is_empty() {
-            return Ok(());
-        }
-        let indent = self.content_indent();
-        // Need ≥16 cols of gutter for the panel to read meaningfully
-        // (glyph + space + 6-char id + space + 6+-char prompt).
-        if indent < 16 {
-            return Ok(());
-        }
-        // Leave the bottom 3 rows for the avatar.
-        let avatar_reserve: u16 = 3;
-        let panel_bottom = rows.saturating_sub(self.input_rows + 1 + avatar_reserve);
-        if panel_bottom == 0 {
-            return Ok(());
-        }
-        let dim = self.color(crate::ui::theme::dim());
-        let header_color = self.color(crate::ui::theme::header());
-        let agent = self.color(crate::ui::theme::agent());
-        let err = self.color(crate::ui::theme::system());
-
-        // Header row.
-        stdout.execute(MoveTo(0, 0))?;
-        write!(stdout, "{}", " ".repeat(indent.saturating_sub(1)))?;
-        stdout.execute(MoveTo(0, 0))?;
-        write!(stdout, "{}", SetForegroundColor(header_color))?;
-        write!(stdout, "SUBAGENTS")?;
-        write!(stdout, "{}", ResetColor)?;
-
-        // Rows. Cap at the available height; oldest entries drop off.
-        let row_budget = (panel_bottom.saturating_sub(1)) as usize;
-        let show = self.subagent_status.iter().take(row_budget);
-        for (i, row) in show.enumerate() {
-            let y = (i as u16).saturating_add(1);
-            if y >= panel_bottom {
-                break;
-            }
-            stdout.execute(MoveTo(0, y))?;
-            // Wipe the row first so a previous longer entry doesn't
-            // leave fossil characters.
-            write!(stdout, "{}", " ".repeat(indent.saturating_sub(1)))?;
-            stdout.execute(MoveTo(0, y))?;
-            let (glyph, color) = match row.state.as_str() {
-                "running" => ("⋯", agent),
-                "completed" => ("✓", agent),
-                "failed" => ("✗", err),
-                _ => ("·", dim),
-            };
-            write!(stdout, "{}", SetForegroundColor(color))?;
-            write!(stdout, "{} ", glyph)?;
-            write!(stdout, "{}", SetForegroundColor(dim))?;
-            // 6-char short id + space.
-            let id_field: String = row.id_short.chars().take(6).collect();
-            write!(stdout, "{:6} ", id_field)?;
-            // Prompt fills the rest of the gutter (minus 2 for the
-            // glyph/space and 7 for the id/space).
-            write!(stdout, "{}", SetForegroundColor(agent))?;
-            let prompt_max = indent.saturating_sub(2 + 7 + 1);
-            let prompt_field: String = row.prompt_short.chars().take(prompt_max).collect();
-            write!(stdout, "{}", prompt_field)?;
-            write!(stdout, "{}", ResetColor)?;
-        }
-        Ok(())
-    }
-
-    fn ensure_room(&mut self) {
-        if self.scroll_offset > 0 {
-            return;
-        }
-        let (_, rows) = self.terminal_size();
-        if rows < 3 {
-            return;
-        }
-        // Clear only the content band so the right-hand info panel keeps
-        // its pixels when the chat viewport scrolls.
-        let content_cols = self.content_cols();
-        let max_content = rows.saturating_sub(self.input_rows + 1);
-        if self.lines >= max_content {
-            let mut stdout = io::stdout();
-            let _ = stdout.execute(ScrollUp(1));
-            self.lines = self.lines.saturating_sub(1);
-            // After ScrollUp, the input row (with the avatar) and any
-            // continuation input rows + the status row all shifted up
-            // by 1. Their fragments now sit on `max_content - 1`
-            // through `rows - 2`. Clear EVERY row from the last chat
-            // row through the previous status row — anything else
-            // would leave avatar/status fragments visible at the
-            // wrong row, which is the symptom users see as "avatar
-            // duplicated on scroll." The bottom row (now blank from
-            // ScrollUp) doesn't need clearing.
-            let clear_start = max_content.saturating_sub(1);
-            let clear_end = rows.saturating_sub(1); // exclusive
-            for r in clear_start..clear_end {
-                let _ = stdout.execute(MoveTo(0, r));
-                let _ = write!(stdout, "{}", " ".repeat(content_cols as usize));
-            }
-            // Repaint the avatar after the wipe — otherwise the
-            // avatar visibly blinks out between writes during
-            // streaming (until the next `draw_bottom` is called by
-            // the UI loop on a significant event). Cheap: one
-            // MoveTo + 5 chars at a known column.
-            let input_top = rows.saturating_sub(self.input_rows + 1);
-            let _ = self.draw_avatar(&mut stdout, input_top);
-            let _ = stdout.flush();
-        }
-    }
-
-    fn content_row(&self) -> u16 {
-        let (_, rows) = self.terminal_size();
-        self.lines.min(rows.saturating_sub(self.input_rows + 2))
+        self.tui_redraw()
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
         self.commit_partial();
         let max_width = self.max_line_width();
-        let indent = self.content_indent();
         for segment in text.split('\n') {
             let wrapped = self.wrap_line(segment, max_width);
             for chunk in &wrapped {
@@ -972,58 +998,13 @@ impl Renderer {
                     text: chunk.clone(),
                     color,
                 });
-                if self.scroll_offset == 0 {
-                    self.ensure_room();
-                    let mut stdout = io::stdout();
-                    // Hide cursor so streaming agent output doesn't drag the
-                    // hardware cursor across the chat area; draw_bottom shows
-                    // it again at the input prompt.
-                    stdout.execute(Hide)?;
-                    let r = self.content_row();
-                    stdout.execute(MoveTo(0, r))?;
-                    stdout.execute(Clear(ClearType::CurrentLine))?;
-                    // Indent so the directly-painted line matches the
-                    // centered layout that `render_viewport` produces.
-                    // Without this, the streaming path writes at col 0
-                    // and the chat visibly jumps from centered (after
-                    // a render_viewport repaint) to left-aligned
-                    // (immediately after each write).
-                    if indent > 0 {
-                        write!(stdout, "{}", " ".repeat(indent))?;
-                    }
-                    // Bold-glow for bright tones so streamed text
-                    // reads the same as the post-redraw render_viewport
-                    // path. Without this, streaming chunks look flat
-                    // until the next full repaint shifts them to the
-                    // bright/bold weight.
-                    let bloom = crate::ui::theme::is_bright(color);
-                    if bloom {
-                        write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-                    }
-                    write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
-                    // dirge-ypg: emit CRLF, not bare LF. In raw mode
-                    // (enable_raw_mode disables OPOST/ONLCR) a bare
-                    // `\n` is just LF — cursor moves down one row but
-                    // the column stays where the chunk ended. Even
-                    // though the NEXT write_line call MoveTo(0, r)s
-                    // first, some terminals (or buffer-flush
-                    // interleavings) drop characters in the gap and
-                    // the user sees a staircase on subsequent
-                    // streamed text. Explicit `\r\n` resets the col
-                    // immediately so the cursor is in a known state
-                    // regardless of what follows.
-                    write!(stdout, "{}\r\n", chunk)?;
-                    if bloom {
-                        write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-                    }
-                    write!(stdout, "{}", ResetColor)?;
-                    self.lines = self.lines.saturating_add(1);
-                    self.col = 0;
-                }
             }
         }
+        // ratatui path: state is mutated above; the redraw repaints
+        // the full chat region (no per-line direct stdout writes,
+        // no Clear(CurrentLine) wiping side-panel cols).
         if self.scroll_offset == 0 {
-            io::stdout().flush()?;
+            self.tui_redraw()?;
         }
         Ok(())
     }
@@ -1036,16 +1017,13 @@ impl Renderer {
         if max_width == 0 {
             return Ok(());
         }
-        // Hide cursor for the duration of this streamed write; draw_bottom
-        // is the only place that re-shows it at the input prompt.
-        if self.scroll_offset == 0 {
-            io::stdout().execute(Hide)?;
-        }
-        // Same centering offset render_viewport / write_line use.
-        // Without this the streaming token path paints at col 0 while
-        // the rest of the chat is centered — content jumps left as it
-        // streams and back to center on the next full repaint.
-        let indent = self.content_indent() as u16;
+        // ratatui path: token-by-token streaming just appends to the
+        // partial line buffer + commits on newlines / wrap. The
+        // ratatui Buffer diff handles which cells actually changed;
+        // no direct stdout writes, no per-token MoveTo, no manual
+        // CRLF handling, no Clear(CurrentLine) collateral on side
+        // panels. Soft-wrap math stays here so wrapped-line counts
+        // remain consistent with render math.
         let parts: Vec<&str> = text.split('\n').collect();
         let last = parts.len() - 1;
         for (i, segment) in parts.iter().enumerate() {
@@ -1063,36 +1041,7 @@ impl Renderer {
                         color,
                     });
                 }
-                if self.scroll_offset == 0 {
-                    self.ensure_room();
-                    let mut stdout = io::stdout();
-                    let r = self.content_row();
-                    stdout.execute(MoveTo(indent + self.col, r))?;
-                    if !segment.is_empty() {
-                        let bloom = crate::ui::theme::is_bright(color);
-                        if bloom {
-                            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-                        }
-                        write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
-                        write!(stdout, "{}", segment)?;
-                        if bloom {
-                            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-                        }
-                        write!(stdout, "{}", ResetColor)?;
-                    }
-                    // dirge-ypg: emit CRLF, not bare LF — same
-                    // reasoning as the write_line site above. User
-                    // hit the staircase on the reasoning stream
-                    // path (`AgentEvent::Reasoning` routes through
-                    // this function); each chunk's trailing LF in
-                    // raw mode moved the cursor down without
-                    // resetting the column, and subsequent chunks
-                    // landed at the prior end-col. Explicit `\r\n`
-                    // resets col immediately.
-                    write!(stdout, "\r\n")?;
-                    self.lines = self.lines.saturating_add(1);
-                    self.col = 0;
-                }
+                self.col = 0;
             } else if !segment.is_empty() {
                 let chars: Vec<char> = segment.chars().collect();
                 let mut idx = 0;
@@ -1100,46 +1049,27 @@ impl Renderer {
                     let avail = max_width.saturating_sub(self.col as usize);
                     if avail == 0 {
                         self.commit_partial();
-                        if self.scroll_offset == 0 {
-                            self.lines = self.lines.saturating_add(1);
-                            self.col = 0;
-                        }
+                        self.col = 0;
                         continue;
                     }
                     let end = (idx + avail).min(chars.len());
                     let chunk: String = chars[idx..end].iter().collect();
                     self.partial_color = color;
                     self.partial.push_str(&chunk);
-                    if self.scroll_offset == 0 {
-                        self.ensure_room();
-                        let mut stdout = io::stdout();
-                        let r = self.content_row();
-                        stdout.execute(MoveTo(indent + self.col, r))?;
-                        let bloom = crate::ui::theme::is_bright(color);
-                        if bloom {
-                            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-                        }
-                        write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
-                        write!(stdout, "{}", chunk)?;
-                        if bloom {
-                            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-                        }
-                        write!(stdout, "{}", ResetColor)?;
-                        self.col = self.col.saturating_add(chunk.chars().count() as u16);
-                    }
+                    self.col = self.col.saturating_add(chunk.chars().count() as u16);
                     idx = end;
                     if idx < chars.len() {
                         self.commit_partial();
-                        if self.scroll_offset == 0 {
-                            self.lines = self.lines.saturating_add(1);
-                            self.col = 0;
-                        }
+                        self.col = 0;
                     }
                 }
             }
         }
+        // Single redraw at the end of the streamed batch — repeated
+        // tokens within the batch land in the buffer + partial, and
+        // the diff engine in ratatui only emits cells that changed.
         if self.scroll_offset == 0 {
-            io::stdout().flush()?;
+            self.tui_redraw()?;
         }
         Ok(())
     }
@@ -1164,555 +1094,37 @@ impl Renderer {
         status: &str,
         is_running: bool,
     ) -> io::Result<()> {
-        let (_, rows) = crossterm::terminal::size()?;
-        // Width available for input/status content. When the info panel is
-        // visible this is smaller than terminal width — using it everywhere
-        // keeps the prompt + status text from spilling under the panel.
-        let cols = self.content_cols();
-        let mut stdout = io::stdout();
+        let full = editor.buffer.as_str();
+        let cursor_byte = editor.cursor.min(full.len());
+        // Wrap to chat-content width minus 3 cols of prompt prefix.
+        let wrap_w = self.content_width().saturating_sub(3).max(1);
+        let (rows, cursor_row, cursor_col) = wrap_editor(full, cursor_byte, wrap_w);
+        let total_rows = rows.len() as u16;
+        self.cached_input_rows = rows;
+        self.cached_input_cursor_row = cursor_row;
+        self.cached_input_cursor_col = cursor_col;
+        self.cached_status = status.to_string();
+        self.cached_is_running = is_running;
+        self.input_rows = total_rows.clamp(1, MAX_INPUT_VISIBLE_LINES as u16);
 
-        let full_input: &str = editor.buffer.as_str();
-        let full_cursor: usize = editor.cursor;
-
-        // Break the buffer into logical lines (one per `\n`). An empty buffer
-        // still shows one row so the prompt is visible.
-        let logical_lines: Vec<&str> = if full_input.is_empty() {
-            vec![""]
-        } else {
-            full_input.split('\n').collect()
-        };
-        let line_count = logical_lines.len();
-
-        // Determine which logical line the cursor sits on, and the byte
-        // offset within it.
-        let cursor_line_start = full_input[..full_cursor]
-            .rfind('\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        let cursor_line_idx = full_input[..cursor_line_start].matches('\n').count();
-        let cursor_col_in_line = full_cursor - cursor_line_start;
-
-        // Wrap width: chat-content width minus the 3-char prompt prefix
-        // (`▌▌ ` idle, `░▌ `/`▒▌ ` spinner, `▏  ` continuation — all 3
-        // columns) that sits in front of every visible row.
-        //
-        // Must use `content_width()` (the capped, centered band the chat
-        // uses) and NOT raw `cols`. On wide terminals where content is
-        // capped at 120 cols, `bottom_indent` is non-zero — wrapping at
-        // `cols - 3` would let input text spill past the centered band's
-        // right edge into the divider/panel/blank margin, and the
-        // terminal's own hard-wrap would kick in instead of ours. The
-        // user sees that as "soft-wrap is broken." Min 1 to avoid
-        // div-by-zero in wrap math on ridiculous terminal sizes.
-        let wrap_width = (self.content_width().saturating_sub(3)).max(1);
-
-        // Pre-render each logical line (placeholder expansion etc.) into the
-        // displayable form, alongside the cursor's display column on its line.
-        let display_lines: Vec<String> = logical_lines
-            .iter()
-            .map(|line| editor.render_line(line, 0).0)
-            .collect();
-        let cursor_raw_line = logical_lines[cursor_line_idx];
-        let (_, cursor_display_col) = editor.render_line(cursor_raw_line, cursor_col_in_line);
-
-        // Soft-wrap to visual rows. Each visual row spans at most
-        // `wrap_width` chars of one logical line; long lines emit multiple
-        // visual rows. Cursor mapping accounts for end-of-line at the exact
-        // wrap boundary (cursor stays at the right edge instead of jumping
-        // to a phantom next row with no content under it).
-        let (visual_rows, cursor_visual_row, cursor_visual_col) = wrap_input(
-            &display_lines,
-            cursor_line_idx,
-            cursor_display_col,
-            wrap_width,
-        );
-        let total_visual = visual_rows.len();
-        let visible_input_rows = total_visual.clamp(1, MAX_INPUT_VISIBLE_LINES);
-
-        // Window the visual rows so the cursor stays on screen.
-        let first_visible_visual = if cursor_visual_row >= visible_input_rows {
-            cursor_visual_row + 1 - visible_input_rows
-        } else {
-            0
-        };
-
-        // If the bottom panel grew or shrank, the chat viewport needs to be
-        // repainted at its new size before we overwrite the bottom rows.
-        let new_input_rows = visible_input_rows as u16;
-        if new_input_rows != self.input_rows {
-            self.input_rows = new_input_rows;
-            self.render_viewport()?;
-        }
-
-        let status_row = rows.saturating_sub(1);
-        let input_top = rows.saturating_sub(self.input_rows + 1);
-        // Heavy block prompt indicator. While running, we tick a 4-stage
-        // gradient through the block characters to suggest a phosphor
-        // pulse — readable without becoming distracting.
-        let prompt_main = if is_running {
+        if is_running {
             self.spinner_tick = !self.spinner_tick;
             self.avatar_tick = !self.avatar_tick;
-            // Two-state spinner using ░/▒ blocks so the eye registers
-            // motion at slow refresh rates.
-            if self.spinner_tick {
-                "▒▌ "
-            } else {
-                "░▌ "
-            }
-        } else {
-            "▌▌ "
-        };
-        // Continuation rows show a fainter single-block guide so wrapped
-        // text reads as a vertical "chamber" attached to the prompt.
-        let prompt_cont = "▏  ";
-
-        // Pre-collect chars per logical line so each visual row's slice can
-        // be cut without re-iterating.
-        let display_chars: Vec<Vec<char>> =
-            display_lines.iter().map(|s| s.chars().collect()).collect();
-
-        // Input rows + status row also center under the chat band so
-        // the prompt + status visually align with the chat content
-        // above.
-        let bottom_indent = self.content_indent();
-        for row_offset in 0..visible_input_rows {
-            let row = input_top + row_offset as u16;
-            let vr_idx = first_visible_visual + row_offset;
-            stdout.execute(MoveTo(0, row))?;
-            write!(stdout, "{}", " ".repeat(cols as usize))?;
-            stdout.execute(MoveTo(bottom_indent as u16, row))?;
-            // Bold-glow the prompt indicator + input text so they
-            // match the chat above. Without this the bottom area
-            // looked dimmer than the chat that scrolled past it.
-            let accent_bloom = crate::ui::theme::is_bright(crate::ui::theme::accent());
-            if accent_bloom {
-                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-            }
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(crate::ui::theme::accent()))
-            )?;
-            let is_prompt_row = vr_idx == 0;
-            if is_prompt_row {
-                write!(stdout, "{}", prompt_main)?;
-            } else {
-                write!(stdout, "{}", prompt_cont)?;
-            }
-            if accent_bloom {
-                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-            }
-            // Switch to the user-input text tone (bright phosphor)
-            // before writing what the user typed, so the prompt
-            // accent and the input text are visually distinct but
-            // both on the green axis.
-            let user_bloom = crate::ui::theme::is_bright(crate::ui::theme::user());
-            if user_bloom {
-                write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-            }
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(crate::ui::theme::user()))
-            )?;
-            if let Some(vr) = visual_rows.get(vr_idx)
-                && let Some(chars) = display_chars.get(vr.logical_line)
-            {
-                let slice: String = chars[vr.char_start..vr.char_end].iter().collect();
-                write!(stdout, "{}", slice)?;
-            }
-            if user_bloom {
-                write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-            }
-            write!(stdout, "{}", ResetColor)?;
         }
 
-        // Status row — also centered under the chat band.
-        stdout.execute(MoveTo(0, status_row))?;
-        write!(stdout, "{}", " ".repeat(cols as usize))?;
-        stdout.execute(MoveTo(bottom_indent as u16, status_row))?;
-        write!(
-            stdout,
-            "{}",
-            SetForegroundColor(self.color(crate::ui::theme::dim()))
-        )?;
-        // Status bar with bracketed BBS-style segments. Reads as a row
-        // of small chips: `▒░ STATUS ░▒  ▒░ NEXT ░▒  …` so each fact
-        // gets visual breathing room and the bar feels like a single
-        // designed element rather than dim flowing text.
-        let scroll_prefix = if self.scroll_offset > 0 {
-            "▒░ SCROLL ░▒  "
-        } else {
-            ""
-        };
-        let mut status_display = format!("{}▒░ {} ░▒", scroll_prefix, status);
-        if line_count > 1 || total_visual > MAX_INPUT_VISIBLE_LINES {
-            let hidden = total_visual.saturating_sub(visible_input_rows);
-            if hidden > 0 {
-                status_display
-                    .push_str(&format!("  ▒░ {} lines · {} hidden ░▒", line_count, hidden));
-            } else if line_count > 1 {
-                status_display.push_str(&format!("  ▒░ {} lines ░▒", line_count));
-            }
-        }
-        let token_est = editor.expanded().len() as u64 / 4;
-        if token_est > 0 {
-            status_display.push_str(&format!("  ▒░ {} tk ░▒", token_est));
-        }
-        let truncated: String = status_display.chars().take(cols as usize).collect();
-        write!(stdout, "{}", truncated)?;
-        write!(stdout, "{}", ResetColor)?;
-
-        // Place the visible cursor on its row at the right column.
-        let cursor_row =
-            input_top + (cursor_visual_row.saturating_sub(first_visible_visual)) as u16;
-        // Match the 3-column prompt prefix used in the loop above.
-        // Match the indented prompt (`bottom_indent + 3-col prompt
-        // prefix` + cursor offset within content).
-        let cursor_x =
-            (bottom_indent + 3 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
-
-        // Hide the cursor BEFORE painting panel + avatar — those paints
-        // execute many `MoveTo` calls and the hardware cursor would
-        // visibly flicker across the right-hand panel while iterating
-        // its rows. Hidden cursor stays invisible until the final Show
-        // below puts it back at the input prompt.
-        stdout.execute(Hide)?;
-
-        if self.panel_visible() {
-            self.draw_panel(&mut stdout, rows)?;
-        }
-        // Paint the avatar in the bottom-left margin (cols 0..AVATAR_W,
-        // rows just above the input row). Only painted when the
-        // centering indent leaves room — on narrow terminals where
-        // the chat band already starts at col 0, there's no margin to
-        // put a face into.
-        self.draw_avatar(&mut stdout, input_top)?;
-
-        // Place the cursor at the input position; the Show below will
-        // make it visible exactly there.
-        stdout.execute(MoveTo(cursor_x, cursor_row))?;
-
-        // draw_bottom is the only place the visible cursor belongs (at the
-        // user's input position). Other renderer paths (render_viewport,
-        // write, write_line) keep the cursor hidden so streaming output
-        // doesn't drag the hardware cursor across the chat area.
-        stdout.execute(Show)?;
-        stdout.flush()?;
-        Ok(())
-    }
-
-    /// Paint the bottom-left ASCII avatar at cols `0..AVATAR_W`, in the
-    /// three rows just above `input_top`. Skipped when the chat band's
-    /// centering indent is too narrow (`< AVATAR_W + 1`) to fit the
-    /// avatar without overlapping chat content.
-    fn draw_avatar(&self, stdout: &mut io::Stdout, input_top: u16) -> io::Result<()> {
-        use crate::ui::avatar::{AVATAR_W, art, color};
-        // Single-row avatar painted on the *input* row, horizontally
-        // centered in the left margin between col 0 and the input
-        // prompt. Single-row + on the input row means the avatar
-        // never gets caught in `ensure_room`'s `ScrollUp(1)` — the
-        // input row sits below the scroll region, so the avatar
-        // doesn't smear into the scrollback when chat grows.
-        let indent = self.content_indent();
-        if indent < AVATAR_W + 2 {
-            // Not enough margin to fit the avatar with breathing
-            // room around the input prompt's left edge.
-            return Ok(());
-        }
-        let face = art(self.avatar_state, self.avatar_tick);
-        let painted = self.color(color(self.avatar_state));
-        // Center within [0, indent): x = (indent - AVATAR_W) / 2
-        let x = ((indent - AVATAR_W) / 2) as u16;
-        // Wipe the full margin (cols 0..indent) first so a face from
-        // a previous state doesn't leave fossils when its position
-        // shifts (e.g. theme change, indent recomputed on resize).
-        stdout.execute(MoveTo(0, input_top))?;
-        write!(stdout, "{}", " ".repeat(indent))?;
-        stdout.execute(MoveTo(x, input_top))?;
-        write!(stdout, "{}", SetForegroundColor(painted))?;
-        if crate::ui::theme::is_bright(color(self.avatar_state)) {
-            write!(stdout, "{}", SetAttribute(Attribute::Bold))?;
-        }
-        write!(stdout, "{}", face)?;
-        if crate::ui::theme::is_bright(color(self.avatar_state)) {
-            write!(stdout, "{}", SetAttribute(Attribute::NormalIntensity))?;
-        }
-        write!(stdout, "{}", ResetColor)?;
-        Ok(())
-    }
-
-    /// Paint the right-hand info panel in the rightmost `PANEL_WIDTH` cols,
-    /// preceded by a vertical divider. Uses cached `self.panel_data`. Caller
-    /// is responsible for moving the cursor back if needed.
-    fn draw_panel(&self, stdout: &mut io::Stdout, rows: u16) -> io::Result<()> {
-        let (cols, _) = self.terminal_size();
-        let panel_x = cols.saturating_sub(PANEL_WIDTH);
-        let divider_x = panel_x.saturating_sub(1);
-        // Effective panel content width = PANEL_WIDTH - 1 so we never
-        // write to the terminal's absolute last column. On most
-        // terminals, writing the bottom-right cell triggers an
-        // implicit scroll-up — that shifts the panel content up by a
-        // row each redraw and eats the DIRGE.SYS frame's top border.
-        let width = (PANEL_WIDTH as usize).saturating_sub(1);
-        let last_row = rows.saturating_sub(1); // status row — leave alone
-
-        // Build the rendered lines first so we know how many we have, then
-        // paint top-to-bottom up to last_row-1.
-        let lines = self.build_panel_lines(width, rows);
-
-        // Themed panel colors. Source lines still use the legacy
-        // sentinels (Color::Cyan = header, Color::Reset = dim,
-        // Color::White = body, Color::Green/Red = status); the paint
-        // stage remaps them to the active theme so the phosphor look
-        // applies without rewriting `build_panel_lines`.
-        let divider_color = self.color(crate::ui::theme::divider());
-        let header_color = self.color(crate::ui::theme::header());
-        let dim = self.color(crate::ui::theme::dim());
-        let body = self.color(crate::ui::theme::agent());
-
-        for row in 0..last_row {
-            stdout.execute(MoveTo(divider_x, row))?;
-            write!(stdout, "{}", SetForegroundColor(divider_color))?;
-            write!(stdout, "│")?;
-            write!(stdout, "{}", ResetColor)?;
-
-            stdout.execute(MoveTo(panel_x, row))?;
-            if let Some((text, color)) = lines.get(row as usize) {
-                let painted = match *color {
-                    Color::Cyan => header_color,
-                    Color::Reset | Color::DarkGrey => dim,
-                    Color::White => body,
-                    other => self.color(other),
-                };
-                write!(stdout, "{}", SetForegroundColor(painted))?;
-                write!(stdout, "{}", text)?;
-                write!(stdout, "{}", ResetColor)?;
-                // Pad to panel width so stale text from earlier draws is wiped.
-                let len = text.chars().count();
-                if len < width {
-                    write!(stdout, "{}", " ".repeat(width - len))?;
-                }
-            } else {
-                write!(stdout, "{}", " ".repeat(width))?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Materialize the panel content as `(line, color)` pairs of at most
-    /// `width` chars each. Sections are separated by blank lines and a
-    /// header. Lines past terminal height are dropped by the caller.
-    ///
-    /// `total_rows` is the terminal's total row count (from
-    /// `crossterm::terminal::size`). Passed in rather than queried
-    /// here so the MODIFIED section can budget its row count
-    /// deterministically — and so tests can drive any terminal size
-    /// without spinning up a PTY.
-    fn build_panel_lines(&self, width: usize, total_rows: u16) -> Vec<(String, Color)> {
-        let d = &self.panel_data;
-        let mut out: Vec<(String, Color)> = Vec::new();
-
-        // Display-width-aware truncation: `chars().count()` mis-
-        // sizes wide emoji and CJK by half. The panel previously
-        // miscounted, so a status line like `cwd: 📦 /path` ended
-        // up overflowing the right border by one cell.
-        use unicode_width::UnicodeWidthStr;
-        let truncate = |s: &str, w: usize| -> String {
-            let dw = UnicodeWidthStr::width(s);
-            if dw <= w {
-                return s.to_string();
-            }
-            if w <= 1 {
-                return "…".to_string();
-            }
-            // Walk chars accumulating display width until adding
-            // the next one would exceed `w-1` (reserving 1 cell
-            // for the ellipsis).
-            use unicode_width::UnicodeWidthChar;
-            let mut out = String::new();
-            let mut used = 0usize;
-            for ch in s.chars() {
-                let cw = ch.width().unwrap_or(0);
-                if used + cw > w - 1 {
-                    break;
-                }
-                out.push(ch);
-                used += cw;
-            }
-            out.push('…');
-            out
-        };
-
-        // Top padding rows. Same reasoning as the chat banner — without
-        // these the DIRGE.SYS frame's `╭───╮` sits flush against the
-        // terminal's row 0 and reads as cut off; some terminals also
-        // shift the panel up by a row when the bottom-right cell is
-        // touched, eating the top frame entirely. The padding gives
-        // both visual breathing room and a buffer against that.
-        out.push((String::new(), Color::Reset));
-        out.push((String::new(), Color::Reset));
-
-        // Inner width inside the frame's left+right borders.
-        let inner = width.saturating_sub(2);
-        // Helper: format a content row inside a closed pill — left
-        // border, padded content, right border. Truncates content
-        // that overflows so the pill stays a perfect rectangle.
-        let row = |text: &str| -> String {
-            let trimmed = truncate(text, inner);
-            // Pad by display width too, otherwise an emoji-bearing
-            // row left a 1-cell gap before the right border.
-            let len = UnicodeWidthStr::width(trimmed.as_str());
-            let pad = inner.saturating_sub(len);
-            format!("│{}{}│", trimmed, " ".repeat(pad))
-        };
-        // Helper: bottom border of a pill (`╰────────╯`).
-        let bottom = || -> String { format!("╰{}╯", "─".repeat(inner)) };
-
-        // Panel top pill: `╭─ DIRGE.SYS ────╮` … `╰──────────╯`.
-        let dirge_label = " DIRGE.SYS ";
-        let dirge_pre_len = dirge_label.chars().count() + 2;
-        let dirge_dashes = inner.saturating_sub(dirge_label.chars().count() + 1);
-        let _ = dirge_pre_len;
-        out.push((
-            format!("╭─{}{}╮", dirge_label, "─".repeat(dirge_dashes)),
-            Color::Cyan,
-        ));
-        out.push((row(&format!(" {}", d.cwd)), Color::White));
-        out.push((bottom(), Color::Cyan));
-
-        // Section helper: closed pill with the section name on the
-        // top border (`╭─ MCP ─────╮ … ╰────────╯`). Every content
-        // row gets a `│ … │` left+right border so the section reads
-        // as a discrete card, matching the btop / cool-retro-term
-        // reference. Empty sections show `· (none)` in the dim
-        // phosphor tone rather than grey.
-        let push_section =
-            |out: &mut Vec<(String, Color)>, title: &str, items: Vec<(String, Color)>| {
-                out.push((String::new(), Color::Reset));
-                let label = format!(" {} ", title);
-                let pre_len = label.chars().count() + 1;
-                let dashes = inner.saturating_sub(pre_len);
-                let header = format!("╭─{}{}╮", label, "─".repeat(dashes));
-                out.push((header, Color::Cyan));
-                if items.is_empty() {
-                    out.push((row(" · (none)"), Color::Reset));
-                } else {
-                    for (text, color) in items {
-                        // Items arrive with a leading "  "; strip it
-                        // and let `row` re-add the chamber prefix.
-                        let content = text.strip_prefix("  ").unwrap_or(&text);
-                        out.push((row(&format!(" {}", content)), color));
-                    }
-                }
-                out.push((bottom(), Color::Cyan));
-            };
-
-        let mcp_items: Vec<(String, Color)> = d
-            .mcp
-            .iter()
-            .map(|(name, ok)| {
-                let glyph = if *ok { "●" } else { "○" };
-                let color = if *ok { Color::Green } else { Color::Red };
-                (format!("  {} {}", glyph, name), color)
-            })
-            .collect();
-        push_section(&mut out, "MCP", mcp_items);
-
-        let lsp_items: Vec<(String, Color)> = d
-            .lsp
-            .iter()
-            .map(|(id, root, ok)| {
-                let glyph = if *ok { "●" } else { "○" };
-                let color = if *ok { Color::Green } else { Color::Red };
-                (format!("  {} {} {}", glyph, id, root), color)
-            })
-            .collect();
-        push_section(&mut out, "LSP", lsp_items);
-
-        let todo_items: Vec<(String, Color)> = d
-            .todos
-            .iter()
-            .map(|(status, text)| (format!("  {} {}", status, text), Color::White))
-            .collect();
-        push_section(&mut out, "TODOS", todo_items);
-
-        // Modified-files panel section. Opencode-style grow-to-fit:
-        // show as many entries as the remaining panel rows allow,
-        // with a `+N older` footer when the list was truncated.
-        // Older entries (oldest at the FRONT of `d.modified`,
-        // newest at the BACK — `recent()` returns insertion order)
-        // get dropped first; the user always sees the freshest
-        // touches.
-        //
-        // Per-row width: filename matters more than the path prefix
-        // so we left-truncate (`…foo/bar.rs`).
-        let mod_max = inner.saturating_sub(2);
-
-        // Budget: terminal rows minus the status row at the bottom
-        // minus everything already pushed above. Each new section
-        // costs `3 + max(1, items.len())` rows (blank + header +
-        // body + bottom).
-        //
-        // Review #3: floor at 5 rows (blank + header + 1 visible
-        // item + 1 footer row + bottom). The previous floor of 4
-        // had an off-by-one — at `available == 4`, `row_budget = 1`
-        // and a truncated list emitted 1 file + 1 `+N older` footer
-        // = 2 item rows, plus 3 frame rows = 5 total. draw_panel
-        // clipped at last_row and silently dropped the bottom
-        // `╰────╯` border. Bumping the floor (and using
-        // `effective_visible = min(row_budget, total)` for the
-        // count math) guarantees the bottom border is always
-        // painted.
-        let last_row = (total_rows as usize).saturating_sub(1);
-        let used = out.len();
-        let available = last_row.saturating_sub(used);
-        const MIN_MOD_SECTION_ROWS: usize = 5;
-        const FRAME_OVERHEAD: usize = 3; // blank + header + bottom
-
-        if available >= MIN_MOD_SECTION_ROWS {
-            let row_budget = available.saturating_sub(FRAME_OVERHEAD);
-            let total = d.modified.len();
-            // Reserve one row for the "+N older" footer when we
-            // know we'll truncate. If total fits in row_budget,
-            // no footer needed. With the new floor, row_budget ≥ 2
-            // so `visible = row_budget - 1 ≥ 1` is always valid
-            // when truncation kicks in.
-            let (visible_count, hidden) = if total <= row_budget {
-                (total, 0)
-            } else {
-                let visible = row_budget.saturating_sub(1).max(1);
-                (visible, total - visible)
-            };
-
-            // Show the freshest `visible_count` entries. The
-            // tracker is insertion-ordered (oldest first, newest
-            // last), so we take the tail.
-            let start = total.saturating_sub(visible_count);
-            let mut mod_items: Vec<(String, Color)> = d
-                .modified
-                .iter()
-                .skip(start)
-                .map(|p| (format!("  {}", left_truncate(p, mod_max)), Color::White))
-                .collect();
-            if hidden > 0 {
-                mod_items.push((
-                    format!("  · +{} older", hidden),
-                    Color::Reset, // dim — distinguishes the footer
-                ));
-            }
-            push_section(&mut out, "MODIFIED", mod_items);
-        }
-        // Else: not enough vertical room. Better to omit the section
-        // than render a half-clipped one.
-
-        out
+        self.tui_redraw()
     }
 }
 
 /// One visible row of the input box after soft-wrapping. A logical line
 /// (between newlines in the buffer) may produce multiple visual rows when
 /// it exceeds the terminal's wrap width.
+///
+/// Currently unused by production code (the ratatui BottomStrip renders
+/// one input row only). Kept because multi-row input is the next likely
+/// feature to land — re-using this `wrap_input` + tests means we don't
+/// have to re-derive the cursor-placement-at-wrap-boundary logic.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisualRow {
     pub logical_line: usize,
@@ -1727,6 +1139,7 @@ pub(crate) struct VisualRow {
 /// where chars exactly fill the row) keeps the cursor at the right edge of
 /// the filled row rather than jumping to an empty phantom row beneath it,
 /// matching what most line editors do.
+#[allow(dead_code)]
 pub(crate) fn wrap_input(
     display_lines: &[String],
     cursor_line_idx: usize,
@@ -1829,6 +1242,77 @@ pub(crate) fn display_col_to_char_index(s: &str, display_col: usize) -> usize {
 /// overflows. Useful for paths where the filename matters more than
 /// the prefix: `…clj/yourname/foo.rs` reads better than `src/clj/…`.
 /// Returns the input verbatim when `s` fits in `max` chars.
+/// Wrap the input editor's buffer into visual rows + locate the
+/// cursor. Splits on `\n` (logical lines), then soft-wraps each
+/// logical line to `wrap_w` display cells. Returns the wrapped
+/// rows and the cursor's (row, col) position within them.
+///
+/// `cursor_byte` is the byte offset into `full`; conversion to
+/// display cells handles multi-byte UTF-8 (the cursor column is
+/// the display width of the row prefix up to the byte).
+fn wrap_editor(full: &str, cursor_byte: usize, wrap_w: usize) -> (Vec<String>, u16, u16) {
+    use unicode_width::UnicodeWidthChar;
+    let wrap_w = wrap_w.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cursor_row: u16 = 0;
+    let mut cursor_col: u16 = 0;
+    let cursor_byte = cursor_byte.min(full.len());
+
+    let mut byte_idx: usize = 0;
+    for logical in full.split('\n') {
+        // Soft-wrap by display width. Walk chars, accumulating
+        // width — start a new row when adding the next char would
+        // exceed `wrap_w`.
+        let logical_start = byte_idx;
+        let mut cur_row = String::new();
+        let mut cur_w: usize = 0;
+        let mut local_byte: usize = 0;
+        for ch in logical.chars() {
+            let w = ch.width().unwrap_or(0);
+            if cur_w + w > wrap_w && !cur_row.is_empty() {
+                // Check cursor before flushing the row.
+                let row_start_byte = logical_start + local_byte - cur_row.len();
+                let row_end_byte = row_start_byte + cur_row.len();
+                if cursor_byte >= row_start_byte && cursor_byte <= row_end_byte {
+                    cursor_row = rows.len() as u16;
+                    let prefix_end = cursor_byte - row_start_byte;
+                    cursor_col = unicode_width::UnicodeWidthStr::width(
+                        &cur_row.as_str()[..prefix_end.min(cur_row.len())],
+                    ) as u16;
+                }
+                rows.push(std::mem::take(&mut cur_row));
+                cur_w = 0;
+            }
+            cur_row.push(ch);
+            cur_w += w;
+            local_byte += ch.len_utf8();
+        }
+        // Cursor on the (last) row of this logical line?
+        let row_start_byte = logical_start + local_byte - cur_row.len();
+        let row_end_byte = row_start_byte + cur_row.len();
+        if cursor_byte >= row_start_byte && cursor_byte <= row_end_byte {
+            cursor_row = rows.len() as u16;
+            let prefix_end = cursor_byte - row_start_byte;
+            cursor_col = unicode_width::UnicodeWidthStr::width(
+                &cur_row.as_str()[..prefix_end.min(cur_row.len())],
+            ) as u16;
+        }
+        rows.push(cur_row);
+        // Advance past this logical line + the '\n'.
+        byte_idx += logical.len() + 1;
+    }
+
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    (rows, cursor_row, cursor_col)
+}
+
+// Used by the legacy modified-files panel; the new SubPanel widget
+// doesn't truncate paths the same way (set_stringn clips at width).
+// Kept because multi-line input wrap will likely need a similar
+// shortening helper once it lands.
+#[allow(dead_code)]
 fn left_truncate(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
@@ -1897,6 +1381,45 @@ pub fn copy_to_clipboard(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wrap_editor: empty buffer → one empty row, cursor at (0, 0).
+    #[test]
+    fn wrap_editor_empty() {
+        let (rows, r, c) = wrap_editor("", 0, 80);
+        assert_eq!(rows, vec![String::new()]);
+        assert_eq!((r, c), (0, 0));
+    }
+
+    /// wrap_editor: short single-line text doesn't wrap.
+    #[test]
+    fn wrap_editor_no_wrap_short() {
+        let (rows, r, c) = wrap_editor("hello", 5, 80);
+        assert_eq!(rows, vec!["hello".to_string()]);
+        assert_eq!((r, c), (0, 5));
+    }
+
+    /// wrap_editor: hard newlines split into logical rows.
+    #[test]
+    fn wrap_editor_newlines_split() {
+        let (rows, r, c) = wrap_editor("a\nb\ncc", 5, 80);
+        assert_eq!(rows, vec!["a".to_string(), "b".to_string(), "cc".to_string()]);
+        // Cursor at byte 5 = "cc" position 1.
+        assert_eq!((r, c), (2, 1));
+    }
+
+    /// wrap_editor: long line soft-wraps to wrap_w cells. Cursor
+    /// lands on the wrapped row.
+    #[test]
+    fn wrap_editor_soft_wrap() {
+        let s = "abcdefghij"; // 10 chars
+        let (rows, r, c) = wrap_editor(s, 10, 4);
+        // Wrap to 4 cells: ["abcd", "efgh", "ij"] (cursor at end).
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], "abcd");
+        assert_eq!(rows[1], "efgh");
+        assert_eq!(rows[2], "ij");
+        assert_eq!((r, c), (2, 2));
+    }
 
     /// dirge-ov2 Phase A: chat switching saves the prior chat's
     /// buffer and selection, then loads the target chat's snapshot.
@@ -2243,10 +1766,10 @@ mod tests {
     #[test]
     fn buffer_pos_at_clamps_past_eol() {
         let r = fresh_with_text(&["short"]);
-        // With one buffer line and scroll_offset=0,
-        // `buffer_line_at_row` returns Some(0) for row 0 (start = 0
-        // after saturating, idx = row).
-        let pos = r.buffer_pos_at(0, 999);
+        // Row 0 is the chat top frame in the ui-redesign; row 1 is
+        // the first chat content row. `buffer_line_at_row` returns
+        // Some(0) for row 1 (start = 0 after saturating, idx = 0).
+        let pos = r.buffer_pos_at(1, 999);
         assert_eq!(pos, Some((0, 5)));
     }
 
@@ -2302,8 +1825,9 @@ mod tests {
             color: Color::Reset,
         });
         // Click well past the visible end. content_indent() is 0
-        // in the default test renderer, so col == char_col.
-        let pos = r.buffer_pos_at(0, 999).expect("must resolve");
+        // in the default test renderer, so col == char_col. Row 1
+        // is the first chat content row (row 0 is the chat frame).
+        let pos = r.buffer_pos_at(1, 999).expect("must resolve");
         assert_eq!(pos.1, 15, "clamp should hit visible length 15, not raw 25");
     }
 
@@ -2400,91 +1924,5 @@ mod tests {
         let (rows, cr, cc) = wrap_input(&lines(&["abc"]), 0, 2, 1);
         assert_eq!(rows.len(), 3);
         assert_eq!((cr, cc), (2, 0));
-    }
-
-    /// MODIFIED section grows to fill available rows. With 100 entries
-    /// in `d.modified` and a 50-row terminal, we should see roughly
-    /// (50 - status_row - other_sections - frame_overhead) entries
-    /// plus a `+N older` footer that accounts for the rest.
-    ///
-    /// The test exercises `build_panel_lines` directly via a Renderer
-    /// instance with a forced terminal size.
-    #[test]
-    fn modified_section_grows_to_fit_terminal() {
-        use super::PanelData;
-        let mut r = Renderer::new().expect("renderer");
-        let entries: Vec<String> = (0..100).map(|i| format!("file_{i}.rs")).collect();
-        r.set_panel_data(PanelData {
-            cwd: "test".into(),
-            mcp: Vec::new(),
-            lsp: Vec::new(),
-            todos: Vec::new(),
-            modified: entries,
-        });
-        // Force a known terminal height; width irrelevant to this test.
-        let lines = r.build_panel_lines(30, 50);
-        let modified_header_idx = lines
-            .iter()
-            .position(|(s, _)| s.contains("MODIFIED"))
-            .expect("MODIFIED section present");
-        // Count rows between the header and the section bottom.
-        // The footer `+N older` should be the last content row.
-        let footer_idx = lines
-            .iter()
-            .position(|(s, _)| s.contains("+") && s.contains("older"))
-            .expect("+N older footer present when truncated");
-        assert!(footer_idx > modified_header_idx);
-        // At least a handful of files visible.
-        let visible_files = lines[modified_header_idx + 1..footer_idx]
-            .iter()
-            .filter(|(s, _)| s.contains("file_"))
-            .count();
-        assert!(
-            visible_files >= 5,
-            "expected at least 5 visible files, got {visible_files}"
-        );
-    }
-
-    /// When the list fits entirely in the available rows, no `+N older`
-    /// footer is emitted.
-    #[test]
-    fn modified_section_no_footer_when_fits() {
-        use super::PanelData;
-        let mut r = Renderer::new().expect("renderer");
-        r.set_panel_data(PanelData {
-            cwd: "test".into(),
-            mcp: Vec::new(),
-            lsp: Vec::new(),
-            todos: Vec::new(),
-            modified: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
-        });
-        let lines = r.build_panel_lines(30, 50);
-        let footer_present = lines
-            .iter()
-            .any(|(s, _)| s.contains("+") && s.contains("older"));
-        assert!(!footer_present, "no footer expected when list fits");
-    }
-
-    /// On a tiny terminal (rows < MIN_MOD_SECTION_ROWS after other
-    /// sections), the MODIFIED section is omitted entirely rather than
-    /// painted as a half-clipped fragment.
-    #[test]
-    fn modified_section_omitted_when_no_room() {
-        use super::PanelData;
-        let mut r = Renderer::new().expect("renderer");
-        r.set_panel_data(PanelData {
-            cwd: "test".into(),
-            mcp: vec![("a".into(), true), ("b".into(), true)],
-            lsp: vec![("rust".into(), "/r".into(), true)],
-            todos: vec![("[~]".into(), "t".into())],
-            modified: vec!["x.rs".into()],
-        });
-        // Very short — cwd + MCP + LSP + TODOS already eat most of it.
-        let lines = r.build_panel_lines(30, 12);
-        let has_modified = lines.iter().any(|(s, _)| s.contains("MODIFIED"));
-        assert!(
-            !has_modified,
-            "MODIFIED should be omitted on a too-short terminal"
-        );
     }
 }

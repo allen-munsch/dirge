@@ -62,6 +62,16 @@ rmcp = { version = "1.7", optional = true, default-features = false, features = 
 ] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
+# ui-redesign: ratatui migration. Replaces the hand-rolled stdout
+# paint paths with widget + Buffer + diff rendering. Uses
+# `default-features = false` + `crossterm` backend to share the
+# crossterm version already in this tree.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# Convert the embedded SGR escapes that markdown.rs bakes into chat
+# lines (\x1b[1m bold, \x1b[31m colored, etc.) into ratatui Spans at
+# paint time. Without this, ratatui's Buffer would render the escape
+# sequences as literal characters.
+ansi-to-tui = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "fs", "io-util"] }
@@ -77,6 +87,11 @@ reqwest = "0.13"
 # its scrollback fuzzy search; matches by score with smart-case +
 # Unicode normalization, no need to roll our own ranking.
 nucleo-matcher = "0.3"
+# UI-redesign branch: system CPU / MEM gauges for the [SYSTEM LOAD]
+# sub-panel. `default-features = false` + only the modules we use
+# keeps the dep small (no disks / networks / processes — just CPU
+# + memory polling).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 dirs = "6"
 compact_str = { version = "0.9", features = ["serde"] }
 smallvec = "1"

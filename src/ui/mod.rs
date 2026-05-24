@@ -14,7 +14,12 @@ mod slash;
 mod status;
 #[cfg(feature = "plugin")]
 mod streaming;
+pub(crate) mod sysload;
 mod terminal;
+/// ui-redesign: ratatui-based render pipeline. Lives alongside the
+/// legacy `renderer` module during the staged migration; see beads
+/// dirge-a3x..dirge-eu3 for the phase plan.
+mod tui;
 pub(crate) mod theme;
 mod tree;
 mod wrap;
@@ -402,16 +407,11 @@ fn panel_modified_cached(cwd: &std::path::Path) -> Vec<String> {
 /// own mutexes; safe to call from the UI loop tick.
 fn build_panel_data(
     session: &Session,
+    sysload: Option<&crate::ui::sysload::SharedSysLoad>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
 ) -> crate::ui::renderer::PanelData {
     use std::path::Path;
-
-    let cwd_str = Path::new(session.working_dir.as_str())
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(session.working_dir.as_str())
-        .to_string();
 
     #[cfg(feature = "mcp")]
     let mcp: Vec<(String, bool)> = mcp_manager
@@ -484,11 +484,11 @@ fn build_panel_data(
     let modified = panel_modified_cached(&cwd_path);
 
     crate::ui::renderer::PanelData {
-        cwd: cwd_str,
         mcp,
         lsp,
         todos,
         modified,
+        sysload: sysload.map(|s| s.snapshot()),
     }
 }
 
@@ -764,6 +764,9 @@ pub async fn run_interactive(
     mut subagent_chat_rx: tokio::sync::mpsc::UnboundedReceiver<
         crate::agent::tools::task::SubagentChatEvent,
     >,
+    // ui-redesign: shared system-load snapshot. Polled in the
+    // background; read at panel paint time. Cheap clone (Arc bump).
+    sysload: crate::ui::sysload::SharedSysLoad,
 ) -> anyhow::Result<()> {
     let _guard = TerminalGuard::new()?;
 
@@ -878,6 +881,15 @@ pub async fn run_interactive(
     // the alert handler can rely on a fact about the *screen* rather
     // than a fact about a name that has other clear sites.
     let mut tool_chamber_open: bool = false;
+    // Buffer positions bracketing the chamber TOP (spacer + header
+    // banner). `chamber_top_start` is the buffer length BEFORE
+    // those lines were pushed; `chamber_top_end` is the length
+    // AFTER. If the chamber is closed passively (next ToolCall,
+    // notification, etc.) AND buffer_len() == chamber_top_end (no
+    // body content was added in between), the chamber is dropped
+    // entirely via replace_from(start, []) — no orphan empty box.
+    let mut chamber_top_start: Option<usize> = None;
+    let mut chamber_top_end: Option<usize> = None;
 
     // dirge-ov2 Phase C: per-chat UI state. When the user switches
     // chats (Ctrl-N/P/X, /tasks), the locals above (response_buf,
@@ -966,11 +978,28 @@ pub async fn run_interactive(
     // shows for every panel field until the user nudges any event.
     renderer.set_panel_data(build_panel_data(
         session,
+        Some(&sysload),
         #[cfg(feature = "mcp")]
         mcp_manager,
         #[cfg(feature = "lsp")]
         lsp_manager.as_ref(),
     ));
+
+    // ui-redesign: seed the left-panel [AGENT STATUS] card with the
+    // current session's metadata so the idle state has a real
+    // logo + agent ID / model / focus on first paint. The card
+    // shows when no subagents are running; refreshed whenever the
+    // user switches model via /model.
+    let initial_left_info = crate::ui::renderer::LeftPanelInfo {
+        agent_id: session.id.as_str().chars().take(8).collect(),
+        model: session.model.to_string(),
+        focus: context
+            .current_prompt_name
+            .as_deref()
+            .unwrap_or("default")
+            .to_string(),
+    };
+    renderer.set_left_panel_info(initial_left_info);
 
     render_session(&mut renderer, session, cli, cfg, context)?;
     renderer.draw_bottom(
@@ -1020,6 +1049,14 @@ pub async fn run_interactive(
             }
             match event::read() {
                 Ok(event::Event::Key(key)) => {
+                    // Filter Release / Repeat events. Modern terminals
+                    // (kitty keyboard protocol, Windows 10+ ConPTY,
+                    // some iTerm2 modes) emit BOTH Press and Release
+                    // for every keystroke — without this filter every
+                    // typed char inserts twice ("ssuubb..." bug).
+                    if key.kind != event::KeyEventKind::Press {
+                        continue;
+                    }
                     if user_tx_clone.blocking_send(UserEvent::Key(key)).is_err() {
                         break;
                     }
@@ -1087,6 +1124,7 @@ pub async fn run_interactive(
         // the worst case, which is fine for ambient status.
         renderer.set_panel_data(build_panel_data(
             session,
+            Some(&sysload),
             #[cfg(feature = "mcp")]
             mcp_manager,
             #[cfg(feature = "lsp")]
@@ -1382,6 +1420,8 @@ pub async fn run_interactive(
                                     &mut renderer,
                                     &mut last_tool_name,
                                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                     &msg,
                                     c_error(),
                                 )?;
@@ -1403,6 +1443,8 @@ pub async fn run_interactive(
                                     &mut renderer,
                                     &mut last_tool_name,
                                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                     "copied selection",
                                     Color::Green,
                                 )?;
@@ -1431,6 +1473,8 @@ pub async fn run_interactive(
                                 &mut renderer,
                                 &mut last_tool_name,
                                 &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                 &format!(
                                     "dropped 1 queued message ({} remaining)",
                                     interjection_queue.len()
@@ -1944,6 +1988,8 @@ pub async fn run_interactive(
                                         &mut renderer,
                                         &mut last_tool_name,
                                         &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                         "agent is busy, wait or interrupt first",
                                         c_error(),
                                     )?;
@@ -2060,6 +2106,8 @@ pub async fn run_interactive(
                                         &mut renderer,
                                         &mut last_tool_name,
                                         &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                         "agent is busy — wait, interrupt (Ctrl+C), or use /quit. (/tasks /help /sessions /tree /model /prompt run during agent activity.)",
                                         c_error(),
                                     )?;
@@ -2521,7 +2569,13 @@ pub async fn run_interactive(
                         // (Error / Interjected / ContextOverflow) are
                         // genuine denial-shaped events and stay on
                         // `close_tool_chamber_if_open`.
-                        close_tool_chamber_passive(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
+                        close_tool_chamber_passive(
+                            &mut renderer,
+                            &mut last_tool_name,
+                            &mut tool_chamber_open,
+                            &mut chamber_top_start,
+                            &mut chamber_top_end,
+                        )?;
                         last_tool_name = Some(name.to_string());
                         last_tool_call_id = Some(id.to_string());
                         if agent_line_started {
@@ -2540,6 +2594,11 @@ pub async fn run_interactive(
                         // width so it visually mates with the closing
                         // bottom border (matching btop's framed cards).
                         let upper = name.to_ascii_uppercase();
+                        // Record the buffer position BEFORE the
+                        // spacer + header — used by passive close
+                        // to drop the chamber entirely if no body
+                        // content follows (parallel tool calls).
+                        chamber_top_start = Some(renderer.buffer_len());
                         // Blank line BEFORE the chamber top so the eye
                         // has an anchor between dense prior output (a
                         // permission alert + "allowed ..." lines) and
@@ -2555,6 +2614,7 @@ pub async fn run_interactive(
                         let (frame_w, _) = chamber_widths(&renderer);
                         let header = fit_banner_header(&upper, &raw_value, frame_w);
                         renderer.write_line(&header, c_tool())?;
+                        chamber_top_end = Some(renderer.buffer_len());
                         tool_chamber_open = true;
 
                         // Note: on-tool-start fires from HookedToolDyn now,
@@ -2618,6 +2678,8 @@ pub async fn run_interactive(
                                     &mut renderer,
                                     &mut last_tool_name,
                                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                 )?;
                             }
                             let (resolved_name, resolved_args) = tool_calls_buf
@@ -2683,9 +2745,16 @@ pub async fn run_interactive(
                         }
                         if tool_chamber_open && !show_details {
                             // (c) chamber on-screen but body suppressed
-                            // — close with a bare bottom so a stale
-                            // `╭─` doesn't swallow the next paint.
-                            let (frame_w, _) = chamber_widths(&renderer);
+                            // — show a single dim "(body hidden)" row
+                            // so the chamber doesn't look like an
+                            // empty box with no content. Then close
+                            // with a bare bottom so a stale `╭─`
+                            // doesn't swallow the next paint.
+                            let (frame_w, inner) = chamber_widths(&renderer);
+                            renderer.write_line(
+                                &chamber_row("(body hidden — show_tool_details=false)", inner),
+                                theme::dim(),
+                            )?;
                             renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
                             tool_chamber_open = false;
                         }
@@ -2732,25 +2801,25 @@ pub async fn run_interactive(
                             // doesn't orphan. Skip the rest of branch
                             // (a).
                             if resolved_name.is_empty() {
-                                let (frame_w, _) = chamber_widths(&renderer);
+                                let (frame_w, inner) = chamber_widths(&renderer);
                                 let trimmed = output.trim();
-                                if !trimmed.is_empty() {
+                                let row_text = if trimmed.is_empty() {
+                                    "(unresolved tool, no output)".to_string()
+                                } else {
                                     let first = trimmed.lines().next().unwrap_or("");
-                                    let inner = frame_w.saturating_sub(4);
-                                    renderer.write_line(
-                                        &chamber_row(
-                                            &format!("(unresolved tool) {}", first),
-                                            inner,
-                                        ),
-                                        theme::dim(),
-                                    )?;
-                                }
+                                    format!("(unresolved tool) {}", first)
+                                };
+                                renderer.write_line(
+                                    &chamber_row(&row_text, inner),
+                                    theme::dim(),
+                                )?;
                                 renderer.write_line(
                                     &chamber_bottom(frame_w),
                                     theme::dim(),
                                 )?;
                                 tool_chamber_open = false;
-                                // Don't fall through to is_edit / render_tool_output.
+                                chamber_top_start = None;
+                                chamber_top_end = None;
                                 last_tool_name = None;
                                 continue;
                             }
@@ -2869,9 +2938,30 @@ pub async fn run_interactive(
                         // would mislead the user about an otherwise-
                         // successful run).
                         if tool_chamber_open {
-                            let (frame_w, _) = chamber_widths(&renderer);
-                            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            // Same drop-or-close logic as
+                            // close_tool_chamber_passive: if no
+                            // body content was added since the
+                            // TOP was painted (result never
+                            // arrived from the agent — MCP timeout,
+                            // network blip, agent loop bug), drop
+                            // the chamber entirely instead of
+                            // leaving an empty box on screen.
+                            // Otherwise close with a bottom border.
+                            let drop_chamber = match (chamber_top_start, chamber_top_end) {
+                                (Some(_), Some(end)) => renderer.buffer_len() == end,
+                                _ => false,
+                            };
+                            if drop_chamber {
+                                if let Some(start) = chamber_top_start {
+                                    renderer.replace_from(start, Vec::new());
+                                }
+                            } else {
+                                let (frame_w, _) = chamber_widths(&renderer);
+                                renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            }
                             tool_chamber_open = false;
+                            chamber_top_start = None;
+                            chamber_top_end = None;
                         }
                         last_tool_name = None;
                         renderer.set_avatar_state(avatar::AvatarState::Done);
@@ -3803,6 +3893,8 @@ pub async fn run_interactive(
                     )?;
                     renderer.write_line(&chamber_bottom(frame_w), c_tool())?;
                     tool_chamber_open = false;
+                    chamber_top_start = None;
+                    chamber_top_end = None;
                     let reopen = last_tool_name.clone();
                     last_tool_name = None;
                     // If `last_tool_name` was somehow cleared while
@@ -3849,106 +3941,55 @@ pub async fn run_interactive(
                     is_running,
                 )?;
 
-                // Framed permission prompt. The double-bar border +
-                // ALERT wordmark visually arrests the eye — this is
-                // the single most important UX moment and the user
-                // must not miss it. Box width = 64 for a stable look
-                // independent of terminal width; the chat area
-                // requires at least 60 cols anyway.
-                const BOX_W: usize = 64;
-                let inner = BOX_W.saturating_sub(2);
-                let pre = "╭─ ⚠ ALERT · PERMISSION ";
-                let pre_len = pre.chars().count();
-                let top_fill = BOX_W.saturating_sub(pre_len + 1);
-                let bot_bar = "─".repeat(inner);
-                // Helper: pad / clamp one logical line of content into
-                // `│ content │` shape. Caller is responsible for
-                // wrapping long content into multiple logical lines
-                // BEFORE calling this — the helper itself only handles
-                // the chamber-border framing for a single row.
-                let row = |content: &str| -> String {
-                    // Display-width-aware padding so embedded emoji
-                    // / wide glyphs / sanitized control replacements
-                    // (`·`) don't drift the right `│`.
-                    let content_w = crate::ui::wrap::visible_width(content);
-                    let cap_w = inner.saturating_sub(1);
-                    let (trimmed, trimmed_w) = if content_w <= cap_w {
-                        (content.to_string(), content_w)
-                    } else if cap_w == 0 {
-                        (String::new(), 0)
-                    } else {
-                        // Hard fallback if a single token overflowed
-                        // a wrapped chunk (shouldn't happen given the
-                        // soft_wrap pre-pass below, but be defensive).
-                        let mut used = 0usize;
-                        let mut out = String::with_capacity(content.len());
-                        for ch in content.chars() {
-                            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                            if used + w > cap_w.saturating_sub(1) {
-                                break;
-                            }
-                            out.push(ch);
-                            used += w;
-                        }
-                        out.push('…');
-                        (out, used + 1)
-                    };
-                    let pad = inner.saturating_sub(trimmed_w + 1);
-                    format!("│ {}{}│", trimmed, " ".repeat(pad))
-                };
-
-                // Soft-wrap a labelled value (`label`: `value`) into a
-                // vec of chamber-row-ready strings. First row is
-                // `<label>: <value head>`, continuation rows indent
-                // under the colon so the wrapped tail visually lives
-                // beneath the value column rather than the label
-                // column. Width budget for the wrap = inner - 1 cell
-                // (the trailing right-border pad).
-                //
-                // This is the user-visible fix for the bug report:
-                // the previous alert hard-truncated args at ~50 cells
-                // with `…`, hiding the rest of the command — a
-                // user approving an obscured bash command is being
-                // asked to make a security decision blind.
-                let labelled_rows = |label: &str, value: &str| -> Vec<String> {
-                    let prefix = format!("{} : ", label);
-                    let prefix_w = crate::ui::wrap::visible_width(&prefix);
-                    let cont_indent = " ".repeat(prefix_w);
-                    let budget = inner.saturating_sub(1);
-                    let combined = format!("{}{}", prefix, value);
-                    crate::ui::wrap::soft_wrap(&combined, budget, &cont_indent)
-                        .into_iter()
-                        .map(|chunk| row(&chunk))
-                        .collect()
-                };
-                renderer.write_line(
-                    &format!("{}{}╮", pre, "─".repeat(top_fill)),
-                    c_perm(),
-                )?;
-                // ASNI/control-char sanitize the tool name + args
-                // before painting. These fields can carry attacker-
-                // shaped content (MCP tool name, plugin-injected
-                // call, pathological filename), and the ALERT row
-                // is the single moment the user is being asked to
-                // make a security decision — a raw escape here
-                // could recolor the row, blank the prompt, or move
-                // the cursor. The sibling reopen path at the bottom
-                // of this handler already sanitizes; do the same
-                // here for symmetry.
-                let safe_tool = sanitize_output(&ask_req.tool);
-                let safe_input = sanitize_output(&ask_req.input);
-                for line in labelled_rows("tool", &safe_tool) {
-                    renderer.write_line(&line, c_perm())?;
+                // Permission prompt is rendered ONLY as a bottom-
+                // strip overlay (set_alert_overlay below). The old
+                // in-scrollback ╭─ ⚠ ALERT · PERMISSION ─╮ chamber
+                // was a second visual representation of the same
+                // event — two boxes for one decision. Removed: the
+                // overlay is the single source of truth.
+                {
+                    let safe_tool = sanitize_output(&ask_req.tool);
+                    let safe_input = sanitize_output(&ask_req.input);
+                    // Spacer rows are empty strings — the widget
+                    // wraps + paints them as a blank row each,
+                    // giving the alert visual breathing room
+                    // between sections. Action keys use theme::perm
+                    // (amber/yellow) so the whole alert reads in
+                    // one cautionary color. The args line uses an
+                    // explicit `\x1F` (Unit Separator) sentinel as
+                    // the hanging-indent boundary so wrapped
+                    // continuations align under the value, not at
+                    // column 0. paint_overlay_box reads the
+                    // sentinel and uses a 6-space wrap indent for
+                    // that line.
+                    let mut overlay: Vec<(String, Color)> = Vec::new();
+                    overlay.push(("⚠ PERMISSION REQUIRED".to_string(), theme::perm()));
+                    overlay.push((String::new(), theme::perm()));
+                    overlay.push((format!("tool: {}", safe_tool), theme::perm()));
+                    overlay.push((format!("args: {}", safe_input), theme::perm()));
+                    overlay.push((String::new(), theme::perm()));
+                    overlay.push((
+                        "[y] allow once  [a] allow always  [n] deny  [ESC] abort"
+                            .to_string(),
+                        theme::perm(),
+                    ));
+                    renderer.set_alert_overlay(overlay);
+                    renderer.draw_bottom(
+                        &input,
+                        &with_queue(
+                            StatusLine::render(
+                                session,
+                                is_running,
+                                0,
+                                loop_label.as_deref(),
+                                context.current_prompt_name.as_deref(),
+                                perm_mode().as_deref(),
+                            ),
+                            interjection_queue.len(),
+                        ),
+                        is_running,
+                    )?;
                 }
-                for line in labelled_rows("args", &safe_input) {
-                    renderer.write_line(&line, c_perm())?;
-                }
-                renderer.write_line(&format!("├{}┤", bot_bar), c_perm())?;
-                renderer.write_line(
-                    &row("[y] allow once  [a] allow always  [n] deny  [ESC] abort"),
-                    c_perm(),
-                )?;
-                renderer.write_line(&format!("╰{}╯", bot_bar), c_perm())?;
 
                 let decision = loop {
                     tokio::select! {
@@ -4030,6 +4071,10 @@ pub async fn run_interactive(
                     _ => None,
                 };
                 let was_denied = matches!(decision, UserDecision::Deny);
+                // ui-redesign Phase 6: alert decided — clear the
+                // overlay so the [ALERT] frame swaps back to the
+                // input editor for the next user interaction.
+                renderer.clear_alert_overlay();
                 let _ = ask_req.reply.send(decision);
 
                 // Audit H10: cascading reject. When the user denies
@@ -4237,6 +4282,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     &text,
                     color,
                 )?;
@@ -4306,6 +4353,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     &label,
                     resolve_color(color, cli.no_color),
                 )?;
@@ -4496,6 +4545,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     "",
                     Color::White,
                 )?;
@@ -4783,6 +4834,8 @@ pub async fn run_interactive(
                             &mut renderer,
                             &mut last_tool_name,
                             &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                             &format!("[plugin {}] {}", title, question),
                             c_perm(),
                         )?;
@@ -4833,6 +4886,8 @@ pub async fn run_interactive(
                             &mut renderer,
                             &mut last_tool_name,
                             &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                             &format!("[plugin {}] pick one:", title),
                             c_perm(),
                         )?;
@@ -4914,6 +4969,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     &format!("[plan] switch to {}? (y/n)", label),
                     c_perm(),
                 )?;
@@ -5121,6 +5178,8 @@ pub(crate) fn write_outside_chamber(
     renderer: &mut Renderer,
     last_tool_name: &mut Option<String>,
     tool_chamber_open: &mut bool,
+    chamber_top_start: &mut Option<usize>,
+    chamber_top_end: &mut Option<usize>,
     text: &str,
     color: Color,
 ) -> anyhow::Result<()> {
@@ -5135,7 +5194,13 @@ pub(crate) fn write_outside_chamber(
     // ANSI escapes into chat. KEEP_NEWLINE preserves intentional
     // multi-line content; `renderer.write_line` handles the
     // per-line splits + per-row caps.
-    close_tool_chamber_passive(renderer, last_tool_name, tool_chamber_open)?;
+    close_tool_chamber_passive(
+        renderer,
+        last_tool_name,
+        tool_chamber_open,
+        chamber_top_start,
+        chamber_top_end,
+    )?;
     let safe = crate::ui::ansi::strip_controls(text, crate::ui::ansi::StripPolicy::KEEP_NEWLINE);
     renderer.write_line(&safe, color)?;
     Ok(())
@@ -5180,12 +5245,32 @@ fn close_tool_chamber_passive(
     renderer: &mut Renderer,
     last_tool_name: &mut Option<String>,
     tool_chamber_open: &mut bool,
+    chamber_top_start: &mut Option<usize>,
+    chamber_top_end: &mut Option<usize>,
 ) -> anyhow::Result<()> {
     if last_tool_name.is_some() || *tool_chamber_open {
-        let (frame_w, _inner) = chamber_widths(renderer);
-        renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+        // If the chamber TOP was painted but no body content
+        // followed (parallel tool-call displacement: the agent
+        // fired the next tool before any result for this one
+        // landed), DROP the chamber entirely instead of closing
+        // an empty box. The result for the displaced id will
+        // paint its own fresh chamber via the dirge-jzj path.
+        let drop_chamber = match (*chamber_top_start, *chamber_top_end) {
+            (Some(_start), Some(end)) => renderer.buffer_len() == end,
+            _ => false,
+        };
+        if drop_chamber {
+            if let Some(start) = *chamber_top_start {
+                renderer.replace_from(start, Vec::new());
+            }
+        } else {
+            let (frame_w, _inner) = chamber_widths(renderer);
+            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+        }
         *last_tool_name = None;
         *tool_chamber_open = false;
+        *chamber_top_start = None;
+        *chamber_top_end = None;
     }
     Ok(())
 }
@@ -5294,6 +5379,21 @@ fn render_tool_output(
     let hidden_lines = total_lines.saturating_sub(shown_lines);
 
     let (frame_w, inner) = chamber_widths(renderer);
+    // When the tool returned nothing (or only whitespace), paint a
+    // dim placeholder row so the chamber never appears as a bare
+    // ╭───╮ + ╰───╯ pair. Per-tool wording so it reads naturally
+    // — `glob`/`grep` say "no matches", `read` says "empty file",
+    // everything else falls back to "(no output)".
+    let body_is_empty = char_sliced.trim().is_empty();
+    if body_is_empty {
+        let placeholder = match tool_name {
+            "glob" | "grep" | "find" | "semantic" => "(no matches)",
+            "read" => "(empty file)",
+            "bash" => "(no output)",
+            _ => "(no output)",
+        };
+        renderer.write_line(&chamber_row(placeholder, inner), theme::dim())?;
+    }
     for line in &lines[..shown_lines] {
         renderer.write_line(&chamber_row(line, inner), theme::result())?;
     }
@@ -5364,8 +5464,12 @@ fn render_collapsed_in_full(
 /// area. Capped at 120 so very wide terminals don't produce sprawling
 /// chambers that overwhelm the content.
 fn chamber_widths(renderer: &Renderer) -> (usize, usize) {
-    let term_w = renderer.line_width().max(20);
-    let frame_w = term_w.min(120);
+    // Match ChatPane's 1-cell right margin EXACTLY. ChatPane paints
+    // chat content into `chat.width - 1` cells (the last cell is a
+    // reserved margin before the ║ border). Chamber lines pass
+    // through that same painter, so any chamber wider than
+    // `content_width - 1` gets its right `╮`/`╯` corner clipped.
+    let frame_w = renderer.content_width().saturating_sub(1).max(20);
     let inner = frame_w.saturating_sub(4); // `│ ` + ` │`
     (frame_w, inner)
 }
@@ -5940,14 +6044,36 @@ mod tests {
         // reports).
         let mut name: Option<String> = None;
         let mut open = true;
-        write_outside_chamber(&mut renderer, &mut name, &mut open, "hello", Color::White).unwrap();
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        write_outside_chamber(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+            "hello",
+            Color::White,
+        )
+        .unwrap();
         assert!(!open, "chamber must be closed");
         assert!(name.is_none());
 
         // Name-only open (legacy signal).
         let mut name: Option<String> = Some("read".to_string());
         let mut open = false;
-        write_outside_chamber(&mut renderer, &mut name, &mut open, "hi", Color::White).unwrap();
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        write_outside_chamber(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+            "hi",
+            Color::White,
+        )
+        .unwrap();
         assert!(name.is_none());
         assert!(!open);
 
@@ -5955,7 +6081,18 @@ mod tests {
         // (idempotent close, then write).
         let mut name: Option<String> = None;
         let mut open = false;
-        write_outside_chamber(&mut renderer, &mut name, &mut open, "plain", Color::White).unwrap();
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        write_outside_chamber(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+            "plain",
+            Color::White,
+        )
+        .unwrap();
         // No assertion on state — just verifying it doesn't panic
         // / error.
     }
@@ -5968,21 +6105,79 @@ mod tests {
     /// the helper uses the passive close which only emits the
     /// chamber bottom + clears state.
     #[test]
-    fn close_passive_does_not_paint_abort_row() {
+    fn close_passive_drops_empty_chamber() {
+        // When the chamber TOP was painted but no body content
+        // followed, passive close DROPS the chamber entirely
+        // (truncates buffer back to before the TOP). No empty
+        // box on screen.
         let mut renderer = Renderer::new().expect("renderer");
-        let initial_buffer_len = renderer.buffer_len();
-        let mut name: Option<String> = None;
+        let chamber_start = renderer.buffer_len();
+        // Simulate a ToolCall painting spacer + header.
+        renderer.write_line("", Color::White).unwrap();
+        renderer.write_line("╭─ MOCK_TOOL ─────╮", Color::White).unwrap();
+        let chamber_end = renderer.buffer_len();
+        assert_eq!(chamber_end - chamber_start, 2);
+
+        let mut name: Option<String> = Some("mock".into());
         let mut open = true;
-        close_tool_chamber_passive(&mut renderer, &mut name, &mut open).unwrap();
-        let after = renderer.buffer_len();
-        // Exactly ONE row appended (the bottom border). The abort
-        // variant would have appended TWO (centered abort row +
-        // bottom border).
+        let mut start: Option<usize> = Some(chamber_start);
+        let mut end: Option<usize> = Some(chamber_end);
+        close_tool_chamber_passive(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+        )
+        .unwrap();
+        // Buffer is back to BEFORE the chamber TOP — the empty
+        // chamber is gone entirely.
         assert_eq!(
-            after - initial_buffer_len,
-            1,
-            "passive close should emit exactly one row (chamber bottom)",
+            renderer.buffer_len(),
+            chamber_start,
+            "passive close on an empty chamber should drop it"
         );
+        assert!(!open);
+        assert!(name.is_none());
+        assert!(start.is_none());
+        assert!(end.is_none());
+    }
+
+    /// When body content WAS added (buffer_len > chamber_top_end),
+    /// passive close paints a bottom border to close the chamber
+    /// normally — does NOT truncate.
+    #[test]
+    fn close_passive_with_body_writes_bottom() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let chamber_start = renderer.buffer_len();
+        renderer.write_line("", Color::White).unwrap();
+        renderer.write_line("╭─ MOCK_TOOL ─────╮", Color::White).unwrap();
+        let chamber_end = renderer.buffer_len();
+        // Add body content.
+        renderer.write_line("│ body row 1 │", Color::White).unwrap();
+        let after_body = renderer.buffer_len();
+        assert!(after_body > chamber_end);
+
+        let mut name: Option<String> = Some("mock".into());
+        let mut open = true;
+        let mut start: Option<usize> = Some(chamber_start);
+        let mut end: Option<usize> = Some(chamber_end);
+        close_tool_chamber_passive(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+        )
+        .unwrap();
+        // One more row (the chamber bottom) is appended — no truncation.
+        assert_eq!(
+            renderer.buffer_len(),
+            after_body + 1,
+            "passive close with body should append exactly one row (bottom)",
+        );
+        let body_lines = renderer.buffer_lines();
+        assert!(body_lines.last().unwrap().contains('╰'));
         assert!(!open);
         assert!(name.is_none());
     }
@@ -6095,6 +6290,45 @@ mod tests {
         .expect("render ok");
         let c = collapsed.expect("char-truncation alone must still stash for Ctrl+O");
         assert_eq!(c.full_output.len(), 50_000);
+    }
+
+    /// Empty tool output gets a `(no matches)` / `(empty file)` /
+    /// `(no output)` placeholder row so the chamber never appears
+    /// as a bare ╭───╮ ╰───╯ with nothing between.
+    #[test]
+    fn render_tool_output_empty_body_gets_placeholder() {
+        // glob with no matches → "(no matches)" placeholder.
+        let mut renderer = Renderer::new().expect("renderer");
+        render_tool_output(&mut renderer, "glob", "**/*.nonexistent", "", 10_000, 100)
+            .expect("render ok");
+        let body_text: Vec<&str> = renderer.buffer_lines();
+        assert!(
+            body_text.iter().any(|l| l.contains("(no matches)")),
+            "glob with empty output should show '(no matches)'; got {:?}",
+            body_text
+        );
+
+        // read with whitespace-only file → "(empty file)".
+        let mut renderer = Renderer::new().expect("renderer");
+        render_tool_output(&mut renderer, "read", "empty.txt", "   \n\n  ", 10_000, 100)
+            .expect("render ok");
+        let body_text: Vec<&str> = renderer.buffer_lines();
+        assert!(
+            body_text.iter().any(|l| l.contains("(empty file)")),
+            "read with whitespace-only output should show '(empty file)'; got {:?}",
+            body_text
+        );
+
+        // Unknown tool → generic "(no output)".
+        let mut renderer = Renderer::new().expect("renderer");
+        render_tool_output(&mut renderer, "weird_tool", "x", "", 10_000, 100)
+            .expect("render ok");
+        let body_text: Vec<&str> = renderer.buffer_lines();
+        assert!(
+            body_text.iter().any(|l| l.contains("(no output)")),
+            "unknown tool with empty output should show '(no output)'; got {:?}",
+            body_text
+        );
     }
 
     /// Output that fits in `max_lines` returns None (no collapse

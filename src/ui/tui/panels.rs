@@ -1,0 +1,668 @@
+//! Side-panel widgets: `LeftPanel`, `RightPanel`, and the
+//! `SubPanel` building block.
+//!
+//! The right panel is a vertical stack of `SubPanel`s — each one a
+//! light-rounded box `╭─[TITLE]─╮ … ╰─╯` with left-aligned content.
+//! The left panel paints the DIRGE idle card when no subagents are
+//! active, or a list of subagent status rows when there are.
+//!
+//! All horizontals (top frame's [AGENT STATUS] / [SYSTEM] labels)
+//! are owned by `TopFrame` — these widgets paint INSIDE
+//! `Layout::left_panel` / `Layout::right_panel` only.
+
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color as RColor, Style};
+use ratatui::widgets::Widget;
+
+use crate::ui::renderer::{LeftPanelInfo, PanelData, SubagentStatusRow};
+
+use super::chat::crossterm_to_ratatui;
+
+/// One framed sub-panel: `╭─[TITLE]─╮` top, `│ content │` body,
+/// `╰─╯` bottom. Content lines are LEFT-aligned with one cell of
+/// leading padding — the user explicitly asked for this in
+/// preference to centered content.
+#[derive(Clone)]
+pub struct SubPanel<'a> {
+    title: &'a str,
+    lines: Vec<(String, RColor)>,
+    border_style: Style,
+}
+
+impl<'a> SubPanel<'a> {
+    pub fn new(title: &'a str) -> Self {
+        Self {
+            title,
+            lines: Vec::new(),
+            border_style: Style::default().fg(RColor::Green),
+        }
+    }
+
+    /// Append one body line. The color is applied to the text
+    /// (borders + padding always use `border_style`).
+    pub fn line(mut self, text: impl Into<String>, color: RColor) -> Self {
+        self.lines.push((text.into(), color));
+        self
+    }
+
+    pub fn border_style(mut self, style: Style) -> Self {
+        self.border_style = style;
+        self
+    }
+
+    /// How many rows this sub-panel needs: top + N content + bottom.
+    pub fn height(&self) -> u16 {
+        2 + self.lines.len() as u16
+    }
+}
+
+impl<'a> Widget for SubPanel<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width < 4 || area.height < 2 {
+            return;
+        }
+        let bs = self.border_style;
+        let inner_w = area.width as usize - 2;
+
+        // Top border: ╭─[TITLE]─╮ centered.
+        let label = format!("[{}]", self.title);
+        let lw = label.chars().count();
+        let (lpad, rpad) = if lw >= inner_w {
+            (0, 0)
+        } else {
+            let pad = inner_w - lw;
+            (pad / 2, pad - pad / 2)
+        };
+        buf[(area.x, area.y)].set_char('╭').set_style(bs);
+        for i in 0..lpad as u16 {
+            buf[(area.x + 1 + i, area.y)].set_char('─').set_style(bs);
+        }
+        if lw <= inner_w {
+            for (i, ch) in label.chars().enumerate() {
+                buf[(area.x + 1 + lpad as u16 + i as u16, area.y)]
+                    .set_char(ch)
+                    .set_style(bs);
+            }
+            let after = 1 + lpad + lw;
+            for i in 0..rpad {
+                buf[(area.x + (after + i) as u16, area.y)]
+                    .set_char('─')
+                    .set_style(bs);
+            }
+        } else {
+            // Title wider than inner — fall back to plain ────.
+            for i in 0..inner_w as u16 {
+                buf[(area.x + 1 + i, area.y)]
+                    .set_char('─')
+                    .set_style(bs);
+            }
+        }
+        buf[(area.x + area.width - 1, area.y)]
+            .set_char('╮')
+            .set_style(bs);
+
+        // Body rows: │ content │ with content left-aligned.
+        let body_rows = area.height.saturating_sub(2);
+        for (i, slot) in (0..body_rows).enumerate() {
+            let y = area.y + 1 + slot;
+            buf[(area.x, y)].set_char('│').set_style(bs);
+            buf[(area.x + area.width - 1, y)]
+                .set_char('│')
+                .set_style(bs);
+            if let Some((text, color)) = self.lines.get(i) {
+                // One leading space, then text clipped to inner_w - 1.
+                let text_style = Style::default().fg(*color);
+                buf.set_stringn(
+                    area.x + 1,
+                    y,
+                    format!(" {}", text),
+                    inner_w,
+                    text_style,
+                );
+            }
+        }
+
+        // Bottom border ╰─╯.
+        let by = area.y + area.height - 1;
+        buf[(area.x, by)].set_char('╰').set_style(bs);
+        for i in 0..inner_w as u16 {
+            buf[(area.x + 1 + i, by)].set_char('─').set_style(bs);
+        }
+        buf[(area.x + area.width - 1, by)]
+            .set_char('╯')
+            .set_style(bs);
+    }
+}
+
+/// Left panel widget. Renders the DIRGE idle card (subagents
+/// empty) or a list of subagent status rows (otherwise).
+pub struct LeftPanel<'a> {
+    info: &'a LeftPanelInfo,
+    subagents: &'a [SubagentStatusRow],
+    style: Style,
+}
+
+impl<'a> LeftPanel<'a> {
+    pub fn new(info: &'a LeftPanelInfo, subagents: &'a [SubagentStatusRow]) -> Self {
+        Self {
+            info,
+            subagents,
+            style: Style::default().fg(RColor::Green),
+        }
+    }
+}
+
+impl<'a> Widget for LeftPanel<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        if self.subagents.is_empty() {
+            paint_idle_card(buf, area, self.info, self.style);
+        } else {
+            paint_subagent_list(buf, area, self.subagents);
+        }
+    }
+}
+
+/// One row of top padding so the left-panel content doesn't sit
+/// flush against the unified top frame. Matches the right panel's
+/// symmetric padding for visual balance.
+const LEFT_PANEL_TOP_PAD: u16 = 1;
+
+fn paint_idle_card(buf: &mut Buffer, area: Rect, info: &LeftPanelInfo, style: Style) {
+    let dim = Style::default().fg(RColor::DarkGray);
+    let panel_w = area.width as usize;
+
+    // DIRGE banner centered at top. Metadata block (Agent ID /
+    // Model / Focus) below it, LEFT-aligned as a column so the
+    // labels and values line up. The block as a whole is centered
+    // horizontally so it doesn't sit flush against the left edge —
+    // the per-row labels are aligned, not the row centers.
+    let banner = "D I R G E";
+    let metadata = [
+        format!("Agent ID: {}", info.agent_id),
+        format!("Model:    {}", info.model),
+        format!("Focus:    {}", info.focus),
+    ];
+    let max_meta_w = metadata
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    let meta_indent = panel_w.saturating_sub(max_meta_w) / 2;
+
+    // Row 0 (after top pad): banner centered.
+    let banner_dy = LEFT_PANEL_TOP_PAD;
+    if banner_dy < area.height {
+        let bw = banner.chars().count();
+        let bpad = panel_w.saturating_sub(bw) / 2;
+        buf.set_stringn(
+            area.x + bpad as u16,
+            area.y + banner_dy,
+            banner,
+            panel_w.saturating_sub(bpad),
+            style,
+        );
+    }
+    // Rows 1-2: blank spacer.
+    // Rows 3..: metadata block, left-aligned as a column.
+    for (i, line) in metadata.iter().enumerate() {
+        let dy = banner_dy + 3 + i as u16;
+        if dy >= area.height {
+            break;
+        }
+        buf.set_stringn(
+            area.x + meta_indent as u16,
+            area.y + dy,
+            line,
+            panel_w.saturating_sub(meta_indent),
+            dim,
+        );
+    }
+}
+
+fn paint_subagent_list(buf: &mut Buffer, area: Rect, rows: &[SubagentStatusRow]) {
+    let dim = Style::default().fg(RColor::DarkGray);
+    let agent = Style::default().fg(RColor::Green);
+    let err = Style::default().fg(RColor::Red);
+
+    // Two rows per subagent: short hash line, then indented prompt
+    // line. Format:
+    //
+    //   ⋯ ...b53fcd
+    //      Investigate Clojure project structure …
+    //
+    // Glyph + space prefix = 2 cells; the prompt row indents by 3
+    // cells (under the hash, not the glyph) so wrap reads naturally.
+    // Reserve one trailing cell so text doesn't run into the
+    // chat-frame divider on the right.
+    let prompt_indent = 3_u16;
+    let trailing_pad = 1_usize;
+    let cap_rows = area.height.saturating_sub(LEFT_PANEL_TOP_PAD) as usize;
+    let mut dy: u16 = LEFT_PANEL_TOP_PAD;
+    for row in rows {
+        // Need at least 2 rows for this subagent.
+        if (dy + 2 - LEFT_PANEL_TOP_PAD) as usize > cap_rows {
+            break;
+        }
+        let (glyph, style) = match row.state.as_str() {
+            "running" => ("⋯", agent),
+            "completed" => ("✓", agent),
+            "failed" => ("✗", err),
+            _ => ("·", dim),
+        };
+        // Hash line: glyph + " ..." + last 6 chars of id_short.
+        let id_tail: String = row
+            .id_short
+            .chars()
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let hash_line = format!("{} ...{}", glyph, id_tail);
+        let hash_w = (area.width as usize).saturating_sub(trailing_pad);
+        buf.set_stringn(area.x, area.y + dy, hash_line, hash_w, style);
+        // Prompt line: indented, dim, truncated to fit width.
+        let prompt_avail = (area.width as usize)
+            .saturating_sub(prompt_indent as usize)
+            .saturating_sub(trailing_pad);
+        let prompt_field: String = row.prompt_short.chars().take(prompt_avail).collect();
+        buf.set_stringn(
+            area.x + prompt_indent,
+            area.y + dy + 1,
+            prompt_field,
+            prompt_avail,
+            dim,
+        );
+        dy += 2;
+    }
+}
+
+/// Right panel widget. Stacks sub-panels vertically in this order:
+/// `[SYSTEM LOAD]`, `[MCP]`, `[LSP]`, `[TODOS]`, `[MODIFIED]`.
+/// Each sub-panel takes its own minimum height; remaining rows go
+/// to the last sub-panel (MODIFIED) so the file list grows on tall
+/// terminals.
+pub struct RightPanel<'a> {
+    data: &'a PanelData,
+    style: Style,
+}
+
+impl<'a> RightPanel<'a> {
+    pub fn new(data: &'a PanelData) -> Self {
+        Self {
+            data,
+            style: Style::default().fg(RColor::Green),
+        }
+    }
+}
+
+/// Right-panel top padding (rows). Mirrors LEFT_PANEL_TOP_PAD so
+/// the two sides line up against the unified top frame.
+const RIGHT_PANEL_TOP_PAD: u16 = 1;
+/// One cell of trailing padding inside sub-panel content so it
+/// doesn't run flush against the right │ border.
+const RIGHT_PANEL_TRAILING_PAD: u16 = 1;
+/// Amber tone — used for the [SYSTEM] title in the unified top
+/// frame and for all body text inside the right panel.
+const AMBER: RColor = RColor::Rgb(255, 191, 0);
+
+impl<'a> Widget for RightPanel<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        // Body text in the [SYSTEM] pane is amber per spec.
+        let dim = RColor::DarkGray;
+        let body = AMBER;
+
+        // [SYSTEM LOAD]
+        let sysload_panel = match self.data.sysload.as_ref() {
+            Some(s) => SubPanel::new("SYSTEM LOAD")
+                .line(format_bar("CPU", s.cpu_pct), body)
+                .line(format_bar("MEM", s.mem_pct), body)
+                .border_style(self.style),
+            None => SubPanel::new("SYSTEM LOAD")
+                .line("(pending)", dim)
+                .border_style(self.style),
+        };
+        let mcp_panel = {
+            let mut p = SubPanel::new("MCP").border_style(self.style);
+            if self.data.mcp.is_empty() {
+                p = p.line("· (none)", dim);
+            } else {
+                for (name, ok) in &self.data.mcp {
+                    let glyph = if *ok { "●" } else { "○" };
+                    p = p.line(format!("{} {}", glyph, name), body);
+                }
+            }
+            p
+        };
+        let lsp_panel = {
+            let mut p = SubPanel::new("LSP").border_style(self.style);
+            if self.data.lsp.is_empty() {
+                p = p.line("· (none)", dim);
+            } else {
+                for (id, root, ok) in &self.data.lsp {
+                    let glyph = if *ok { "●" } else { "○" };
+                    p = p.line(format!("{} {} {}", glyph, id, root), body);
+                }
+            }
+            p
+        };
+        let todos_panel = {
+            let mut p = SubPanel::new("TODOS").border_style(self.style);
+            if self.data.todos.is_empty() {
+                p = p.line("· (none)", dim);
+            } else {
+                for (status, text) in &self.data.todos {
+                    p = p.line(format!("{} {}", status, text), body);
+                }
+            }
+            p
+        };
+        // MODIFIED is built below with knowledge of the remaining
+        // row budget — keep it out of the fixed-height stack.
+
+        // Stack vertically with one blank row between. Top padding
+        // pushes the first sub-panel down by RIGHT_PANEL_TOP_PAD
+        // rows, and `inner_w = area.width - RIGHT_PANEL_TRAILING_PAD`
+        // leaves a one-cell margin so content doesn't run into the
+        // outer divider on the right edge.
+        let mut y = area.y + RIGHT_PANEL_TOP_PAD;
+        let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
+        // First four sub-panels get their natural height. MODIFIED
+        // grows to fill the remaining vertical space (with a
+        // `+N older` footer when truncated) — same growth model
+        // the legacy panel had.
+        let fixed = [sysload_panel, mcp_panel, lsp_panel, todos_panel];
+        for panel in fixed {
+            let h = panel.height();
+            if y + h > area.y + area.height {
+                break;
+            }
+            let rect = Rect::new(area.x, y, inner_w, h);
+            panel.render(rect, buf);
+            y += h + 1; // blank spacer
+        }
+        // MODIFIED: take whatever vertical room is left.
+        let modified_top = y;
+        let remaining = (area.y + area.height).saturating_sub(modified_top);
+        if remaining >= 3 {
+            let rect = Rect::new(area.x, modified_top, inner_w, remaining);
+            // Re-build the MODIFIED panel with its true row budget
+            // applied so a `+N older` footer can substitute for
+            // overflow.
+            let inner_rows = (remaining as usize).saturating_sub(2);
+            let mut p = SubPanel::new("MODIFIED").border_style(self.style);
+            let total = self.data.modified.len();
+            if total == 0 {
+                p = p.line("· (none)", dim);
+            } else if total <= inner_rows {
+                for f in &self.data.modified {
+                    p = p.line(f.clone(), body);
+                }
+            } else {
+                // Reserve last row for the "+N older" footer.
+                let head_rows = inner_rows.saturating_sub(1);
+                for f in self.data.modified.iter().take(head_rows) {
+                    p = p.line(f.clone(), body);
+                }
+                let older = total - head_rows;
+                p = p.line(format!("+{} older", older), dim);
+            }
+            p.render(rect, buf);
+        }
+    }
+}
+
+/// Render `LABEL: [####....] NN%` of fixed width.
+fn format_bar(label: &str, pct: f32) -> String {
+    let bar_w = 10;
+    let filled = ((pct / 100.0) * bar_w as f32).round().clamp(0.0, bar_w as f32) as usize;
+    let empty = bar_w - filled;
+    format!(
+        "{}: [{}{}] {:>3}%",
+        label,
+        "#".repeat(filled),
+        ".".repeat(empty),
+        pct.round() as i32
+    )
+}
+
+// Silence unused-import lint until LeftPanel is wired in.
+const _: fn(crossterm::style::Color) -> RColor = crossterm_to_ratatui;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::layout::Layout;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// SubPanel paints the frame and centers the [TITLE] label.
+    #[test]
+    fn subpanel_frame_and_title() {
+        let mut backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 20, 4);
+                f.render_widget(SubPanel::new("MCP").line("a", RColor::Green), area);
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+
+        let row = |y: u16| -> String {
+            (0..20)
+                .map(|x| {
+                    backend
+                        .buffer()
+                        .cell((x, y))
+                        .unwrap()
+                        .symbol()
+                        .to_string()
+                })
+                .collect()
+        };
+        // [MCP] is 5 chars in a 18-wide inner band, pad=13, left=6.
+        let expected_top = format!("╭{}[MCP]{}╮", "─".repeat(6), "─".repeat(7));
+        assert_eq!(row(0), expected_top, "got {:?}", row(0));
+        // Body has " a" left-aligned, padded with spaces, with │ borders.
+        let body_chars: Vec<char> = row(1).chars().collect();
+        assert_eq!(body_chars[0], '│', "got first char {:?}", body_chars[0]);
+        assert_eq!(body_chars[1], ' ');
+        assert_eq!(body_chars[2], 'a');
+        assert_eq!(body_chars[19], '│', "row(1) = {:?}", row(1));
+        // Bottom border.
+        let expected_bot = format!("╰{}╯", "─".repeat(18));
+        assert_eq!(row(3), expected_bot);
+    }
+
+    /// Sub-panel content is LEFT-aligned per user feedback (not centered).
+    #[test]
+    fn subpanel_content_is_left_aligned() {
+        let mut backend = TestBackend::new(20, 4);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 20, 3);
+                f.render_widget(SubPanel::new("X").line("hi", RColor::Green), area);
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+        // Body row.
+        let body: String = (0..20)
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, 1))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        // Expected: "│ hi              │" — text at cols 2-3, spaces to 18, │ at 19.
+        let body_chars: Vec<char> = body.chars().collect();
+        assert_eq!(body_chars[0], '│');
+        assert_eq!(body_chars[1], ' ');
+        assert_eq!(body_chars[2], 'h');
+        assert_eq!(body_chars[3], 'i');
+        // Cols [4..19] are spaces.
+        for c in &body_chars[4..19] {
+            assert_eq!(*c, ' ');
+        }
+        assert_eq!(body_chars[19], '│');
+    }
+
+    /// LeftPanel idle state paints DIRGE banner centered.
+    #[test]
+    fn left_panel_idle_paints_dirge_card() {
+        let info = LeftPanelInfo {
+            agent_id: "abc123".into(),
+            model: "test".into(),
+            focus: "code".into(),
+        };
+        let mut backend = TestBackend::new(30, 12);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 30, 12);
+                f.render_widget(LeftPanel::new(&info, &[]), area);
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+        // Row 1 should contain "D I R G E" centered.
+        let row1: String = (0..30)
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, 1))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(row1.contains("D I R G E"), "got {:?}", row1);
+        // Some row should contain "Agent ID: abc123".
+        let mut found_agent_id = false;
+        for y in 0..12 {
+            let r: String = (0..30)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            if r.contains("Agent ID: abc123") {
+                found_agent_id = true;
+                break;
+            }
+        }
+        assert!(found_agent_id, "expected Agent ID row");
+    }
+
+    /// LeftPanel with subagents lists status rows.
+    #[test]
+    fn left_panel_lists_subagents() {
+        let info = LeftPanelInfo::default();
+        let subs = vec![
+            SubagentStatusRow {
+                id_short: "abc123".into(),
+                state: "running".into(),
+                prompt_short: "do thing".into(),
+            },
+            SubagentStatusRow {
+                id_short: "def456".into(),
+                state: "completed".into(),
+                prompt_short: "done".into(),
+            },
+        ];
+        let mut backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 30, 6);
+                f.render_widget(LeftPanel::new(&info, &subs), area);
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+        // Two-row format with one row of top padding:
+        //   row 0: blank (LEFT_PANEL_TOP_PAD)
+        //   row 1: ⋯ ...bc123       (hash line for subagent 0)
+        //   row 2:    do thing       (prompt line, indented)
+        //   row 3: ✓ ...ef456       (hash line for subagent 1)
+        //   row 4:    done
+        let row_at = |y: u16| -> String {
+            (0..30)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        assert!(row_at(1).starts_with("⋯ ...abc123"), "row1 = {:?}", row_at(1));
+        assert!(row_at(2).contains("do thing"), "row2 = {:?}", row_at(2));
+        assert!(row_at(3).starts_with("✓ ...def456"), "row3 = {:?}", row_at(3));
+        assert!(row_at(4).contains("done"), "row4 = {:?}", row_at(4));
+    }
+
+    /// RightPanel stacks sub-panels and shows their titles.
+    #[test]
+    fn right_panel_stacks_sub_panels() {
+        let mut data = PanelData::default();
+        data.mcp = vec![("server1".into(), true)];
+        let layout = Layout::new(160, 30, 1);
+        let mut backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(RightPanel::new(&data), layout.right_panel);
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+
+        // Scan the right panel rect for each title.
+        let mut titles_found: Vec<&str> = Vec::new();
+        for y in layout.right_panel.y
+            ..(layout.right_panel.y + layout.right_panel.height)
+        {
+            let row: String = (layout.right_panel.x
+                ..layout.right_panel.x + layout.right_panel.width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            for t in ["[SYSTEM LOAD]", "[MCP]", "[LSP]", "[TODOS]", "[MODIFIED]"] {
+                if row.contains(t) && !titles_found.contains(&t) {
+                    titles_found.push(t);
+                }
+            }
+        }
+        // All five titles should appear (assuming tall enough terminal).
+        assert_eq!(
+            titles_found,
+            vec!["[SYSTEM LOAD]", "[MCP]", "[LSP]", "[TODOS]", "[MODIFIED]"],
+        );
+
+        // The MCP server name "server1" should appear too.
+        let mut found_server = false;
+        for y in layout.right_panel.y
+            ..(layout.right_panel.y + layout.right_panel.height)
+        {
+            let row: String = (layout.right_panel.x
+                ..layout.right_panel.x + layout.right_panel.width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            if row.contains("server1") {
+                found_server = true;
+                break;
+            }
+        }
+        assert!(found_server, "expected MCP server name in right panel");
+    }
+
+    /// CPU/MEM bar formatting.
+    #[test]
+    fn bar_formatting() {
+        assert_eq!(format_bar("CPU", 0.0), "CPU: [..........]   0%");
+        assert_eq!(format_bar("MEM", 50.0), "MEM: [#####.....]  50%");
+        assert_eq!(format_bar("CPU", 100.0), "CPU: [##########] 100%");
+    }
+}
