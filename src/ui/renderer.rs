@@ -1089,8 +1089,14 @@ impl Renderer {
         status: &str,
         is_running: bool,
     ) -> io::Result<()> {
-        let full = editor.buffer.as_str();
-        let cursor_byte = editor.cursor.min(full.len());
+        // Use the editor's display projection so paste markers
+        // (`\x01<idx>\x01` blocks) appear as `[N lines pasted]`
+        // placeholders rather than bare digits between invisible
+        // SOH bytes. `display()` also maps the cursor byte into
+        // the projected string.
+        let (display_buf, cursor_byte) = editor.display();
+        let full = display_buf.as_str();
+        let cursor_byte = cursor_byte.min(full.len());
         // Wrap to chat-content width minus 3 cols of prompt prefix.
         let wrap_w = self.content_width().saturating_sub(3).max(1);
         let (rows, cursor_row, cursor_col) = wrap_editor(full, cursor_byte, wrap_w);

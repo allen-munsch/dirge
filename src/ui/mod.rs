@@ -87,6 +87,46 @@ fn with_queue(s: String, n: usize) -> String {
     if n == 0 { s } else { format!("{} q:{}", s, n) }
 }
 
+/// Print a (possibly multi-line) user-typed message to the chat log
+/// as a single visual message: the first line gets the `<you> `
+/// prefix, continuation lines are indented to align under it, and
+/// blank lines stay blank (so an expanded paste doesn't produce a
+/// column of empty `<you>` markers, as reported by users pasting
+/// multi-paragraph text). `sanitize_output` is applied per line to
+/// strip control bytes — the paste-placeholder SOH markers in
+/// particular must not leak to the terminal.
+fn write_user_lines(renderer: &mut Renderer, text: &str) -> std::io::Result<()> {
+    const PREFIX: &str = "<you> ";
+    // Visible width of `PREFIX` — 6 cells. Used as the continuation
+    // indent so wrapped lines line up under the first character of
+    // the message body.
+    const CONT_INDENT: &str = "      ";
+    let mut prefix_emitted = false;
+    for line in text.lines() {
+        let safe = sanitize_output(line);
+        if safe.is_empty() {
+            // Preserve blank lines as actual blank rows — no prefix,
+            // no indent — so paragraphs stay paragraphs in the log.
+            renderer.write_line("", theme::user())?;
+            continue;
+        }
+        let formatted = if !prefix_emitted {
+            prefix_emitted = true;
+            format!("{}{}", PREFIX, safe)
+        } else {
+            format!("{}{}", CONT_INDENT, safe)
+        };
+        renderer.write_line(&formatted, theme::user())?;
+    }
+    // If `text` was entirely empty (no `lines()` iterations) emit a
+    // single `<you>` line so the user still sees their (empty)
+    // submission acknowledged.
+    if !prefix_emitted {
+        renderer.write_line(PREFIX, theme::user())?;
+    }
+    Ok(())
+}
+
 /// Capture whatever assistant text had streamed in before an abort,
 /// store it on the session as the assistant's reply (with a
 /// `[interrupted by user]` trailer so the LLM sees on next turn
@@ -2000,10 +2040,7 @@ pub async fn run_interactive(
                                     )?;
                                     continue;
                                 }
-                                for line in text.lines() {
-                                    let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
-                                }
+                                write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
                                 match prefix {
                                     shell::ShellPrefix::Visible(cmd) => {
@@ -2118,10 +2155,7 @@ pub async fn run_interactive(
                                     )?;
                                     continue;
                                 }
-                                for line in text.lines() {
-                                    let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
-                                }
+                                write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
                                 let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref()).await;
                                 match result {
@@ -2289,10 +2323,7 @@ pub async fn run_interactive(
                                     theme::dim(),
                                 )?;
                             } else {
-                                for line in text.lines() {
-                                    let safe_line = sanitize_output(line);
-                                    renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
-                                }
+                                write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
 
                                 let history = crate::agent::runner::convert_history(session);
@@ -3353,11 +3384,7 @@ pub async fn run_interactive(
                         if !is_running && !interjection_queue.is_empty() {
                             let queued: Vec<String> = interjection_queue.drain(..).collect();
                             let combined = queued.join("\n\n");
-                            for line in combined.lines() {
-                                let safe_line = sanitize_output(line);
-                                renderer
-                                    .write_line(&format!("<you> {}", safe_line), theme::user())?;
-                            }
+                            write_user_lines(&mut renderer, &combined)?;
                             renderer.write_line("", Color::White)?;
 
                             let history = crate::agent::runner::convert_history(session);
@@ -3494,10 +3521,7 @@ pub async fn run_interactive(
                         if !interjection_queue.is_empty() {
                             let queued: Vec<String> = interjection_queue.drain(..).collect();
                             let combined = queued.join("\n\n");
-                            for line in combined.lines() {
-                                let safe_line = sanitize_output(line);
-                                renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
-                            }
+                            write_user_lines(&mut renderer, &combined)?;
                             renderer.write_line("", Color::White)?;
 
                             let history = crate::agent::runner::convert_history(session);

@@ -310,11 +310,6 @@ fn marker_blocks(s: &str) -> Vec<(usize, usize, usize)> {
 }
 
 /// Compute the placeholder display string for a paste body.
-// Paste-placeholder render used by `render_line` — both currently
-// unused by production code (BottomStrip renders the buffer string
-// directly, no placeholder expansion yet). Kept for the multi-row
-// input port.
-#[allow(dead_code)]
 fn placeholder_display(text: &str) -> String {
     let lines = text.matches('\n').count() + 1;
     format!("[{} lines pasted]", lines)
@@ -440,6 +435,56 @@ impl InputEditor {
     /// real text.
     pub fn expanded(&self) -> CompactString {
         Self::expand_with_pastes(&self.buffer, &self.pastes).into()
+    }
+
+    /// Render the buffer for the input box display: each
+    /// `\x01<idx>\x01` marker block is replaced with the
+    /// `[N lines pasted]` placeholder so the user sees a compact
+    /// representation rather than a bare digit between invisible
+    /// SOH bytes. Returns `(display_text, cursor_byte_in_display)`
+    /// so the renderer can place the cursor correctly.
+    ///
+    /// Cursor mapping: marker blocks are atomic for cursor motion
+    /// (see `prev_pos` / `next_pos`), so the cursor only ever sits
+    /// at the open boundary, the close boundary, or outside any
+    /// marker. For each marker block whose close is at or before
+    /// the cursor, shift the displayed cursor by
+    /// `placeholder.len() - marker_len`.
+    pub fn display(&self) -> (String, usize) {
+        let buf = self.buffer.as_str();
+        let blocks = marker_blocks(buf);
+        if blocks.is_empty() {
+            return (buf.to_string(), self.cursor.min(buf.len()));
+        }
+        let cursor = self.cursor.min(buf.len());
+        let mut out = String::with_capacity(buf.len());
+        let mut cursor_display = cursor;
+        let mut last_end = 0usize;
+        for (start, end, idx) in &blocks {
+            out.push_str(&buf[last_end..*start]);
+            let placeholder = self
+                .pastes
+                .get(*idx)
+                .and_then(|o| o.as_ref())
+                .map(|s| placeholder_display(s.as_str()))
+                .unwrap_or_default();
+            let marker_len = end - start;
+            if cursor >= *end {
+                // Cursor is past the marker — shift by delta.
+                cursor_display = cursor_display
+                    .saturating_sub(marker_len)
+                    .saturating_add(placeholder.len());
+            } else if cursor > *start {
+                // Defensive: cursor inside the marker (shouldn't
+                // happen via normal motion). Clamp to end of
+                // placeholder in the display.
+                cursor_display = out.len() + placeholder.len();
+            }
+            out.push_str(&placeholder);
+            last_end = *end;
+        }
+        out.push_str(&buf[last_end..]);
+        (out, cursor_display)
     }
 
     /// Expand markers in `s` using `pastes` for bodies. Free-function form
@@ -1212,5 +1257,70 @@ mod tests {
         // line) lands at end (byte 3 relative to target start = 13).
         // Target line is &s[13..16] = "abc".
         assert_eq!(byte_at_char_col(s, 13, s.len(), 3), s.len());
+    }
+
+    /// User-reported bug: a multi-line paste inserted a marker like
+    /// `\x01<idx>\x01` into the buffer; the renderer printed the raw
+    /// bytes, so the user only saw the bare digit between two
+    /// invisible SOH characters instead of the intended
+    /// `[N lines pasted]` placeholder. `display()` is the fix —
+    /// these tests pin the projection AND the cursor mapping.
+    #[test]
+    fn display_no_marker_passes_through() {
+        let mut e = InputEditor::new();
+        e.insert_str("hello world");
+        e.cursor = 5;
+        let (s, c) = e.display();
+        assert_eq!(s, "hello world");
+        assert_eq!(c, 5);
+    }
+
+    #[test]
+    fn display_marker_renders_as_placeholder() {
+        let mut e = InputEditor::new();
+        // 5 lines triggers the collapse threshold.
+        e.handle_paste("a\nb\nc\nd\ne");
+        let (s, _) = e.display();
+        assert_eq!(s, "[5 lines pasted]");
+    }
+
+    #[test]
+    fn display_cursor_maps_to_end_of_placeholder() {
+        let mut e = InputEditor::new();
+        e.handle_paste("a\nb\nc\nd\ne");
+        // handle_paste leaves the cursor at the end of the marker
+        // (after the closing \x01). Verify display maps it to the
+        // end of the placeholder string.
+        let (s, c) = e.display();
+        assert_eq!(s, "[5 lines pasted]");
+        assert_eq!(c, s.len());
+    }
+
+    #[test]
+    fn display_cursor_before_marker_unchanged() {
+        let mut e = InputEditor::new();
+        e.insert_str("pre ");
+        e.handle_paste("a\nb\nc\nd\ne");
+        // Cursor is currently at end (after the marker). Reset to
+        // before "pre" and confirm the display cursor matches.
+        e.cursor = 0;
+        let (s, c) = e.display();
+        assert!(
+            s.starts_with("pre [") && s.contains("lines pasted]"),
+            "got {s:?}",
+        );
+        assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn display_text_after_marker_offset_correctly() {
+        let mut e = InputEditor::new();
+        e.handle_paste("a\nb\nc\nd\ne");
+        e.insert_str(" suffix");
+        // Cursor sits at end of " suffix" — verify display maps it
+        // to the end of `[N lines pasted] suffix`.
+        let (s, c) = e.display();
+        assert_eq!(s, "[5 lines pasted] suffix");
+        assert_eq!(c, s.len());
     }
 }
