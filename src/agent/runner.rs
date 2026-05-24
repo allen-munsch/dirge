@@ -151,6 +151,25 @@ where
     let start_instant = std::time::Instant::now();
     let session_id = uuid_v4_simple();
     let mut num_turns: u32 = 0;
+
+    // Plugin `on-prompt` dispatch. Headless modes (--print, --loop)
+    // previously skipped this — plugins that mutate the user prompt
+    // or block it never fired in CI/script contexts.
+    let effective_prompt: String = {
+        #[cfg(feature = "plugin")]
+        {
+            if let Some(pm_arc) = crate::plugin::hook::global() {
+                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                resolve_prompt_with_hooks(prompt, &mut mgr)
+            } else {
+                prompt.to_string()
+            }
+        }
+        #[cfg(not(feature = "plugin"))]
+        {
+            prompt.to_string()
+        }
+    };
     // For Json / StreamJson modes the assistant text is BUFFERED
     // (never streamed inline to stdout) so the JSON envelope is the
     // only thing the user sees on stdout. Text mode keeps the prior
@@ -187,7 +206,7 @@ where
     let mut attempts: usize = 0;
     loop {
         let mut stream = agent
-            .stream_chat(prompt.to_string(), Vec::<Message>::new())
+            .stream_chat(effective_prompt.clone(), Vec::<Message>::new())
             .multi_turn(max_turns)
             .await;
 
@@ -271,6 +290,49 @@ where
         // closing payload. Ported from maki print.rs:51-64
         // (`PrintResult`) and the StreamJson assistant event shape.
         num_turns += 1;
+
+        // Plugin `on-response` + `on-complete` + `prepare-next-run`
+        // dispatch. Headless modes previously skipped these. The
+        // on-response hook can replace the final response via
+        // harness/replace-result — used (for example) by a
+        // formatting plugin that wraps the agent's output in a
+        // structured envelope. Errors go to stderr; we keep the
+        // run going so the user still sees the unmodified response.
+        //
+        // NOTE: text mode has already streamed full_response to
+        // stdout BYTE BY BYTE during the loop above — a
+        // replace-result mutation can't roll those bytes back, so
+        // text mode prints the mutated tail after a separator
+        // rather than silently dropping the upstream content. JSON
+        // / StreamJson modes buffer (`suppress_inline`), so the
+        // mutation cleanly replaces.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = crate::plugin::hook::global() {
+            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let result = apply_response_hooks(&full_response, &mut mgr);
+            if let Some(replacement) = result.replacement {
+                if suppress_inline {
+                    full_response = replacement;
+                } else {
+                    // Text mode already streamed the original — show
+                    // the replacement on a new line with a marker so
+                    // the user understands what happened.
+                    println!();
+                    println!("[plugin replace-result]");
+                    println!("{}", replacement);
+                    full_response = replacement;
+                }
+            }
+            if let Some(next_model) = result.next_model {
+                eprintln!(
+                    "[plugin] prepare-next-run requested model={} — \
+                    --print uses a single agent; ignored. \
+                    Use --loop or interactive mode for model swap.",
+                    next_model
+                );
+            }
+        }
+
         match output_format {
             crate::cli::OutputFormat::Text => {
                 println!();
@@ -359,4 +421,228 @@ fn uuid_v4_simple() -> String {
         bytes[14],
         bytes[15],
     )
+}
+
+/// Outcome of the post-response plugin dispatch sequence
+/// (`on-response` → `on-complete` → `prepare-next-run`).
+#[cfg(feature = "plugin")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResponseHookResult {
+    /// `Some(text)` when a plugin called `harness/replace-result` to
+    /// substitute the agent's response. Caller decides how to surface
+    /// it (text mode prints with a marker since the original already
+    /// streamed; JSON modes substitute cleanly).
+    pub replacement: Option<String>,
+    /// `Some(model)` when a plugin called `harness/set-next-model`.
+    /// `--print` ignores this; `--loop` would rebuild the agent.
+    pub next_model: Option<String>,
+}
+
+/// Resolve `prompt` through the `on-prompt` hook chain:
+///
+///   1. Dispatch `on-prompt` → join results as a "hint" prepended
+///      to the prompt
+///   2. `harness/request-prompt` → if set, replaces the hint
+///   3. `harness/replace-prompt` → if set, fully replaces the prompt
+///
+/// Errors from plugin code are surfaced to stderr so the user's
+/// stdout (the structured `--print` result) stays clean.
+#[cfg(feature = "plugin")]
+pub(crate) fn resolve_prompt_with_hooks(
+    prompt: &str,
+    mgr: &mut crate::plugin::PluginManager,
+) -> String {
+    let janet_ctx = format!(
+        "@{{:prompt \"{}\"}}",
+        crate::plugin::escape_janet_string(prompt)
+    );
+    let mut hint: Option<String> = match mgr.dispatch("on-prompt", &janet_ctx) {
+        Ok(results) if !results.is_empty() => Some(results.join("\n")),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("[plugin] on-prompt error: {e}");
+            None
+        }
+    };
+    if let Some(pending) = mgr.take_pending_prompt() {
+        hint = Some(pending);
+    }
+    let replace = mgr.take_pending_prompt_replace();
+    if let Some(rep) = replace {
+        rep
+    } else if let Some(h) = hint {
+        format!("{}\n\n{}", h, prompt)
+    } else {
+        prompt.to_string()
+    }
+}
+
+/// Run the post-response hook chain: `on-response` → record store →
+/// `on-complete` → `prepare-next-run`. Returns the replacement (if
+/// any) and the requested next model (if any). The original
+/// `response` is unchanged in the caller's hands until the caller
+/// decides whether to swap based on the result.
+#[cfg(feature = "plugin")]
+pub(crate) fn apply_response_hooks(
+    response: &str,
+    mgr: &mut crate::plugin::PluginManager,
+) -> ResponseHookResult {
+    let janet_ctx = format!(
+        "@{{:response \"{}\"}}",
+        crate::plugin::escape_janet_string(response)
+    );
+    if let Err(e) = mgr.dispatch("on-response", &janet_ctx) {
+        eprintln!("[plugin] on-response error: {e}");
+    }
+    mgr.store_response(response);
+    let replacement = mgr.take_pending_replace_result();
+    if let Err(e) = mgr.dispatch("on-complete", "@{}") {
+        eprintln!("[plugin] on-complete error: {e}");
+    }
+    if let Err(e) = mgr.dispatch("prepare-next-run", "@{}") {
+        eprintln!("[plugin] prepare-next-run error: {e}");
+    }
+    let next_model = mgr.take_pending_next_model().and_then(|m| {
+        let t = m.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    });
+    ResponseHookResult {
+        replacement,
+        next_model,
+    }
+}
+
+#[cfg(all(test, feature = "plugin"))]
+mod plugin_hook_tests {
+    use super::*;
+    use crate::plugin::PluginManager;
+
+    /// on-prompt result is joined with the original prompt as a
+    /// "hint" prefix. Demonstrates the simplest plugin-mutates-input
+    /// flow: a code-style hint that always precedes the user prompt.
+    #[test]
+    fn resolve_prompt_prepends_on_prompt_hint() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn style-hint [ctx] "ALWAYS USE TYPESCRIPT")"#)
+            .unwrap();
+        mgr.register("on-prompt", "style-hint");
+        let out = resolve_prompt_with_hooks("write a function", &mut mgr);
+        assert!(out.contains("ALWAYS USE TYPESCRIPT"));
+        assert!(out.contains("write a function"));
+        assert!(
+            out.find("ALWAYS USE TYPESCRIPT").unwrap() < out.find("write a function").unwrap(),
+            "hint must come before the prompt"
+        );
+    }
+
+    /// harness/request-prompt overrides the dispatch result. Used by
+    /// plugins that want full control: they may run logic in the
+    /// hook AND emit a queue-style replacement.
+    #[test]
+    fn resolve_prompt_request_prompt_overrides_hint() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn override [ctx]
+                 (harness/request-prompt "from-request-prompt")
+                 "from-dispatch")"#,
+        )
+        .unwrap();
+        mgr.register("on-prompt", "override");
+        let out = resolve_prompt_with_hooks("original", &mut mgr);
+        // The "from-dispatch" hint is discarded once
+        // request-prompt was set — same precedence as the UI path.
+        assert!(out.contains("from-request-prompt"));
+        assert!(out.contains("original"));
+        assert!(!out.contains("from-dispatch"));
+    }
+
+    /// harness/replace-prompt fully substitutes the prompt — the
+    /// original text is not seen by the LLM at all.
+    #[test]
+    fn resolve_prompt_replace_prompt_substitutes_entirely() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn replace [ctx]
+                 (harness/replace-prompt "ENTIRELY NEW PROMPT")
+                 nil)"#,
+        )
+        .unwrap();
+        mgr.register("on-prompt", "replace");
+        let out = resolve_prompt_with_hooks("user typed this", &mut mgr);
+        assert_eq!(out, "ENTIRELY NEW PROMPT");
+        assert!(!out.contains("user typed this"));
+    }
+
+    /// No plugins / nil result: prompt passes through untouched.
+    #[test]
+    fn resolve_prompt_no_hook_passthrough() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let out = resolve_prompt_with_hooks("just this", &mut mgr);
+        assert_eq!(out, "just this");
+    }
+
+    /// on-response can mutate the final response via
+    /// harness/replace-result. Used by formatting / wrapping
+    /// plugins that produce structured output around the agent's
+    /// text.
+    #[test]
+    fn apply_response_hooks_replace_result() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn wrap [ctx]
+                 (harness/replace-result "WRAPPED")
+                 nil)"#,
+        )
+        .unwrap();
+        mgr.register("on-response", "wrap");
+        let result = apply_response_hooks("raw response", &mut mgr);
+        assert_eq!(result.replacement.as_deref(), Some("WRAPPED"));
+        assert_eq!(result.next_model, None);
+    }
+
+    /// prepare-next-run can set the next model. In --print this is
+    /// ignored (single-shot), but the slot still gets drained.
+    #[test]
+    fn apply_response_hooks_set_next_model() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn pick-model [ctx]
+                 (harness/set-next-model "claude-opus-4-7")
+                 nil)"#,
+        )
+        .unwrap();
+        mgr.register("prepare-next-run", "pick-model");
+        let result = apply_response_hooks("ok", &mut mgr);
+        assert_eq!(result.next_model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    /// Empty / whitespace model names are silently dropped — a
+    /// misconfigured plugin shouldn't trigger a "swap to empty
+    /// string" downstream.
+    #[test]
+    fn apply_response_hooks_empty_next_model_dropped() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn bad-pick [ctx]
+                 (harness/set-next-model "   ")
+                 nil)"#,
+        )
+        .unwrap();
+        mgr.register("prepare-next-run", "bad-pick");
+        let result = apply_response_hooks("ok", &mut mgr);
+        assert_eq!(result.next_model, None);
+    }
+
+    /// No plugins / no hooks fired: response passes through with
+    /// no replacement and no next-model.
+    #[test]
+    fn apply_response_hooks_no_hooks_passthrough() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        let result = apply_response_hooks("ok", &mut mgr);
+        assert_eq!(result, ResponseHookResult::default());
+    }
 }
