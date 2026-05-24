@@ -462,13 +462,43 @@ async fn main() -> anyhow::Result<()> {
     // take_dialog_rx again returns None — single owner by design. Always
     // an Option so the UI signature is uniform across feature flags.
     #[cfg(feature = "plugin")]
-    let dialog_rx = plugin_manager.as_ref().and_then(|pm| {
+    let mut dialog_rx = plugin_manager.as_ref().and_then(|pm| {
         pm.lock()
             .unwrap_or_else(|e| e.into_inner())
             .take_dialog_rx()
     });
     #[cfg(not(feature = "plugin"))]
     let dialog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<plugin::DialogRequest>> = None;
+    // Headless modes (--print, --loop) have no UI to render plugin
+    // dialogs. Without a drain, `harness/confirm` / `harness/select`
+    // calls in plugin code block the worker thread forever waiting
+    // on a reply. When `--auto-confirm` is set, spawn a background
+    // task that consumes `dialog_rx` and answers synthetically. The
+    // task lives until `dialog_rx` closes (worker shutdown). If
+    // `--auto-confirm` is omitted, dialog_rx stays attached to the
+    // UI path (interactive) or is intentionally left undrained
+    // (headless without --auto-confirm — same behaviour as before).
+    #[cfg(feature = "plugin")]
+    let _dialog_responder: Option<tokio::task::JoinHandle<()>> = {
+        let headless = cli.print || {
+            #[cfg(feature = "loop")]
+            {
+                cli.loop_mode
+            }
+            #[cfg(not(feature = "loop"))]
+            {
+                false
+            }
+        };
+        match (headless, cli.auto_confirm, dialog_rx.take()) {
+            (true, Some(mode), Some(rx)) => Some(plugin::spawn_headless_dialog_responder(rx, mode)),
+            (_, _, taken) => {
+                // Put it back — interactive path still needs it.
+                dialog_rx = taken;
+                None
+            }
+        }
+    };
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
@@ -689,6 +719,28 @@ async fn main() -> anyhow::Result<()> {
         let response = agent
             .run_print(&msg, cli.resolve_max_agent_turns(&cfg), cli.output_format)
             .await?;
+        // A plugin may have called `harness/set-next-model` during
+        // `prepare-next-run`. `--print` is single-shot so we can't
+        // honor it — surface a warning to stderr so the plugin
+        // author can see why their model swap didn't take effect.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = plugin_manager.as_ref() {
+            if let Some(m) = pm_arc
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_pending_next_model()
+            {
+                let t = m.trim();
+                if !t.is_empty() {
+                    eprintln!(
+                        "[plugin] prepare-next-run requested model={} — \
+                        --print is single-shot; ignored. Use --loop or \
+                        interactive mode for model swap.",
+                        t
+                    );
+                }
+            }
+        }
         if !cli.no_session {
             session.add_message(MessageRole::User, &msg);
             session.add_message(MessageRole::Assistant, &response);
@@ -697,27 +749,103 @@ async fn main() -> anyhow::Result<()> {
     } else {
         #[cfg(feature = "loop")]
         if cli.loop_mode {
-            let model = client.completion_model(model.to_string());
-            let agent = provider::build_agent(
-                model,
-                &cli,
-                &cfg,
-                &context,
-                permission,
-                ask_tx,
-                question_tx.clone(),
-                plan_tx.clone(),
-                bg_store.clone(),
-                #[cfg(feature = "lsp")]
-                lsp_manager.clone(),
-                sandbox.clone(),
-                #[cfg(feature = "mcp")]
-                mcp_manager.as_ref(),
-                #[cfg(feature = "semantic")]
-                semantic_manager.as_ref(),
-            )
-            .await;
-            return run_headless_loop(agent, &cli, &cfg, &context).await;
+            use std::path::PathBuf;
+            use uuid::Uuid;
+
+            use crate::extras::r#loop as loop_mod;
+
+            let loop_prompt = cli
+                .loop_prompt
+                .clone()
+                .or_else(|| {
+                    let msg = cli.message.join(" ");
+                    if msg.is_empty() { None } else { Some(msg) }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No loop prompt. Use --loop-prompt or pass a message.")
+                })?;
+
+            let plan_file = cli
+                .loop_plan
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("LOOP_PLAN.md"));
+            let _use_existing = loop_mod::plan::handle_startup(&plan_file)?;
+
+            let mut loop_state = loop_mod::LoopState::new(
+                loop_prompt,
+                plan_file,
+                cli.loop_max,
+                cli.loop_run.clone(),
+            );
+            let session_id = Uuid::new_v4().to_string();
+
+            // Build the initial agent; on plugin-requested model swap
+            // we rebuild here and re-enter the inner iteration loop
+            // with the same `loop_state` so iteration numbering and
+            // transcript continuity are preserved across the swap.
+            // `mut` is only needed when the plugin feature is enabled.
+            #[cfg_attr(not(feature = "plugin"), allow(unused_mut))]
+            let mut current_agent = {
+                let m = client.completion_model(model.to_string());
+                provider::build_agent(
+                    m,
+                    &cli,
+                    &cfg,
+                    &context,
+                    permission.clone(),
+                    ask_tx.clone(),
+                    question_tx.clone(),
+                    plan_tx.clone(),
+                    bg_store.clone(),
+                    #[cfg(feature = "lsp")]
+                    lsp_manager.clone(),
+                    sandbox.clone(),
+                    #[cfg(feature = "mcp")]
+                    mcp_manager.as_ref(),
+                    #[cfg(feature = "semantic")]
+                    semantic_manager.as_ref(),
+                )
+                .await
+            };
+
+            loop {
+                let exit = run_headless_loop(
+                    &current_agent,
+                    &mut loop_state,
+                    &session_id,
+                    &cli,
+                    &cfg,
+                    #[cfg(feature = "plugin")]
+                    plugin_manager.as_ref(),
+                )
+                .await?;
+                match exit {
+                    HeadlessLoopExit::MaxIterations => return Ok(()),
+                    #[cfg(feature = "plugin")]
+                    HeadlessLoopExit::ModelSwap(new_model) => {
+                        let m = client.completion_model(new_model);
+                        current_agent = provider::build_agent(
+                            m,
+                            &cli,
+                            &cfg,
+                            &context,
+                            permission.clone(),
+                            ask_tx.clone(),
+                            question_tx.clone(),
+                            plan_tx.clone(),
+                            bg_store.clone(),
+                            #[cfg(feature = "lsp")]
+                            lsp_manager.clone(),
+                            sandbox.clone(),
+                            #[cfg(feature = "mcp")]
+                            mcp_manager.as_ref(),
+                            #[cfg(feature = "semantic")]
+                            semantic_manager.as_ref(),
+                        )
+                        .await;
+                    }
+                }
+            }
         }
 
         let agent = provider::build_agent(
@@ -848,41 +976,34 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How a single run of [`run_headless_loop`] ended.
+///
+/// `MaxIterations` is the normal terminal state (or non-recoverable
+/// iteration error). `ModelSwap` is only returned when a plugin
+/// called `harness/set-next-model` from `prepare-next-run` — the
+/// caller is expected to rebuild the agent with the requested model
+/// and re-invoke `run_headless_loop` with the same mutable state /
+/// session id so iteration counting and the transcript continue
+/// seamlessly across the swap.
+#[cfg(feature = "loop")]
+enum HeadlessLoopExit {
+    MaxIterations,
+    #[cfg(feature = "plugin")]
+    ModelSwap(String),
+}
+
 #[cfg(feature = "loop")]
 async fn run_headless_loop(
-    agent: crate::provider::AnyAgent,
+    agent: &crate::provider::AnyAgent,
+    state: &mut crate::extras::r#loop::LoopState,
+    session_id: &str,
     cli: &cli::Cli,
     cfg: &config::Config,
-    _context: &context::ContextFiles,
-) -> anyhow::Result<()> {
-    use std::path::PathBuf;
-    use uuid::Uuid;
-
+    #[cfg(feature = "plugin")] plugin_manager: Option<
+        &std::sync::Arc<std::sync::Mutex<plugin::PluginManager>>,
+    >,
+) -> anyhow::Result<HeadlessLoopExit> {
     use crate::extras::r#loop as loop_mod;
-
-    let prompt = cli
-        .loop_prompt
-        .clone()
-        .or_else(|| {
-            let msg = cli.message.join(" ");
-            if msg.is_empty() { None } else { Some(msg) }
-        })
-        .ok_or_else(|| anyhow::anyhow!("No loop prompt. Use --loop-prompt or pass a message."))?;
-
-    let plan_file = cli
-        .loop_plan
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("LOOP_PLAN.md"));
-    let max_iterations = cli.loop_max;
-    let run_cmd = cli.loop_run.clone();
-    let session_id = Uuid::new_v4().to_string();
-
-    let use_existing = loop_mod::plan::handle_startup(&plan_file)?;
-    if !use_existing {
-        // No plan exists — agent will generate one on first iteration
-    }
-
-    let mut state = loop_mod::LoopState::new(prompt, plan_file, max_iterations, run_cmd);
 
     loop {
         state.iteration += 1;
@@ -892,7 +1013,7 @@ async fn run_headless_loop(
                 "[loop] max iterations ({}) reached, stopping",
                 state.iteration
             );
-            break;
+            return Ok(HeadlessLoopExit::MaxIterations);
         }
 
         let iteration_prompt = state.build_prompt();
@@ -911,7 +1032,7 @@ async fn run_headless_loop(
             Ok(r) => r,
             Err(e) => {
                 eprintln!("[loop] error in iteration {}: {}", state.iteration, e);
-                break;
+                return Ok(HeadlessLoopExit::MaxIterations);
             }
         };
 
@@ -951,7 +1072,7 @@ async fn run_headless_loop(
         state.last_run_output = validation_output.clone();
 
         if let Err(e) = loop_mod::transcript::save_iteration(
-            &session_id,
+            session_id,
             state.iteration,
             &iteration_prompt,
             &response,
@@ -961,8 +1082,27 @@ async fn run_headless_loop(
             eprintln!("[loop] warning: failed to save transcript: {}", e);
         }
 
+        // `prepare-next-run` hooks fired inside `run_print` may have
+        // set a `next_model` slot on the PluginManager. Drain it
+        // BEFORE eprintln'ing "iteration complete" so the swap log
+        // line lands in the right narrative slot.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = plugin_manager {
+            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(raw) = mgr.take_pending_next_model() {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    let next_model = trimmed.to_string();
+                    drop(mgr);
+                    eprintln!(
+                        "--- iteration {} complete, plugin requested model swap to '{}' ---\n",
+                        state.iteration, next_model
+                    );
+                    return Ok(HeadlessLoopExit::ModelSwap(next_model));
+                }
+            }
+        }
+
         eprintln!("--- iteration {} complete, looping ---\n", state.iteration);
     }
-
-    Ok(())
 }

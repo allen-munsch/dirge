@@ -2339,6 +2339,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(err.contains("no .janet files"), "got: {err}");
     }
+
+    /// `--auto-confirm yes` answers `harness/confirm` with `true` and
+    /// picks the first option for `harness/select`. Verifies the
+    /// dialog-drain task (the only thing that lets confirm/select
+    /// finish in headless modes) does not hang.
+    ///
+    /// `spawn_blocking` is used for the std-mpsc receive so the
+    /// current-thread runtime can still drive the responder task.
+    #[tokio::test]
+    async fn auto_confirm_yes_responds_true_and_first_option() {
+        use std::sync::mpsc;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<super::DialogRequest>();
+        let _handle = super::spawn_headless_dialog_responder(rx, crate::cli::AutoConfirmMode::Yes);
+
+        let (creply_tx, creply_rx) = mpsc::channel::<super::DialogReply>();
+        tx.send(super::DialogRequest::Confirm {
+            title: "t".into(),
+            question: "q".into(),
+            reply: creply_tx,
+        })
+        .unwrap();
+        let reply = tokio::task::spawn_blocking(move || {
+            creply_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match reply {
+            super::DialogReply::Confirm(b) => assert!(b),
+            other => panic!("expected Confirm(true), got {:?}", other),
+        }
+
+        let (sreply_tx, sreply_rx) = mpsc::channel::<super::DialogReply>();
+        tx.send(super::DialogRequest::Select {
+            title: "t".into(),
+            options: vec!["alpha".into(), "beta".into()],
+            reply: sreply_tx,
+        })
+        .unwrap();
+        let reply = tokio::task::spawn_blocking(move || {
+            sreply_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match reply {
+            super::DialogReply::Select(picked) => assert_eq!(picked.as_deref(), Some("alpha")),
+            other => panic!("expected Select(Some(\"alpha\")), got {:?}", other),
+        }
+    }
+
+    /// `--auto-confirm no` answers `harness/confirm` with `false` and
+    /// returns `None` for `harness/select`.
+    #[tokio::test]
+    async fn auto_confirm_no_responds_false_and_none() {
+        use std::sync::mpsc;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<super::DialogRequest>();
+        let _handle = super::spawn_headless_dialog_responder(rx, crate::cli::AutoConfirmMode::No);
+
+        let (creply_tx, creply_rx) = mpsc::channel::<super::DialogReply>();
+        tx.send(super::DialogRequest::Confirm {
+            title: "t".into(),
+            question: "q".into(),
+            reply: creply_tx,
+        })
+        .unwrap();
+        let reply = tokio::task::spawn_blocking(move || {
+            creply_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match reply {
+            super::DialogReply::Confirm(b) => assert!(!b),
+            other => panic!("expected Confirm(false), got {:?}", other),
+        }
+
+        let (sreply_tx, sreply_rx) = mpsc::channel::<super::DialogReply>();
+        tx.send(super::DialogRequest::Select {
+            title: "t".into(),
+            options: vec!["alpha".into(), "beta".into()],
+            reply: sreply_tx,
+        })
+        .unwrap();
+        let reply = tokio::task::spawn_blocking(move || {
+            sreply_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        match reply {
+            super::DialogReply::Select(picked) => assert_eq!(picked, None),
+            other => panic!("expected Select(None), got {:?}", other),
+        }
+    }
 }
 
 use std::collections::HashMap;
@@ -2350,6 +2447,39 @@ pub use worker::{DialogReply, DialogRequest};
 pub mod extension;
 pub mod hook;
 pub mod worker;
+
+/// Spawn a background task that drains plugin dialog requests in
+/// headless modes (`--print`, `--loop`, ACP) and auto-replies based
+/// on `mode`. Without this drain, a plugin that calls
+/// `harness/confirm` or `harness/select` in a non-interactive run
+/// blocks forever because the dialog channel has no UI consumer.
+///
+/// The drainer runs until `dialog_rx` is closed (i.e. the
+/// `PluginManager` / `Worker` is dropped). Reply sends are
+/// best-effort: if the worker has moved on, the send is dropped.
+#[cfg(feature = "plugin")]
+pub fn spawn_headless_dialog_responder(
+    mut dialog_rx: tokio::sync::mpsc::UnboundedReceiver<DialogRequest>,
+    mode: crate::cli::AutoConfirmMode,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(req) = dialog_rx.recv().await {
+            match req {
+                DialogRequest::Confirm { reply, .. } => {
+                    let answer = matches!(mode, crate::cli::AutoConfirmMode::Yes);
+                    let _ = reply.send(DialogReply::Confirm(answer));
+                }
+                DialogRequest::Select { options, reply, .. } => {
+                    let picked = match mode {
+                        crate::cli::AutoConfirmMode::Yes => options.into_iter().next(),
+                        crate::cli::AutoConfirmMode::No => None,
+                    };
+                    let _ = reply.send(DialogReply::Select(picked));
+                }
+            }
+        }
+    })
+}
 
 /// Escape a Rust string so it can be safely embedded inside a Janet
 /// double-quoted string literal. Janet's parser accepts the standard

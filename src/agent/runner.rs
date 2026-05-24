@@ -323,14 +323,9 @@ where
                     full_response = replacement;
                 }
             }
-            if let Some(next_model) = result.next_model {
-                eprintln!(
-                    "[plugin] prepare-next-run requested model={} — \
-                    --print uses a single agent; ignored. \
-                    Use --loop or interactive mode for model swap.",
-                    next_model
-                );
-            }
+            // `prepare-next-run`'s `set-next-model` value (if any) is
+            // left in `PluginManager` for the caller to drain. `--loop`
+            // rebuilds the agent on it; `--print` warns and ignores.
         }
 
         match output_format {
@@ -425,6 +420,14 @@ fn uuid_v4_simple() -> String {
 
 /// Outcome of the post-response plugin dispatch sequence
 /// (`on-response` → `on-complete` → `prepare-next-run`).
+///
+/// Note: `next_model` is intentionally NOT included here. The
+/// `prepare-next-run` hook stores its value in [`PluginManager`]; the
+/// caller of `run_print` (e.g. `main.rs`'s `--loop` driver) drains it
+/// via `take_pending_next_model()` AFTER `run_print` returns. That
+/// keeps the choice of how to react (warn-and-ignore in `--print`,
+/// rebuild agent in `--loop`) in the caller's hands and out of the
+/// runner.
 #[cfg(feature = "plugin")]
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResponseHookResult {
@@ -433,9 +436,6 @@ pub(crate) struct ResponseHookResult {
     /// it (text mode prints with a marker since the original already
     /// streamed; JSON modes substitute cleanly).
     pub replacement: Option<String>,
-    /// `Some(model)` when a plugin called `harness/set-next-model`.
-    /// `--print` ignores this; `--loop` would rebuild the agent.
-    pub next_model: Option<String>,
 }
 
 /// Resolve `prompt` through the `on-prompt` hook chain:
@@ -479,9 +479,9 @@ pub(crate) fn resolve_prompt_with_hooks(
 
 /// Run the post-response hook chain: `on-response` → record store →
 /// `on-complete` → `prepare-next-run`. Returns the replacement (if
-/// any) and the requested next model (if any). The original
-/// `response` is unchanged in the caller's hands until the caller
-/// decides whether to swap based on the result.
+/// any). The `set-next-model` value, if any, is left in
+/// [`PluginManager`] for the caller to drain via
+/// `take_pending_next_model()`.
 #[cfg(feature = "plugin")]
 pub(crate) fn apply_response_hooks(
     response: &str,
@@ -502,18 +502,7 @@ pub(crate) fn apply_response_hooks(
     if let Err(e) = mgr.dispatch("prepare-next-run", "@{}") {
         eprintln!("[plugin] prepare-next-run error: {e}");
     }
-    let next_model = mgr.take_pending_next_model().and_then(|m| {
-        let t = m.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        }
-    });
-    ResponseHookResult {
-        replacement,
-        next_model,
-    }
+    ResponseHookResult { replacement }
 }
 
 #[cfg(all(test, feature = "plugin"))]
@@ -601,13 +590,17 @@ mod plugin_hook_tests {
         mgr.register("on-response", "wrap");
         let result = apply_response_hooks("raw response", &mut mgr);
         assert_eq!(result.replacement.as_deref(), Some("WRAPPED"));
-        assert_eq!(result.next_model, None);
+        // next_model is not part of ResponseHookResult; it's left in
+        // the manager. Verify it wasn't set as a side-effect of the
+        // wrap hook.
+        assert_eq!(mgr.take_pending_next_model(), None);
     }
 
-    /// prepare-next-run can set the next model. In --print this is
-    /// ignored (single-shot), but the slot still gets drained.
+    /// prepare-next-run can set the next model. The runner does NOT
+    /// drain it — the caller (e.g. `run_headless_loop`) is responsible
+    /// for `take_pending_next_model()`.
     #[test]
-    fn apply_response_hooks_set_next_model() {
+    fn apply_response_hooks_set_next_model_left_in_manager() {
         let mut mgr = PluginManager::try_new().unwrap();
         mgr.eval(
             r#"(defn pick-model [ctx]
@@ -616,25 +609,11 @@ mod plugin_hook_tests {
         )
         .unwrap();
         mgr.register("prepare-next-run", "pick-model");
-        let result = apply_response_hooks("ok", &mut mgr);
-        assert_eq!(result.next_model.as_deref(), Some("claude-opus-4-7"));
-    }
-
-    /// Empty / whitespace model names are silently dropped — a
-    /// misconfigured plugin shouldn't trigger a "swap to empty
-    /// string" downstream.
-    #[test]
-    fn apply_response_hooks_empty_next_model_dropped() {
-        let mut mgr = PluginManager::try_new().unwrap();
-        mgr.eval(
-            r#"(defn bad-pick [ctx]
-                 (harness/set-next-model "   ")
-                 nil)"#,
-        )
-        .unwrap();
-        mgr.register("prepare-next-run", "bad-pick");
-        let result = apply_response_hooks("ok", &mut mgr);
-        assert_eq!(result.next_model, None);
+        let _ = apply_response_hooks("ok", &mut mgr);
+        assert_eq!(
+            mgr.take_pending_next_model().as_deref(),
+            Some("claude-opus-4-7")
+        );
     }
 
     /// No plugins / no hooks fired: response passes through with

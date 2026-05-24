@@ -23,6 +23,22 @@ pub enum OutputFormat {
     StreamJson,
 }
 
+/// Auto-response policy for `harness/confirm` and `harness/select`
+/// dialogs in headless modes (`--print`, `--loop`, ACP). Default is
+/// `None` (preserves the old behavior: the dialog blocks waiting for
+/// a UI that isn't there). When set, a background task drains the
+/// plugin worker's dialog channel and replies synthetically so
+/// plugin-driven prompts don't hang in CI.
+///
+/// - `Yes`: `confirm` returns `true`; `select` returns the FIRST option.
+/// - `No`:  `confirm` returns `false`; `select` returns `nil`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum AutoConfirmMode {
+    Yes,
+    No,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "dirge", version, about = "Minimal coding agent")]
 pub struct Cli {
@@ -182,6 +198,13 @@ pub struct Cli {
         help = "Validation command to run after each iteration"
     )]
     pub loop_run: Option<String>,
+
+    #[arg(
+        long = "auto-confirm",
+        value_enum,
+        help = "Auto-respond to plugin harness/confirm and harness/select dialogs in headless modes. Without this flag, dialogs hang waiting for an interactive UI."
+    )]
+    pub auto_confirm: Option<AutoConfirmMode>,
 
     #[arg(help = "Prompt message(s)")]
     pub message: Vec<String>,
