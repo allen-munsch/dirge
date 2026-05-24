@@ -28,6 +28,14 @@ pub struct PermissionChecker {
     /// read/write/edit/grep call, accumulating to hundreds of
     /// stat()s per session.
     working_dir_canonical: String,
+    /// The currently-installed CWD-scoped allow-glob (e.g.
+    /// `/Users/foo/proj/**`) used by `install_cwd_allow_rules` and
+    /// `set_working_dir`. Recorded so that on cd we can find and
+    /// remove the stale entries from `rules` before installing
+    /// fresh ones, without touching user-configured rules pushed
+    /// onto the same Vec. `None` when no CWD-allow was installable
+    /// (degenerate working_dir, e.g. empty or `/`).
+    cwd_allow_pattern: Option<String>,
     session_allowlist: Vec<(String, Pattern)>,
     recent_calls: VecDeque<(String, String)>,
     mode: SecurityMode,
@@ -176,33 +184,9 @@ impl PermissionChecker {
         }
 
         // CWD-scoped builtin-allow for mutating filesystem tools.
-        // Without this, every first write/edit inside the project
-        // prompts the user. Installing `<cwd>/**` as Allow makes
-        // writes inside the working directory silent while preserving
-        // the Ask default for paths outside CWD (the
-        // `external_directory` overlay / `is_external_path` demotion
-        // below still gates writes to `/etc`, the user's home, etc.).
-        //
-        // User-supplied rules and last-match-wins ordering: the
-        // legacy per-tool fields (config.write / config.edit /
-        // config.apply_patch) and the M2 `tools` map are pushed onto
-        // this same Vec AFTER this installer, so a user's explicit
-        // deny for a path INSIDE CWD wins. Session allowlist entries
-        // checked before rules (see `is_session_allowed`) also win.
-        //
-        // Not installed under `working_dir = ""` (config-only init
-        // with no cwd resolution) — without a concrete prefix the
-        // pattern would degenerate to `/**` and silently allow writes
-        // anywhere on the filesystem.
-        if !working_dir.is_empty() {
-            let cwd_glob = format!("{}/**", working_dir.trim_end_matches('/'));
-            for tool in ["write", "edit", "apply_patch"] {
-                rules
-                    .entry(tool.to_string())
-                    .or_default()
-                    .push((pattern_for_tool(tool, &cwd_glob), Action::Allow));
-            }
-        }
+        // Helper handles canonicalization + safety guards; see
+        // `install_cwd_allow_rules` for the contract.
+        let cwd_allow_pattern = install_cwd_allow_rules(&mut rules, &working_dir);
 
         // Helper: append a `ToolPerm` (Simple or Granular) onto a
         // tool's rule vec. Used by both the legacy per-tool fields and
@@ -355,6 +339,7 @@ impl PermissionChecker {
             doom_loop_action,
             working_dir,
             working_dir_canonical,
+            cwd_allow_pattern,
             session_allowlist: Vec::new(),
             recent_calls: VecDeque::with_capacity(16),
             mode,
@@ -714,6 +699,20 @@ impl PermissionChecker {
     pub fn set_working_dir(&mut self, dir: &str) {
         self.working_dir = dir.to_string();
         self.working_dir_canonical = canonicalize_for_cache(dir);
+        // Refresh the CWD-scoped builtin-allow rules so the new
+        // project gets its own auto-allow and the OLD pattern
+        // doesn't keep matching after cd. Surgically removes only
+        // the previously-installed pattern (identified by
+        // `pattern.original`) so user-configured rules pushed onto
+        // the same Vec stay intact.
+        if let Some(old_pat) = self.cwd_allow_pattern.take() {
+            for tool in ["write", "edit", "apply_patch"] {
+                if let Some(entries) = self.rules.get_mut(tool) {
+                    entries.retain(|(p, _)| p.original != old_pat);
+                }
+            }
+        }
+        self.cwd_allow_pattern = install_cwd_allow_rules(&mut self.rules, dir);
         // B3-5 (audit fix): clear session-scoped state that was
         // implicitly tied to the OLD cwd. Two concerns:
         //   1. `recent_calls` is the doom-loop counter — stale
@@ -806,6 +805,54 @@ fn canonicalize_for_cache(working_dir: &str) -> String {
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| working_dir.to_string())
+}
+
+/// Install the CWD-scoped builtin-allow rule on `rules` for the
+/// mutating filesystem tools (write/edit/apply_patch). Returns the
+/// pattern string installed (`Some`) so `set_working_dir` can find
+/// and remove it on cd; `None` when the working_dir is too
+/// degenerate to install safely.
+///
+/// Refuses to install when:
+///   - `working_dir` is empty (config-only init w/o cwd resolution).
+///   - The canonical form is `/` or shorter than 2 chars — the
+///     resulting pattern (`/**`) would silently allow writes anywhere
+///     on the filesystem, defeating the "permissive only inside the
+///     project" intent.
+///   - `working_dir` contains glob metacharacters (`*`, `?`, `[`,
+///     `{`). Such characters would be re-interpreted by the glob
+///     compiler rather than matched literally; a user starting dirge
+///     from `/tmp/[odd]` would get a character-class pattern matching
+///     unintended paths.
+///
+/// Uses `canonicalize_for_cache` so the pattern matches the canonical
+/// form `resolve_absolute` produces. Without this, macOS users whose
+/// `/var` / `/tmp` resolve to `/private/var` / `/private/tmp` would
+/// see the rule silently fail to match for any abs_path the checker
+/// computed.
+fn install_cwd_allow_rules(
+    rules: &mut HashMap<String, Vec<(Pattern, Action)>>,
+    working_dir: &str,
+) -> Option<String> {
+    if working_dir.is_empty() {
+        return None;
+    }
+    let canonical = canonicalize_for_cache(working_dir);
+    let trimmed = canonical.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" || canonical.len() < 2 {
+        return None;
+    }
+    if trimmed.chars().any(|c| matches!(c, '*' | '?' | '[' | '{')) {
+        return None;
+    }
+    let cwd_glob = format!("{}/**", trimmed);
+    for tool in ["write", "edit", "apply_patch"] {
+        rules
+            .entry(tool.to_string())
+            .or_default()
+            .push((pattern_for_tool(tool, &cwd_glob), Action::Allow));
+    }
+    Some(cwd_glob)
 }
 
 fn resolve_absolute(path: &str, working_dir: &str) -> String {
@@ -1133,6 +1180,115 @@ mod tests {
             checker.check_path("write", "/tmp/proj/src/main.rs"),
             CheckResult::Allowed
         ));
+    }
+
+    /// `/cd` mid-session refreshes the CWD-allow rule. After cd from
+    /// `/tmp/old` to `/tmp/new`, writes inside `/tmp/new` must be
+    /// auto-allowed AND writes inside `/tmp/old` must NOT be
+    /// (the old rule must not linger).
+    #[test]
+    fn set_working_dir_refreshes_cwd_allow_rule() {
+        let mut checker = PermissionChecker::new(
+            &PermissionConfig::default(),
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp/old")),
+        );
+        // Baseline: old CWD allows.
+        assert!(matches!(
+            checker.check_path("write", "/tmp/old/foo.rs"),
+            CheckResult::Allowed
+        ));
+
+        checker.set_working_dir("/tmp/new");
+
+        // New CWD now allowed.
+        assert!(matches!(
+            checker.check_path("write", "/tmp/new/foo.rs"),
+            CheckResult::Allowed
+        ));
+        // Old CWD no longer auto-allowed — the stale rule was
+        // removed, so it falls through to default Ask.
+        assert!(
+            matches!(
+                checker.check_path("write", "/tmp/old/foo.rs"),
+                CheckResult::Ask
+            ),
+            "stale CWD-allow for /tmp/old must be removed after cd",
+        );
+    }
+
+    /// Repeated `/cd` calls don't accumulate stale CWD-allow rules.
+    /// Pin that after N cds, only one CWD-allow entry per tool
+    /// remains (matching the current working_dir).
+    #[test]
+    fn set_working_dir_does_not_accumulate_stale_rules() {
+        let mut checker = PermissionChecker::new(
+            &PermissionConfig::default(),
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp/a")),
+        );
+        checker.set_working_dir("/tmp/b");
+        checker.set_working_dir("/tmp/c");
+        checker.set_working_dir("/tmp/d");
+
+        // Only the most-recent CWD allows.
+        for stale in ["/tmp/a/x", "/tmp/b/x", "/tmp/c/x"] {
+            assert!(
+                matches!(checker.check_path("write", stale), CheckResult::Ask),
+                "{stale} should no longer be allowed",
+            );
+        }
+        assert!(matches!(
+            checker.check_path("write", "/tmp/d/x"),
+            CheckResult::Allowed
+        ));
+    }
+
+    /// Degenerate working_dirs (`/`, empty) must NOT install a
+    /// CWD-allow rule — `/` would generate `/**` which silently
+    /// allows everything, defeating the "permissive only inside the
+    /// project" intent.
+    #[test]
+    fn cwd_allow_refuses_root_and_empty() {
+        let mut checker = PermissionChecker::new(
+            &PermissionConfig::default(),
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/")),
+        );
+        // `/` cwd: writes anywhere still prompt — no `/**` allow installed.
+        assert!(matches!(
+            checker.check_path("write", "/etc/passwd"),
+            CheckResult::Ask
+        ));
+        assert!(matches!(
+            checker.check_path("write", "/tmp/anything.rs"),
+            CheckResult::Ask
+        ));
+    }
+
+    /// Working dirs containing glob metacharacters (`*`, `?`, `[`,
+    /// `{`) must NOT install a CWD-allow rule — the glob compiler
+    /// would interpret them as wildcards / classes and match
+    /// unintended paths.
+    #[test]
+    fn cwd_allow_refuses_paths_with_glob_metachars() {
+        // The test working_dir doesn't have to exist on disk;
+        // canonicalize falls back to the literal string for the
+        // safety check.
+        for dir in ["/tmp/proj-*", "/tmp/p[a-z]", "/tmp/{a,b}"] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfig::default(),
+                SecurityMode::Standard,
+                Some(std::path::PathBuf::from(dir)),
+            );
+            // A write that would normally land inside the project
+            // must still prompt — no rule installed.
+            let inside = format!("{}/foo.rs", dir);
+            assert!(
+                matches!(checker.check_path("write", &inside), CheckResult::Ask),
+                "{dir} must not install CWD-allow (glob metachar present)",
+            );
+        }
     }
 
     /// Explicit user rules override the M4 builtin-allow list.
