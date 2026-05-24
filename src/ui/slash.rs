@@ -1977,13 +1977,17 @@ pub fn builtin_commands() -> Vec<&'static str> {
         "/regen-prompts",
         "/retry",
         "/sessions",
+        "/tasks",
         "/toggle",
         "/tree",
         "/undo",
-        "/worktree",
-        "/wt-exit",
-        "/wt-merge",
     ];
+    #[cfg(feature = "git-worktree")]
+    {
+        cmds.push("/worktree");
+        cmds.push("/wt-exit");
+        cmds.push("/wt-merge");
+    }
     #[cfg(feature = "mcp")]
     cmds.push("/mcp");
     #[cfg(feature = "loop")]
@@ -2023,12 +2027,6 @@ pub fn format_completion_preview(
             break;
         }
         result = candidate;
-    }
-    if start == 0 && result.len() >= all[0].len() {
-        // We've wrapped around. A trailing " …" hints there's more.
-        if let Some(truncated) = result.char_indices().rev().nth(1) {
-            let _ = truncated; // just checking we have room
-        }
     }
     result
 }

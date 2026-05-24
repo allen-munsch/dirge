@@ -1109,8 +1109,8 @@ impl InputEditor {
                     {
                         self.buffer = cr.new_buffer.clone().into();
                         self.cursor = cr.new_cursor;
-                        self.completion = Some(cr);
                         self.reset_kill_accumulation();
+                        self.completion = Some(cr);
                         return None;
                     }
                 }
