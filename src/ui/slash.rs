@@ -1782,11 +1782,7 @@ pub async fn handle_slash(
                 c_result(),
             )?;
             renderer.write_line(
-                "  mouse drag             select text (copies to clipboard on release)",
-                c_result(),
-            )?;
-            renderer.write_line(
-                "  Esc (while selected)   clear selection (no copy)",
+                "  drag + Cmd/Ctrl+C      select and copy text (native terminal)",
                 c_result(),
             )?;
             renderer.write_line("  Ctrl+R                 toggle reasoning", c_result())?;
@@ -1807,7 +1803,7 @@ pub async fn handle_slash(
                 "  (type while agent runs to queue a follow-up message)",
                 c_result(),
             )?;
-            renderer.write_line("  mouse scroll           scroll chat", c_result())?;
+            renderer.write_line("  PgUp/PgDn             scroll chat history", c_result())?;
 
             // Plugin-registered commands, if any. Listed last so they sit
             // visually after the built-ins and the keybindings.

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossterm::ExecutableCommand;
 use crossterm::cursor::Hide;
-use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
+use crossterm::event::EnableBracketedPaste;
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen};
 
 /// A handle to `/dev/tty` opened once by `TerminalGuard::new` and
@@ -82,7 +82,6 @@ impl TerminalGuard {
         };
         tty_writer.execute(EnterAlternateScreen)?;
         tty_writer.execute(Clear(ClearType::All))?;
-        tty_writer.execute(EnableMouseCapture)?;
         // Bracketed paste lets the terminal deliver a multi-line paste as a
         // single Event::Paste, rather than a flood of keystroke events. The
         // input editor relies on this to compress long pastes into a
@@ -248,18 +247,11 @@ impl Drop for TerminalGuard {
 
         // === Phase 1: tell the terminal to stop reporting things ===
         // Explicit DECRST for every mode we might have touched.
-        // Order matters less here than completeness — any mode left
-        // on can trigger unsolicited reports later (focus events,
-        // mouse motion, paste sentinels, modify-other-keys).
-        //   ?1000  — X10 mouse
-        //   ?1002  — cell motion mouse
-        //   ?1003  — all-motion mouse
-        //   ?1004  — focus in/out events
-        //   ?1006  — SGR-encoded mouse
-        //   ?1015  — urxvt mouse
+        // Mouse is intentionally NOT captured — the terminal handles
+        // native text selection directly.  The mouse DECRST sequences
+        // below are idempotent defensive cleanup.
         //   ?2004  — bracketed paste
         //   ?1049  — alternate screen (LeaveAlternateScreen)
-        // Plus SGR reset (`\x1b[0m`) and cursor-show (`\x1b[?25h`).
         let _ = stdout.write_all(
             b"\x1b[0m\
               \x1b[?25h\

@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 
 use compact_str::CompactString;
 use crossterm::event;
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
@@ -55,7 +55,7 @@ use crate::shell;
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
 use crate::ui::picker::ListPicker;
-use crate::ui::renderer::{LineEntry, Renderer, copy_to_clipboard};
+use crate::ui::renderer::{LineEntry, Renderer};
 use crate::ui::slash::{handle_compress, handle_slash};
 use crate::ui::status::StatusLine;
 use crate::ui::terminal::TerminalGuard;
@@ -1126,37 +1126,6 @@ pub async fn run_interactive(
                         break;
                     }
                 }
-                Ok(event::Event::Mouse(m)) => match m.kind {
-                    MouseEventKind::ScrollUp => {
-                        if user_tx_clone.blocking_send(UserEvent::ScrollUp).is_err() {
-                            break;
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if user_tx_clone.blocking_send(UserEvent::ScrollDown).is_err() {
-                            break;
-                        }
-                    }
-                    MouseEventKind::Down(btn) if btn == MouseButton::Left => {
-                        let _ = user_tx_clone.blocking_send(UserEvent::MouseDown {
-                            row: m.row,
-                            col: m.column,
-                        });
-                    }
-                    MouseEventKind::Drag(btn) if btn == MouseButton::Left => {
-                        let _ = user_tx_clone.blocking_send(UserEvent::MouseDrag {
-                            row: m.row,
-                            col: m.column,
-                        });
-                    }
-                    MouseEventKind::Up(btn) if btn == MouseButton::Left => {
-                        let _ = user_tx_clone.blocking_send(UserEvent::MouseUp {
-                            row: m.row,
-                            col: m.column,
-                        });
-                    }
-                    _ => {}
-                },
                 Ok(event::Event::Paste(text)) => {
                     if user_tx_clone.blocking_send(UserEvent::Paste(text)).is_err() {
                         break;
@@ -1315,56 +1284,6 @@ pub async fn run_interactive(
         tokio::select! {
             Some(ev) = user_rx.recv() => {
                 match ev {
-                    UserEvent::ScrollUp => {
-                        renderer.scroll_line_up();
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                            is_running,
-                        )?;
-                        continue;
-                    }
-                    UserEvent::ScrollDown => {
-                        renderer.scroll_line_down();
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                            is_running,
-                        )?;
-                        continue;
-                    }
-                    UserEvent::MouseDown { row, col } => {
-                        if row < renderer.visible_lines() as u16
-                            && let Some(pos) = renderer.buffer_pos_at(row, col)
-                        {
-                            renderer.selection_active = true;
-                            renderer.selection_start = Some(pos);
-                            renderer.selection_end = Some(pos);
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                        }
-                        continue;
-                    }
-                    UserEvent::MouseDrag { row, col } => {
-                        if renderer.selection_active
-                            && let Some(pos) = renderer.buffer_pos_at(row, col)
-                        {
-                            renderer.selection_end = Some(pos);
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                        }
-                        continue;
-                    }
                     UserEvent::Paste(text) => {
                         input.handle_paste(&text);
                         renderer.draw_bottom(
@@ -1385,24 +1304,6 @@ pub async fn run_interactive(
                             &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
                             is_running,
                         )?;
-                        continue;
-                    }
-                    UserEvent::MouseUp { row, col } => {
-                        if renderer.selection_active {
-                            if let Some(pos) = renderer.buffer_pos_at(row, col) {
-                                renderer.selection_end = Some(pos);
-                            }
-                            if let Some(text) = renderer.selected_text() {
-                                copy_to_clipboard(&text);
-                            }
-                            renderer.clear_selection();
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                        }
                         continue;
                     }
                     UserEvent::Key(key) => {
@@ -1501,331 +1402,6 @@ pub async fn run_interactive(
                             continue;
                         }
 
-                        if renderer.selection_active && key.code == KeyCode::Char('y') {
-                            if let Some(text) = renderer.selected_text() {
-                                copy_to_clipboard(&text);
-                                write_outside_chamber(
-                                    &mut renderer,
-                                    &mut last_tool_name,
-                                    &mut tool_chamber_open,
-                                    &mut chamber_top_start,
-                                    &mut chamber_top_end,
-                                    "copied selection",
-                                    Color::Green,
-                                )?;
-                            }
-                            renderer.clear_selection();
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-                        // dirge-ov2 Phase B: Ctrl-X is reclaimed for
-                        // the /tasks subagent-chat picker (matches
-                        // maki's binding). The previous "drop queued
-                        // interjection" behavior moves to Alt+X. The
-                        // queued-message footer below now reads
-                        // "Alt+X drops" instead of "Ctrl+X drops" —
-                        // surfaced wherever the queue hint is shown.
-                        let alt_x = key.code == KeyCode::Char('x')
-                            && key.modifiers.contains(KeyModifiers::ALT);
-                        if alt_x && !interjection_queue.is_empty() {
-                            interjection_queue.pop_back();
-                            write_outside_chamber(
-                                &mut renderer,
-                                &mut last_tool_name,
-                                &mut tool_chamber_open,
-                                    &mut chamber_top_start,
-                                    &mut chamber_top_end,
-                                &format!(
-                                    "dropped 1 queued message ({} remaining)",
-                                    interjection_queue.len()
-                                ),
-                                theme::dim(),
-                            )?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-
-                        // dirge-ov2 Phase B: Ctrl-N cycles to the next
-                        // chat (subagent window). Wraps to first chat
-                        // after the last; no-op when only one chat
-                        // exists. Mirrors maki's NEXT_CHAT binding
-                        // (`components/keybindings.rs:136`).
-                        let ctrl_n = key.code == KeyCode::Char('n')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_n && renderer.chat_count() > 1 {
-                            let cur = renderer.active_chat();
-                            let next = (cur + 1) % renderer.chat_count();
-                            // dirge-ov2 Phase C: stash this chat's
-                            // streaming state, hop to the next chat,
-                            // load its state. Hot-path locals stay
-                            // pointing at the active chat throughout.
-                            save_chat_ui_state(
-                                &mut chat_ui_states[cur],
-                                &mut response_buf, &mut response_start_line,
-                                &mut reasoning_buf, &mut reasoning_start_line,
-                                &mut last_tool_name, &mut last_tool_call_id,
-                                &mut tool_chamber_open, &mut agent_line_started,
-                                &mut was_reasoning, &mut tool_calls_buf,
-                                &mut tool_calls_this_run,
-                            );
-                            renderer.switch_chat(next);
-                            // Ensure chat_ui_states has a slot for
-                            // the target chat (subagent chats added
-                            // by Phase D push entries; defensive
-                            // here in case of ordering bugs).
-                            while chat_ui_states.len() < renderer.chat_count() {
-                                chat_ui_states.push(ChatUiState::empty());
-                            }
-                            load_chat_ui_state(
-                                &mut chat_ui_states[next],
-                                &mut response_buf, &mut response_start_line,
-                                &mut reasoning_buf, &mut reasoning_start_line,
-                                &mut last_tool_name, &mut last_tool_call_id,
-                                &mut tool_chamber_open, &mut agent_line_started,
-                                &mut was_reasoning, &mut tool_calls_buf,
-                                &mut tool_calls_this_run,
-                            );
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-
-                        // dirge-ov2 Phase B: Ctrl-P cycles to the
-                        // previous chat. Mirrors maki's PREV_CHAT
-                        // binding (`components/keybindings.rs:135`).
-                        let ctrl_p = key.code == KeyCode::Char('p')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_p && renderer.chat_count() > 1 {
-                            let cur = renderer.active_chat();
-                            let count = renderer.chat_count();
-                            let prev = (cur + count - 1) % count;
-                            save_chat_ui_state(
-                                &mut chat_ui_states[cur],
-                                &mut response_buf, &mut response_start_line,
-                                &mut reasoning_buf, &mut reasoning_start_line,
-                                &mut last_tool_name, &mut last_tool_call_id,
-                                &mut tool_chamber_open, &mut agent_line_started,
-                                &mut was_reasoning, &mut tool_calls_buf,
-                                &mut tool_calls_this_run,
-                            );
-                            renderer.switch_chat(prev);
-                            while chat_ui_states.len() < renderer.chat_count() {
-                                chat_ui_states.push(ChatUiState::empty());
-                            }
-                            load_chat_ui_state(
-                                &mut chat_ui_states[prev],
-                                &mut response_buf, &mut response_start_line,
-                                &mut reasoning_buf, &mut reasoning_start_line,
-                                &mut last_tool_name, &mut last_tool_call_id,
-                                &mut tool_chamber_open, &mut agent_line_started,
-                                &mut was_reasoning, &mut tool_calls_buf,
-                                &mut tool_calls_this_run,
-                            );
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-
-                        // dirge-ov2 Phase B: Ctrl-X opens the /tasks
-                        // picker — same effect as typing `/tasks`.
-                        // No-op when only the main chat exists
-                        // (nothing to switch between). Maki's TASKS
-                        // keybinding (`components/keybindings.rs`,
-                        // `ctrl_bind!('x')`).
-                        let ctrl_x = key.code == KeyCode::Char('x')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_x && renderer.chat_count() > 1 {
-                            let cur = renderer.active_chat();
-                            let next = (cur + 1) % renderer.chat_count();
-                            save_chat_ui_state(
-                                &mut chat_ui_states[cur],
-                                &mut response_buf, &mut response_start_line,
-                                &mut reasoning_buf, &mut reasoning_start_line,
-                                &mut last_tool_name, &mut last_tool_call_id,
-                                &mut tool_chamber_open, &mut agent_line_started,
-                                &mut was_reasoning, &mut tool_calls_buf,
-                                &mut tool_calls_this_run,
-                            );
-                            renderer.switch_chat(next);
-                            while chat_ui_states.len() < renderer.chat_count() {
-                                chat_ui_states.push(ChatUiState::empty());
-                            }
-                            load_chat_ui_state(
-                                &mut chat_ui_states[next],
-                                &mut response_buf, &mut response_start_line,
-                                &mut reasoning_buf, &mut reasoning_start_line,
-                                &mut last_tool_name, &mut last_tool_call_id,
-                                &mut tool_chamber_open, &mut agent_line_started,
-                                &mut was_reasoning, &mut tool_calls_buf,
-                                &mut tool_calls_this_run,
-                            );
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-
-                        // Ctrl+O — expand the most-recent collapsed
-                        // tool result. We re-print it as a fresh
-                        // chamber below the current chat so the user
-                        // sees the full body. Older collapsed results
-                        // are not addressable (they scroll into chat
-                        // history as collapsed); this matches the
-                        // "last one only" scope chosen during design.
-                        let ctrl_o = key.code == KeyCode::Char('o')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_o {
-                            // Review #5: `.as_ref().cloned()` instead
-                            // of `.take()` so Ctrl+O is re-pressable
-                            // — the body is still in scrollback from
-                            // the first expand, but a second press
-                            // would be confusing if it reported
-                            // "nothing to expand". The stash is
-                            // overwritten on the next collapse (or
-                            // cleared on prompt-send / Done /
-                            // ContextOverflow respawn for
-                            // turn-scope hygiene, see review #4).
-                            if let Some(c) = last_collapsed.as_ref().cloned() {
-                                let max_chars = cfg.resolve_tool_result_max_chars();
-                                render_collapsed_in_full(&mut renderer, &c, max_chars)?;
-                            } else {
-                                renderer.write_line(
-                                    "  ↳ nothing to expand (no collapsed tool result in this turn)",
-                                    theme::dim(),
-                                )?;
-                            }
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(
-                                    StatusLine::render(
-                                        session,
-                                        is_running,
-                                        0,
-                                        loop_label.as_deref(),
-                                        context.current_prompt_name.as_deref(),
-                                        perm_mode().as_deref(),
-                                    ),
-                                    interjection_queue.len(),
-                                ),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-
-                        let ctrl_f = key.code == KeyCode::Char('f')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if ctrl_f && !search_active && !rewind_picker.active {
-                            search_active = true;
-                            search_query.clear();
-                            search_matches.clear();
-                            search_selected = 0;
-                            update_search(&renderer, &search_query, &mut search_matches, &mut search_selected);
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            draw_search_bar(&search_query, &search_matches, search_selected)?;
-                            continue;
-                        }
-
-                        if search_active {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    search_active = false;
-                                    last_esc = None;
-                                    renderer.render_viewport()?;
-                                    renderer.draw_bottom(
-                                        &input,
-                                        &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                        is_running,
-                                    )?;
-                                    continue;
-                                }
-                                KeyCode::Enter => {
-                                    if let Some(&line) = search_matches.get(search_selected) {
-                                        renderer.scroll_to_line(line);
-                                    }
-                                    search_active = false;
-                                    renderer.render_viewport()?;
-                                    renderer.draw_bottom(
-                                        &input,
-                                        &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                        is_running,
-                                    )?;
-                                    continue;
-                                }
-                                KeyCode::Up => {
-                                    if search_selected > 0 {
-                                        search_selected -= 1;
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if search_selected + 1 < search_matches.len() {
-                                        search_selected += 1;
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    search_query.pop();
-                                    update_search(&renderer, &search_query, &mut search_matches, &mut search_selected);
-                                }
-                                KeyCode::Char(c) => {
-                                    search_query.push(c);
-                                    update_search(&renderer, &search_query, &mut search_matches, &mut search_selected);
-                                }
-                                _ => {}
-                            }
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            draw_search_bar(&search_query, &search_matches, search_selected)?;
-                            continue;
-                        }
-
-                        if key.code == KeyCode::Esc && rewind_picker.active {
-                            rewind_picker.deactivate();
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-
-                        if renderer.selection_active && key.code == KeyCode::Esc {
-                            renderer.clear_selection();
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                is_running,
-                            )?;
-                            continue;
-                        }
-
                         if key.code == KeyCode::Esc && is_running {
                             is_running = false;
                             if let Some(h) = agent_abort.take() { h.abort(); }
@@ -1880,7 +1456,7 @@ pub async fn run_interactive(
                             continue;
                         }
 
-                        if key.code == KeyCode::Esc && !is_running && !renderer.selection_active {
+                        if key.code == KeyCode::Esc && !is_running {
                             let now = std::time::Instant::now();
                             if let Some(prev) = last_esc {
                                 if now.duration_since(prev) < std::time::Duration::from_millis(1500) {
@@ -4101,14 +3677,6 @@ pub async fn run_interactive(
                                 // events were dropped on the floor
                                 // inside this loop, locking the chat
                                 // viewport.
-                                UserEvent::ScrollUp => {
-                                    renderer.scroll_line_up();
-                                    renderer.render_viewport()?;
-                                }
-                                UserEvent::ScrollDown => {
-                                    renderer.scroll_line_down();
-                                    renderer.render_viewport()?;
-                                }
                                 _ => {}
                             }
                         }
@@ -4897,8 +4465,7 @@ pub async fn run_interactive(
                                             _ => deferred.push(UserEvent::Key(key)),
                                         }
                                     } else {
-                                        // Paste, Mouse*, ScrollUp/Down,
-                                        // Resize, etc. Hand them back after
+                                        // Paste, Resize, etc. Hand them back after
                                         // the dialog so the main loop arms
                                         // can handle them as usual.
                                         deferred.push(ev);

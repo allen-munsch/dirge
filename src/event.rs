@@ -157,20 +157,6 @@ pub enum AgentEvent {
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Key(crossterm::event::KeyEvent),
-    ScrollUp,
-    ScrollDown,
-    MouseDown {
-        row: u16,
-        col: u16,
-    },
-    MouseDrag {
-        row: u16,
-        col: u16,
-    },
-    MouseUp {
-        row: u16,
-        col: u16,
-    },
     Paste(String),
     /// Terminal was resized. Carries no payload — the renderer queries
     /// `crossterm::terminal::size()` directly; the variant is just a kick
