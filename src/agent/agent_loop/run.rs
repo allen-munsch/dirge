@@ -498,6 +498,7 @@ mod tests {
             request_timeout: None,
             provider_name: None,
             model_name: None,
+            compact_model: None,
         }
     }
 
@@ -962,7 +963,10 @@ mod tests {
                 // Second call: check for "interrupt" in messages.
                 let found = llm_ctx.messages.iter().any(|m| {
                     m.get("role").and_then(|r| r.as_str()) == Some("user")
-                        && m.get("content").and_then(|c| c.as_str()) == Some("interrupt")
+                        && m.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.contains("interrupt"))
+                            == Some(true)
                 });
                 *saw_clone.lock().unwrap() = found;
             }

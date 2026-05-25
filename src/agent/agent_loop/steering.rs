@@ -30,6 +30,17 @@ use super::hooks::GetSteeringMessagesFn;
 use super::message::{LoopMessage, UserMessage};
 use super::types::QueueMode;
 
+/// Port of Reasonix `MID_TURN_STEER_WRAPPER` (loop.ts:54-55).
+/// Prepended to every steering message so the model doesn't
+/// treat it as a new task and abandon the current one.
+pub const MID_TURN_STEER_WRAPPER: &str = "[Mid-turn steer queued by the user. Do not treat this as a new task; use it only as additional guidance for the current task after completing the current step.]";
+
+/// Wrap steering content with the mid-turn steering preamble.
+/// Port of Reasonix `formatSteerUserMessage` (loop.ts:57-59).
+pub fn format_steer_user_message(content: &str) -> String {
+    [MID_TURN_STEER_WRAPPER, content].join("\n")
+}
+
 /// Build a `GetSteeringMessagesFn` that drains from a shared
 /// `Arc<Mutex<VecDeque<String>>>` according to `mode`.
 ///
@@ -55,7 +66,15 @@ pub fn steering_from_queue(
             };
             drained
                 .into_iter()
-                .map(|content| LoopMessage::User(UserMessage { content }))
+                .map(|content| {
+                    LoopMessage::User(UserMessage {
+                        // Port of Reasonix loop.ts:740-743 —
+                        // wrap every steering message with the
+                        // mid-turn preamble so the model doesn't
+                        // abandon the current task.
+                        content: format_steer_user_message(&content),
+                    })
+                })
                 .collect()
         })
     })
@@ -93,7 +112,7 @@ where
                 .into_iter()
                 .map(|content| {
                     LoopMessage::User(UserMessage {
-                        content: sanitize(&content),
+                        content: format_steer_user_message(&sanitize(&content)),
                     })
                 })
                 .collect()
@@ -116,7 +135,8 @@ mod tests {
     }
 
     /// `QueueMode::All` drains every queued string in FIFO
-    /// order and wraps each as `LoopMessage::User`.
+    /// order and wraps each as `LoopMessage::User` with the
+    /// mid-turn steer wrapper prepended (Reasonix loop.ts:54-58).
     #[tokio::test]
     async fn all_mode_drains_fifo() {
         let queue = Arc::new(Mutex::new(VecDeque::<String>::from(vec![
@@ -134,13 +154,18 @@ mod tests {
                 _ => panic!("expected User"),
             })
             .collect();
-        assert_eq!(contents, vec!["first", "second", "third"]);
+        // Each message is wrapped with the steer wrapper preamble.
+        assert!(contents[0].starts_with(MID_TURN_STEER_WRAPPER));
+        assert!(contents[0].ends_with("first"));
+        assert!(contents[1].ends_with("second"));
+        assert!(contents[2].ends_with("third"));
         // Queue is empty after drain.
         assert!(queue.lock().unwrap().is_empty());
     }
 
     /// `QueueMode::OneAtATime` drains only the oldest per poll;
-    /// subsequent polls drain the next.
+    /// subsequent polls drain the next. Each wrapped with the
+    /// mid-turn steer wrapper.
     #[tokio::test]
     async fn one_at_a_time_drains_oldest_only() {
         let queue = Arc::new(Mutex::new(VecDeque::<String>::from(vec![
@@ -153,7 +178,7 @@ mod tests {
         assert_eq!(m1.len(), 1);
         assert!(matches!(
             &m1[0],
-            LoopMessage::User(u) if u.content == "first"
+            LoopMessage::User(u) if u.content.starts_with(MID_TURN_STEER_WRAPPER) && u.content.ends_with("first")
         ));
 
         // One left.
@@ -163,7 +188,7 @@ mod tests {
         assert_eq!(m2.len(), 1);
         assert!(matches!(
             &m2[0],
-            LoopMessage::User(u) if u.content == "second"
+            LoopMessage::User(u) if u.content.contains("second")
         ));
 
         // Empty now.
@@ -191,12 +216,12 @@ mod tests {
         .await
         .unwrap();
 
-        // Second poll: sees the new message.
+        // Second poll: sees the new message, wrapped with steer preamble.
         let messages = hook().await;
         assert_eq!(messages.len(), 1);
         assert!(matches!(
             &messages[0],
-            LoopMessage::User(u) if u.content == "mid-run"
+            LoopMessage::User(u) if u.content.starts_with(MID_TURN_STEER_WRAPPER) && u.content.ends_with("mid-run")
         ));
     }
 
@@ -223,8 +248,10 @@ mod tests {
             })
             .collect();
         // ESC stripped from the first; second untouched.
-        assert_eq!(contents[0], "hello[31m world");
-        assert_eq!(contents[1], "plain");
+        // Both wrapped with the steer preamble.
+        assert!(contents[0].starts_with(MID_TURN_STEER_WRAPPER));
+        assert!(contents[0].contains("hello[31m world"));
+        assert!(contents[1].contains("plain"));
     }
 
     /// Same queue can be polled concurrently — Mutex serializes
@@ -342,7 +369,10 @@ mod tests {
                 // Second call: inspect ctx for the interrupt.
                 let found = llm_ctx.messages.iter().any(|m| {
                     m.get("role").and_then(|r| r.as_str()) == Some("user")
-                        && m.get("content").and_then(|c| c.as_str()) == Some("interrupt")
+                        && m.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.contains("interrupt"))
+                            == Some(true)
                 });
                 *saw_clone.lock().unwrap() = found;
             } else if n == 0 {
@@ -407,6 +437,7 @@ mod tests {
             request_timeout: None,
             provider_name: None,
             model_name: None,
+            compact_model: None,
         };
         config.get_steering_messages = Some(steering_from_queue(queue.clone(), QueueMode::All));
 
@@ -432,7 +463,7 @@ mod tests {
         );
 
         // Check messages: user "start" + assistant tool_use +
-        // tool result + user "interrupt" + assistant "done".
+        // tool result + user "interrupt" (wrapped with steer preamble) + assistant "done".
         let user_contents: Vec<String> = messages
             .iter()
             .filter_map(|m| match m {
@@ -440,6 +471,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(user_contents, vec!["start", "interrupt"]);
+        assert_eq!(user_contents[0], "start");
+        assert!(
+            user_contents[1].starts_with(MID_TURN_STEER_WRAPPER),
+            "steering message should be wrapped with preamble"
+        );
+        assert!(user_contents[1].ends_with("interrupt"));
     }
 }

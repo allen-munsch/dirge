@@ -395,6 +395,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         request_timeout: None,
         provider_name: cfg.provider_name.clone(),
         model_name: cfg.model_name.clone(),
+        compact_model: None,
     };
 
     #[cfg(feature = "plugin")]
@@ -747,7 +748,10 @@ mod tests {
             if n == 1 {
                 let found = llm_ctx.messages.iter().any(|m| {
                     m.get("role").and_then(|r| r.as_str()) == Some("user")
-                        && m.get("content").and_then(|c| c.as_str()) == Some("interrupt")
+                        && m.get("content")
+                            .and_then(|c| c.as_str())
+                            .map(|s| s.contains("interrupt"))
+                            == Some(true)
                 });
                 *saw_clone.lock().unwrap() = found;
             } else if n == 0 {

@@ -275,6 +275,13 @@ pub struct LoopConfig {
     /// that fills `provider_name`. `None` is acceptable —
     /// telemetry falls back to an `unknown` placeholder.
     pub model_name: Option<String>,
+
+    /// Port of Reasonix flash-first: hard-code a cheap model for
+    /// mechanical auxiliary calls (fold summaries, healing
+    /// truncation). When `Some`, summarisation and related tasks
+    /// use this model instead of the session model. Reasonix uses
+    /// `deepseek-v4-flash` for all auxiliary work.
+    pub compact_model: Option<String>,
 }
 
 /// `convertToLlm` signature. Synchronous in pi (returns
@@ -349,6 +356,8 @@ impl std::fmt::Debug for LoopConfig {
             .field("metadata", &self.metadata)
             .field("request_timeout", &self.request_timeout)
             .field("provider_name", &self.provider_name)
+            .field("model_name", &self.model_name)
+            .field("compact_model", &self.compact_model)
             .finish()
     }
 }
@@ -374,6 +383,7 @@ impl Clone for LoopConfig {
             request_timeout: self.request_timeout,
             provider_name: self.provider_name.clone(),
             model_name: self.model_name.clone(),
+            compact_model: self.compact_model.clone(),
         }
     }
 }
