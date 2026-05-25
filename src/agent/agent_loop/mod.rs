@@ -28,6 +28,7 @@ pub mod bridge;
 pub mod context_manager;
 #[cfg(test)]
 mod h7_smoke;
+pub mod heal;
 pub mod hooks;
 pub mod inflight;
 pub mod integration;

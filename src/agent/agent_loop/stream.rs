@@ -376,6 +376,7 @@ mod tests {
             request_timeout: None,
             provider_name: None,
             model_name: None,
+            compact_model: None,
         }
     }
 
@@ -668,6 +669,7 @@ mod tests {
             request_timeout: None,
             provider_name: None,
             model_name: None,
+            compact_model: None,
         };
         let signal = AbortSignal::new();
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(32);

@@ -989,6 +989,7 @@ mod tests {
             request_timeout: None,
             provider_name: None,
             model_name: None,
+            compact_model: None,
         }
     }
 
