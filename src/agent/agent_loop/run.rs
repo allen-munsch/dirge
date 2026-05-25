@@ -44,13 +44,13 @@
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+use super::inflight::InflightSet;
 use super::message::{
     AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, ToolResultMessage,
 };
 use super::storm::{StormBreaker, StormReport};
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
-use super::tools::execute_tool_calls;
 use super::types::{Context, LoopConfig};
 
 /// Errors from `run_agent_loop_continue`. Pi throws synchronously
@@ -192,6 +192,11 @@ pub async fn run_loop(
     // stuck-in-a-loop behavior. Reset each new user turn.
     // Port of Reasonix `repair/index.ts:38-46` + `loop.ts:621`.
     let mut storm = StormBreaker::default();
+
+    // Inflight set: authoritative running-id tracker.
+    // UI cards consult `inflight.has(call_id)` to derive spinner state.
+    // Port of Reasonix `loop.ts:147` InflightSet.
+    let inflight = InflightSet::new();
 
     // Pi line 167: initial steering poll.
     let mut pending_messages: Vec<LoopMessage> = match &config.get_steering_messages {
@@ -370,6 +375,7 @@ pub async fn run_loop(
                         &config,
                         &signal,
                         emit,
+                        &inflight,
                     )
                     .await;
                     tool_results.extend(batch.messages.clone());
@@ -500,6 +506,7 @@ async fn execute_tool_calls_with(
     config: &LoopConfig,
     signal: &AbortSignal,
     emit: &mpsc::Sender<LoopEvent>,
+    inflight: &InflightSet,
 ) -> super::tools::ExecutedToolCallBatch {
     use super::ExecutedToolCallBatch;
     let has_sequential = tool_calls.iter().any(|tc| {
@@ -518,6 +525,7 @@ async fn execute_tool_calls_with(
             config,
             signal,
             emit,
+            inflight,
         )
         .await
     } else {
@@ -528,6 +536,7 @@ async fn execute_tool_calls_with(
             config,
             signal,
             emit,
+            inflight,
         )
         .await
     }

@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::hooks::{AfterToolCallContext, BeforeToolCallContext};
+use super::inflight::InflightSet;
 use super::message::{AssistantMessage, ContentBlock, LoopEvent, LoopMessage, ToolResultMessage};
 use super::result::LoopToolResult;
 use super::tool::{AbortSignal, LoopTool, LoopToolUpdate};
@@ -97,6 +98,7 @@ pub async fn execute_tool_calls_sequential(
     config: &LoopConfig,
     signal: &AbortSignal,
     emit: &mpsc::Sender<LoopEvent>,
+    inflight: &InflightSet,
 ) -> ExecutedToolCallBatch {
     let mut finalized_calls: Vec<FinalizedOutcome> = Vec::with_capacity(tool_calls.len());
     let mut messages: Vec<ToolResultMessage> = Vec::with_capacity(tool_calls.len());
@@ -110,6 +112,9 @@ pub async fn execute_tool_calls_sequential(
                 args: tool_call.arguments.clone(),
             })
             .await;
+
+        // Inflight: add at dispatch entry. Idempotent.
+        inflight.add(&tool_call.id);
 
         // 2. prepare
         let prepared =
@@ -143,6 +148,9 @@ pub async fn execute_tool_calls_sequential(
         // 5. tool-result message
         let result_msg = create_tool_result_message(&finalized);
         emit_tool_result_message(&result_msg, emit).await;
+
+        // Finally-contract: delete from inflight.
+        inflight.delete(&tool_call.id);
 
         finalized_calls.push(finalized);
         messages.push(result_msg);
@@ -579,6 +587,7 @@ pub async fn execute_tool_calls_parallel(
     config: &LoopConfig,
     signal: &AbortSignal,
     emit: &mpsc::Sender<LoopEvent>,
+    inflight: &InflightSet,
 ) -> ExecutedToolCallBatch {
     use futures::future::join_all;
     use std::pin::Pin;
@@ -622,12 +631,15 @@ pub async fn execute_tool_calls_parallel(
                 // tool_execution_end at the end. The
                 // tool_execution_end ordering THEREFORE matches
                 // completion order, not source order.
+                inflight.add(&tool_call.id);
                 let tool_call_clone = tool_call.clone();
                 let assistant_clone = assistant_message.clone();
                 let config_clone = config.clone();
                 let context_clone = context.clone();
                 let signal_clone = signal.clone();
                 let emit_clone = emit.clone();
+                let inflight_clone = inflight.clone();
+                let call_id = tool_call.id.clone();
                 entries.push(Box::pin(async move {
                     let executed = execute_prepared_tool_call(
                         &tool,
@@ -650,6 +662,8 @@ pub async fn execute_tool_calls_parallel(
                     // difference from sequential (which emits
                     // end immediately after each call).
                     emit_tool_execution_end(&finalized, &emit_clone).await;
+                    // Finally-contract: delete from inflight.
+                    inflight_clone.delete(&call_id);
                     finalized
                 }));
                 if signal.is_cancelled() {
@@ -695,6 +709,7 @@ pub async fn execute_tool_calls(
     config: &LoopConfig,
     signal: &AbortSignal,
     emit: &mpsc::Sender<LoopEvent>,
+    inflight: &InflightSet,
 ) -> ExecutedToolCallBatch {
     let tool_calls = extract_tool_calls(assistant_message);
     let has_sequential = tool_calls.iter().any(|tc| {
@@ -713,6 +728,7 @@ pub async fn execute_tool_calls(
             config,
             signal,
             emit,
+            inflight,
         )
         .await
     } else {
@@ -723,6 +739,7 @@ pub async fn execute_tool_calls(
             config,
             signal,
             emit,
+            inflight,
         )
         .await
     }
@@ -1015,6 +1032,7 @@ mod tests {
             &config,
             &signal,
             &tx,
+            &InflightSet::new(),
         )
         .await;
         drop(tx);
@@ -1088,6 +1106,7 @@ mod tests {
             &config,
             &signal,
             &tx,
+            &InflightSet::new(),
         )
         .await;
         drop(tx);
@@ -1143,6 +1162,7 @@ mod tests {
             &config,
             &signal,
             &tx,
+            &InflightSet::new(),
         )
         .await;
         drop(tx);
@@ -1186,6 +1206,7 @@ mod tests {
             &config,
             &signal,
             &tx,
+            &InflightSet::new(),
         )
         .await;
         assert!(
@@ -1235,6 +1256,7 @@ mod tests {
             &config,
             &signal,
             &tx,
+            &InflightSet::new(),
         )
         .await;
         assert!(
@@ -1270,6 +1292,7 @@ mod tests {
             &config,
             &signal,
             &tx,
+            &InflightSet::new(),
         )
         .await;
         assert_eq!(batch.messages.len(), 1);
@@ -1323,6 +1346,7 @@ mod tests {
             &config,
             &signal,
             &tx,
+            &InflightSet::new(),
         )
         .await;
 
@@ -1428,8 +1452,16 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
         let signal = AbortSignal::new();
-        let _batch =
-            execute_tool_calls_parallel(&context, &assistant, &calls, &config, &signal, &tx).await;
+        let _batch = execute_tool_calls_parallel(
+            &context,
+            &assistant,
+            &calls,
+            &config,
+            &signal,
+            &tx,
+            &InflightSet::new(),
+        )
+        .await;
         drop(tx);
 
         // Drain events; collect ordering observations.
@@ -1498,7 +1530,15 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
         let signal = AbortSignal::new();
-        let batch = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        let batch = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &signal,
+            &tx,
+            &InflightSet::new(),
+        )
+        .await;
         drop(tx);
 
         // Sequential dispatch: max concurrency == 1.
@@ -1554,7 +1594,15 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
         let signal = AbortSignal::new();
-        let _ = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        let _ = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &signal,
+            &tx,
+            &InflightSet::new(),
+        )
+        .await;
         drop(tx);
 
         // Neither tool ever saw concurrency > 1.
@@ -1582,7 +1630,15 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
         let signal = AbortSignal::new();
-        let _ = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        let _ = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &signal,
+            &tx,
+            &InflightSet::new(),
+        )
+        .await;
         drop(tx);
 
         let (_current, max) = echo.concurrency_snapshot();
@@ -1629,7 +1685,15 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
         let signal = AbortSignal::new();
-        let batch = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        let batch = execute_tool_calls(
+            &context,
+            &assistant,
+            &config,
+            &signal,
+            &tx,
+            &InflightSet::new(),
+        )
+        .await;
         drop(tx);
 
         assert!(
@@ -1667,8 +1731,16 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
         let signal = AbortSignal::new();
-        let batch =
-            execute_tool_calls_parallel(&context, &assistant, &calls, &config, &signal, &tx).await;
+        let batch = execute_tool_calls_parallel(
+            &context,
+            &assistant,
+            &calls,
+            &config,
+            &signal,
+            &tx,
+            &InflightSet::new(),
+        )
+        .await;
         drop(tx);
 
         // First result is an error (tool not found); second is ok.
@@ -1785,8 +1857,16 @@ mod tests {
         let cfg = build_config();
         let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
         let started = std::time::Instant::now();
-        let batch =
-            execute_tool_calls_sequential(&ctx, &assistant, &calls, &cfg, &signal, &tx).await;
+        let batch = execute_tool_calls_sequential(
+            &ctx,
+            &assistant,
+            &calls,
+            &cfg,
+            &signal,
+            &tx,
+            &InflightSet::new(),
+        )
+        .await;
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_secs(1),
