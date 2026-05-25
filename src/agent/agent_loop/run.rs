@@ -47,6 +47,7 @@ use tokio::sync::mpsc;
 use super::message::{
     AssistantMessage, ContentBlock, LoopEvent, LoopMessage, StopReason, ToolResultMessage,
 };
+use super::storm::{StormBreaker, StormReport};
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
 use super::tools::execute_tool_calls;
@@ -187,6 +188,11 @@ pub async fn run_loop(
 ) -> Vec<LoopMessage> {
     let mut first_turn = true;
 
+    // Storm breaker: tracks (tool_name, args) repeats to detect
+    // stuck-in-a-loop behavior. Reset each new user turn.
+    // Port of Reasonix `repair/index.ts:38-46` + `loop.ts:621`.
+    let mut storm = StormBreaker::default();
+
     // Pi line 167: initial steering poll.
     let mut pending_messages: Vec<LoopMessage> = match &config.get_steering_messages {
         Some(get) => get().await,
@@ -194,6 +200,10 @@ pub async fn run_loop(
     };
 
     'outer: loop {
+        // Storm: fresh intent on each new user turn.
+        // Port of Reasonix loop.ts:621 `this.repair.resetStorm()`.
+        storm.reset();
+        let mut turn_self_corrected = false;
         let mut has_more_tool_calls = true;
 
         // Pi line 174: INNER LOOP.
@@ -261,14 +271,63 @@ pub async fn run_loop(
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
             has_more_tool_calls = false;
             if !tool_calls.is_empty() {
-                let batch =
-                    execute_tool_calls(&current_context, &assistant_msg, &config, &signal, emit)
-                        .await;
-                tool_results = batch.messages;
-                has_more_tool_calls = !batch.terminate;
-                for result in &tool_results {
-                    current_context.messages.push(tool_result_to_value(result));
-                    new_messages.push(LoopMessage::ToolResult(result.clone()));
+                let original_count = tool_calls.len();
+                let (surviving_calls, storm_report) = storm.filter_calls(&tool_calls);
+                let all_suppressed = storm_report.all_suppressed(original_count);
+
+                // Port of Reasonix loop.ts:935-956 — first-time
+                // all-suppressed: self-correction. Stub tool
+                // results with a guard message and give the model
+                // one shot to self-correct before the loud-warning
+                // path.
+                if all_suppressed && !turn_self_corrected {
+                    turn_self_corrected = true;
+                    let guard_text = "[repeat-loop guard] this call was suppressed because it was identical to a previous call in this turn. Earlier results for it are above — try a meaningfully different approach, or stop and answer if you have enough.";
+                    let guard_blocks = vec![ContentBlock::Text {
+                        text: guard_text.to_string(),
+                    }];
+                    for call in &tool_calls {
+                        let tr = ToolResultMessage {
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            content: guard_blocks.clone(),
+                            details: Value::Null,
+                            is_error: false,
+                        };
+                        current_context.messages.push(tool_result_to_value(&tr));
+                        new_messages.push(LoopMessage::ToolResult(tr.clone()));
+                        tool_results.push(tr);
+                    }
+                    // Surface the self-correction as a tool result
+                    // with a guard text — the model sees it as
+                    // output for its suppressed tool calls.
+                    has_more_tool_calls = true;
+                } else if storm_report.storms_broken > 0 && surviving_calls.is_empty() {
+                    // Port of Reasonix loop.ts:975-982:
+                    // no calls left, all suppressed and already
+                    // self-corrected. Model is stuck — no more
+                    // tool calls to dispatch, exit the inner
+                    // loop.
+                    has_more_tool_calls = false;
+                }
+
+                // Dispatch surviving calls.
+                if !surviving_calls.is_empty() {
+                    let batch = execute_tool_calls_with(
+                        &current_context,
+                        &assistant_msg,
+                        &surviving_calls,
+                        &config,
+                        &signal,
+                        emit,
+                    )
+                    .await;
+                    tool_results.extend(batch.messages.clone());
+                    has_more_tool_calls = !batch.terminate;
+                    for result in &batch.messages {
+                        current_context.messages.push(tool_result_to_value(result));
+                        new_messages.push(LoopMessage::ToolResult(result.clone()));
+                    }
                 }
             }
 
@@ -378,6 +437,50 @@ pub async fn run_loop(
 /// inline so `run.rs` doesn't reach into `tools` for tiny helpers.
 fn extract_tool_calls_from(msg: &AssistantMessage) -> Vec<super::tools::ToolCall> {
     super::tools::extract_tool_calls(msg)
+}
+
+/// Dispatch pre-filtered tool calls (after storm breaker has
+/// removed suppressed calls). Mirrors the dispatch logic in
+/// `execute_tool_calls` but takes the calls directly instead of
+/// extracting from the assistant message.
+async fn execute_tool_calls_with(
+    context: &Context,
+    assistant_message: &AssistantMessage,
+    tool_calls: &[super::tools::ToolCall],
+    config: &LoopConfig,
+    signal: &AbortSignal,
+    emit: &mpsc::Sender<LoopEvent>,
+) -> super::tools::ExecutedToolCallBatch {
+    use super::ExecutedToolCallBatch;
+    let has_sequential = tool_calls.iter().any(|tc| {
+        context
+            .tools
+            .iter()
+            .find(|t| t.name() == tc.name)
+            .and_then(|t| t.execution_mode())
+            == Some(super::ToolExecutionMode::Sequential)
+    });
+    if config.tool_execution == super::ToolExecutionMode::Sequential || has_sequential {
+        super::tools::execute_tool_calls_sequential(
+            context,
+            assistant_message,
+            tool_calls,
+            config,
+            signal,
+            emit,
+        )
+        .await
+    } else {
+        super::tools::execute_tool_calls_parallel(
+            context,
+            assistant_message,
+            tool_calls,
+            config,
+            signal,
+            emit,
+        )
+        .await
+    }
 }
 
 /// Convert a `LoopMessage` to the placeholder `Value` shape used

@@ -39,6 +39,7 @@ pub mod rig_stream_factory;
 pub mod rig_tool;
 pub mod run;
 pub mod steering;
+pub mod storm;
 pub mod stream;
 pub mod tool;
 pub mod tool_input_repair;
