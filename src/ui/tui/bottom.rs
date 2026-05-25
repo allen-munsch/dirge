@@ -103,8 +103,18 @@ impl<'a> Widget for BottomStrip<'a> {
         paint_avatar_box(buf, l.avatar_box, self.avatar.as_ref(), self.border_style);
         match self.body.as_ref() {
             Some(BottomBody::Editor {
-                rows, is_running, completion_preview, ..
-            }) => paint_editor_box(buf, l.input_box, rows, *is_running, completion_preview, self.border_style),
+                rows,
+                is_running,
+                completion_preview,
+                ..
+            }) => paint_editor_box(
+                buf,
+                l.input_box,
+                rows,
+                *is_running,
+                completion_preview,
+                self.border_style,
+            ),
             Some(BottomBody::Overlay { title, lines }) => {
                 paint_overlay_box(buf, l.input_box, title, lines, self.border_style)
             }
@@ -293,7 +303,6 @@ fn paint_editor_box(
         buf.set_stringn(text_x, preview_y, completion_preview, text_avail, dim);
     }
 }
-
 
 /// Return the display width of a `label:` prefix at the start of
 /// `text`, or 0 if there is no such prefix. The label must be all

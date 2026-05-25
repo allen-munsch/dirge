@@ -2001,10 +2001,7 @@ pub fn builtin_commands() -> Vec<&'static str> {
 /// to fit within `avail_w` display cells (after the continuation
 /// prompt), showing as many upcoming command names as will fit.
 #[cfg(feature = "experimental-ui-tab-slash")]
-pub fn format_completion_preview(
-    cr: Option<&CompletionResult>,
-    avail_w: usize,
-) -> String {
+pub fn format_completion_preview(cr: Option<&CompletionResult>, avail_w: usize) -> String {
     let cr = match cr {
         Some(c) => c,
         None => return String::new(),
