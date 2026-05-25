@@ -18,12 +18,6 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbo
 pub struct RustAdapter;
 
 impl RustAdapter {
-    fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
     fn signature(&self, n: Node, s: &[u8]) -> String {
         signature_up_to_body(n, s)
     }
@@ -46,7 +40,7 @@ impl RustAdapter {
         for i in 0..n.named_child_count() {
             let c = n.named_child(i)?;
             if matches!(c.kind(), "identifier" | "type_identifier") {
-                return Some(self.text(c, s).to_string());
+                return Some(node_text(c, s).to_string());
             }
         }
         None
@@ -58,7 +52,7 @@ impl RustAdapter {
     /// attaches its methods to `Foo`, not the generic param `T`.
     fn type_leaf_name(&self, n: Node, s: &[u8]) -> Option<String> {
         match n.kind() {
-            "type_identifier" => Some(self.text(n, s).to_string()),
+            "type_identifier" => Some(node_text(n, s).to_string()),
             "generic_type" | "scoped_type_identifier" => {
                 // First named child is the base type expr.
                 for i in 0..n.named_child_count() {
@@ -82,7 +76,7 @@ impl RustAdapter {
             kind: SymbolKind::Function,
             is_exported: self.is_exported(n),
             name,
-            range: self.range(n),
+            range: ByteRange::from(n),
             signature: self.signature(n, s),
             parent_class: None,
         });
@@ -96,8 +90,8 @@ impl RustAdapter {
             kind: SymbolKind::Class,
             is_exported: self.is_exported(n),
             name,
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
     }
@@ -110,8 +104,8 @@ impl RustAdapter {
             kind: SymbolKind::Interface,
             is_exported: self.is_exported(n),
             name: trait_name.clone(),
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
         // Walk trait body for required-method signatures + provided
@@ -133,7 +127,7 @@ impl RustAdapter {
                         kind: SymbolKind::Method,
                         is_exported: true,
                         name: mname,
-                        range: self.range(m),
+                        range: ByteRange::from(m),
                         signature: self.signature(m, s),
                         parent_class: Some(trait_name.clone()),
                     });
@@ -162,7 +156,7 @@ impl RustAdapter {
                     if let Some(c) = n.named_child(i)
                         && c.kind() == "type_identifier"
                     {
-                        last = Some(self.text(c, s).to_string());
+                        last = Some(node_text(c, s).to_string());
                     }
                 }
                 last
@@ -185,7 +179,7 @@ impl RustAdapter {
                         kind: SymbolKind::Method,
                         is_exported: self.is_exported(m),
                         name: mname,
-                        range: self.range(m),
+                        range: ByteRange::from(m),
                         signature: self.signature(m, s),
                         parent_class: Some(receiving.clone()),
                     });
@@ -202,8 +196,8 @@ impl RustAdapter {
             kind: SymbolKind::TypeAlias,
             is_exported: self.is_exported(n),
             name,
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
     }
@@ -216,7 +210,7 @@ impl RustAdapter {
             if let Some(c) = n.named_child(i)
                 && c.kind() == "identifier"
             {
-                name = Some(self.text(c, s).to_string());
+                name = Some(node_text(c, s).to_string());
                 break;
             }
         }
@@ -225,8 +219,8 @@ impl RustAdapter {
             kind: SymbolKind::Variable,
             is_exported: self.is_exported(n),
             name,
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
     }
@@ -239,8 +233,8 @@ impl RustAdapter {
             kind: SymbolKind::Class,
             is_exported: self.is_exported(n),
             name,
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
         // Inline modules carry a `declaration_list`; file-only
@@ -281,13 +275,13 @@ impl RustAdapter {
             if let Some(c) = n.named_child(i)
                 && c.kind() == "identifier"
             {
-                let name = self.text(c, s).to_string();
+                let name = node_text(c, s).to_string();
                 symbols.push(Symbol {
                     kind: SymbolKind::Function,
                     is_exported: self.is_exported(n),
                     name,
-                    range: self.range(n),
-                    signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+                    range: ByteRange::from(n),
+                    signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
                     parent_class: None,
                 });
                 return;
@@ -315,7 +309,7 @@ impl RustAdapter {
                                 kind: SymbolKind::Function,
                                 is_exported: true,
                                 name,
-                                range: self.range(item),
+                                range: ByteRange::from(item),
                                 signature: self.signature(item, s),
                                 parent_class: None,
                             });
@@ -337,7 +331,7 @@ impl RustAdapter {
             let Some(c) = n.named_child(i) else { continue };
             match c.kind() {
                 "scoped_identifier" | "identifier" | "use_list" | "use_as_clause" => {
-                    let path = self.text(c, s).to_string();
+                    let path = node_text(c, s).to_string();
                     imports.push(Import {
                         names: vec![path.clone()],
                         source: path,

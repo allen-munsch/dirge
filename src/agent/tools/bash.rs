@@ -268,10 +268,8 @@ impl Tool for BashTool {
         // (or passed through to child processes that write to
         // /dev/tty, bypassing our pipe capture). Keep \n (multi-
         // line scripts via `-c`) and \t (indentation).
-        let command = crate::ui::ansi::strip_escapes(
-            &args.command,
-            crate::ui::ansi::StripPolicy::KEEP_BOTH,
-        );
+        let command =
+            crate::ui::ansi::strip_escapes(&args.command, crate::ui::ansi::StripPolicy::KEEP_BOTH);
         check_bash_segments(&self.permission, &self.ask_tx, &command).await?;
 
         // F6: spawn into its own process group so a timeout can

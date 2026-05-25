@@ -1,11 +1,13 @@
+pub mod client;
+pub mod summarize;
+
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use rig::agent::Agent;
 use rig::client::CompletionClient;
-use rig::completion::{CompletionModel, Message, Prompt};
+use rig::completion::{Message, Prompt};
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
-use rig::streaming::StreamingChat;
 
 use crate::agent::builder;
 use crate::agent::prompt;
@@ -16,6 +18,7 @@ use crate::agent::tools::question::QuestionSender;
 use crate::cli::Cli;
 use crate::config::{Config, CustomProviderConfig};
 use crate::context::ContextFiles;
+use crate::event::AgentEvent;
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::permission::ask::AskSender;
@@ -231,7 +234,7 @@ fn provider_env_var_fallbacks(kind: ProviderKind) -> &'static [&'static str] {
     }
 }
 
-fn resolve_api_key(
+pub(crate) fn resolve_api_key(
     kind: ProviderKind,
     api_key_env_override: Option<&str>,
     cli_key: Option<&str>,
@@ -332,7 +335,7 @@ impl AnyClient {
         // window, in which case the summarizer's own context-overflow
         // path surfaces a real error rather than silently lying. Pi
         // and opencode both feed the full prefix.
-        let conversation = serialize_conversation(messages);
+        let conversation = summarize::serialize_conversation(messages);
 
         let prompt = prompt::COMPACTION_PROMPT
             .replace("{conversation}", &conversation)
@@ -340,148 +343,9 @@ impl AnyClient {
             .replace("{instructions}", instructions.unwrap_or("(none)"));
 
         let model = self.completion_model(model_name.to_string());
-        let response = summarize_with_model(model, prompt).await?;
+        let response = summarize::summarize_with_model(model, prompt).await?;
         Ok(response)
     }
-}
-
-async fn summarize_with_model(model: AnyModel, prompt: String) -> anyhow::Result<String> {
-    match model {
-        AnyModel::OpenRouter(m) => run_summarizer(m, prompt).await,
-        AnyModel::OpenAI(m) => run_summarizer(m, prompt).await,
-        AnyModel::Anthropic(m) => run_summarizer(m, prompt).await,
-        AnyModel::Gemini(m) => run_summarizer(m, prompt).await,
-        AnyModel::DeepSeek(m) => run_summarizer(m, prompt).await,
-        AnyModel::Glm(m) => run_summarizer(m, prompt).await,
-        AnyModel::Ollama(m) => run_summarizer(m, prompt).await,
-        AnyModel::Custom(m) => run_summarizer(m, prompt).await,
-    }
-}
-
-async fn run_summarizer<M>(model: M, prompt: String) -> anyhow::Result<String>
-where
-    M: CompletionModel + Clone + 'static,
-    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
-{
-    // Retry loop. The summarizer is invoked by `/compress`, often
-    // exactly when the user's context is about to overflow — a single
-    // transient 503 or rate-limit would otherwise permanently fail
-    // the compaction. Use the same `RecoveryPolicy` shape as the main
-    // agent so the user sees consistent retry semantics. No partial
-    // output is streamed to the UI for the summarizer, so retry is
-    // safe and the response is replaced wholesale on each attempt.
-    use crate::agent::recovery::{self, RecoveryPolicy};
-    let policy = RecoveryPolicy::default();
-    let mut attempts: usize = 0;
-    loop {
-        let agent = rig::agent::AgentBuilder::new(model.clone())
-            .preamble("You are a conversation summarizer.")
-            .build();
-
-        let mut stream = agent
-            .stream_chat(prompt.clone(), Vec::<Message>::new())
-            .multi_turn(1)
-            .await;
-
-        let mut response = String::new();
-        let mut error: Option<String> = None;
-        use futures::StreamExt;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(rig::agent::MultiTurnStreamItem::StreamAssistantItem(
-                    rig::streaming::StreamedAssistantContent::Text(text),
-                )) => response.push_str(&text.text),
-                Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
-                    response = res.response().to_string();
-                    break;
-                }
-                Err(e) => {
-                    error = Some(e.to_string());
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(msg) = error {
-            let kind = recovery::classify_error(&msg);
-            if policy.should_retry(attempts, kind) {
-                let delay = policy.backoff_duration_for_msg(attempts, &msg);
-                tracing::info!(
-                    "summarizer retry {}/{} after {:?} ({:?}): {}",
-                    attempts + 1,
-                    policy.max_retries(),
-                    delay,
-                    kind,
-                    msg
-                );
-                tokio::time::sleep(delay).await;
-                attempts += 1;
-                continue;
-            }
-            return Err(anyhow::anyhow!("Compression failed: {}", msg));
-        }
-
-        if response.is_empty() {
-            anyhow::bail!("Compression returned empty response");
-        }
-
-        return Ok(response);
-    }
-}
-
-fn serialize_conversation(messages: &[SessionMessage]) -> String {
-    // C7 (audit fix): include each assistant message's tool calls.
-    // Previously only `[role]: content` was emitted; msg.tool_calls
-    // (args, results, errors) were invisible to the summarizer. For
-    // tool-heavy sessions that's the bulk of where state diverged
-    // from "just chat" — after compress the LLM had no record that
-    // bash/read/edit ever ran. Pi's compaction prompt includes
-    // structured tool I/O (see pi/.../compaction).
-    let mut result = String::new();
-    for msg in messages {
-        let role_tag = match msg.role {
-            crate::session::MessageRole::User => "User",
-            crate::session::MessageRole::Assistant => "Assistant",
-            crate::session::MessageRole::System => "System",
-        };
-        result.push_str(&format!("[{}]: {}\n", role_tag, msg.content));
-        for tc in &msg.tool_calls {
-            // Args serialized compactly — the summarizer cares about
-            // which tool fired with what shape, not pretty formatting.
-            let args_str = serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".to_string());
-            result.push_str(&format!("[Tool: {}({})]\n", tc.name, args_str));
-            match &tc.state {
-                crate::session::ToolCallState::Completed { result: out } => {
-                    // Cap each individual tool output at 2KB to keep
-                    // the summarizer prompt bounded — full output for
-                    // a 10MB grep would dominate the prompt with low
-                    // signal-per-byte. The truncation here is per-tool
-                    // (not whole-conversation like the C6 fix removed)
-                    // so structure is preserved.
-                    const PER_TOOL_CAP: usize = 2048;
-                    if out.len() > PER_TOOL_CAP {
-                        let trimmed: String = out.chars().take(PER_TOOL_CAP).collect();
-                        result.push_str(&format!(
-                            "[Result: {} ... (truncated, {} bytes total)]\n",
-                            trimmed,
-                            out.len()
-                        ));
-                    } else {
-                        result.push_str(&format!("[Result: {}]\n", out));
-                    }
-                }
-                crate::session::ToolCallState::Interrupted => {
-                    result.push_str("[Result: <interrupted>]\n");
-                }
-                crate::session::ToolCallState::Failed { error } => {
-                    result.push_str(&format!("[Result: <failed: {}>]\n", error));
-                }
-            }
-        }
-        result.push('\n');
-    }
-    result
 }
 
 #[derive(Clone)]
@@ -599,21 +463,164 @@ impl AnyAgent {
     pub async fn run_print(
         &self,
         prompt: &str,
-        max_turns: usize,
+        _max_turns: usize,
         output_format: crate::cli::OutputFormat,
     ) -> anyhow::Result<String> {
-        let t = self.chunk_timeout;
-        let f = output_format;
-        match &self.inner {
-            AnyAgentInner::OpenRouter(a) => runner::run_print(a, prompt, max_turns, t, f).await,
-            AnyAgentInner::OpenAI(a) => runner::run_print(a, prompt, max_turns, t, f).await,
-            AnyAgentInner::Anthropic(a) => runner::run_print(a, prompt, max_turns, t, f).await,
-            AnyAgentInner::Gemini(a) => runner::run_print(a, prompt, max_turns, t, f).await,
-            AnyAgentInner::DeepSeek(a) => runner::run_print(a, prompt, max_turns, t, f).await,
-            AnyAgentInner::Glm(a) => runner::run_print(a, prompt, max_turns, t, f).await,
-            AnyAgentInner::Ollama(a) => runner::run_print(a, prompt, max_turns, t, f).await,
-            AnyAgentInner::Custom(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+        let start_instant = std::time::Instant::now();
+        let session_id = runner::uuid_v4_simple();
+        let mut num_turns: u32 = 0;
+        let suppress_inline = !matches!(output_format, crate::cli::OutputFormat::Text);
+
+        // Plugin `on-prompt` dispatch. Headless modes (--print, --loop)
+        // previously skipped this — plugins that mutate the user prompt
+        // or block it never fired in CI/script contexts.
+        let effective_prompt: String = {
+            #[cfg(feature = "plugin")]
+            {
+                if let Some(pm_arc) = crate::plugin::hook::global() {
+                    let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    runner::resolve_prompt_with_hooks(prompt, &mut mgr)
+                } else {
+                    prompt.to_string()
+                }
+            }
+            #[cfg(not(feature = "plugin"))]
+            {
+                prompt.to_string()
+            }
+        };
+
+        // StreamJson init event — fires once at startup so downstream
+        // tools can pick up cwd/session/model before any turns stream.
+        if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            runner::emit_stream_json_event(serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "cwd": cwd,
+                "session_id": session_id,
+                "tools": Vec::<String>::new(),
+                "model": "",
+            }));
         }
+
+        // Wire through the new agent_loop path: clone the agent (cheap
+        // — Arc internals + refcounts), spawn a runner, and drain the
+        // event channel collecting text.
+        let runner = self
+            .clone()
+            .spawn_runner(effective_prompt.clone(), Vec::new());
+        let task = runner.task;
+        let mut event_rx = runner.event_rx;
+
+        let mut full_response = String::new();
+        let mut had_output = false;
+
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                AgentEvent::Token(text) => {
+                    full_response.push_str(&text);
+                    if !suppress_inline {
+                        let safe = crate::ui::ansi::strip_controls(
+                            &text,
+                            crate::ui::ansi::StripPolicy::KEEP_NEWLINE,
+                        );
+                        print!("{safe}");
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                    had_output = true;
+                }
+                AgentEvent::Done { response, .. } => {
+                    // `Done.response` is the authoritative full text.
+                    full_response = response.to_string();
+                    break;
+                }
+                AgentEvent::Error(err) => {
+                    if had_output {
+                        println!();
+                    }
+                    eprintln!("Error: {}", err);
+                    let _ = task.await;
+                    return Err(anyhow::anyhow!("{}", err));
+                }
+                AgentEvent::TurnEnd { .. } => {
+                    num_turns += 1;
+                }
+                // Plugin-driven model swap after last run puts the
+                // request in the mgr; caller drains via
+                // take_pending_next_model().
+                _ => {}
+            }
+        }
+
+        // Await the spawned task to catch any panics.
+        let _ = task.await;
+
+        // Plugin `on-response` + `on-complete` + `prepare-next-run`
+        // dispatch. Headless modes previously skipped these.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = crate::plugin::hook::global() {
+            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let result = runner::apply_response_hooks(&full_response, &mut mgr);
+            if let Some(replacement) = result.replacement {
+                if suppress_inline {
+                    full_response = replacement;
+                } else {
+                    println!();
+                    println!("[plugin replace-result]");
+                    let safe = crate::ui::ansi::strip_controls(
+                        &replacement,
+                        crate::ui::ansi::StripPolicy::KEEP_NEWLINE,
+                    );
+                    println!("{safe}");
+                    full_response = replacement;
+                }
+            }
+        }
+
+        match output_format {
+            crate::cli::OutputFormat::Text => {
+                println!();
+            }
+            crate::cli::OutputFormat::Json => {
+                let result = serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "duration_ms": start_instant.elapsed().as_millis() as u64,
+                    "num_turns": num_turns,
+                    "result": full_response.clone(),
+                    "session_id": session_id,
+                    "total_cost_usd": 0.0,
+                });
+                if let Ok(s) = serde_json::to_string(&result) {
+                    println!("{}", s);
+                }
+            }
+            crate::cli::OutputFormat::StreamJson => {
+                runner::emit_stream_json_event(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": full_response.clone()}],
+                    },
+                    "session_id": session_id,
+                }));
+                runner::emit_stream_json_event(serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "duration_ms": start_instant.elapsed().as_millis() as u64,
+                    "num_turns": num_turns,
+                    "result": full_response.clone(),
+                    "session_id": session_id,
+                    "total_cost_usd": 0.0,
+                }));
+            }
+        }
+        Ok(full_response)
     }
 
     /// Phase 4.5h-6 cutover: route through the new agent_loop
@@ -795,93 +802,7 @@ pub fn create_client(
     api_key: Option<&str>,
     custom_providers: &HashMap<String, CustomProviderConfig>,
 ) -> anyhow::Result<AnyClient> {
-    let info = resolve_provider_info(provider_name, custom_providers).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, ollama, custom",
-            provider_name
-        )
-    })?;
-
-    let key = resolve_api_key(info.kind, info.api_key_env.as_deref(), api_key)?;
-
-    let base_url = match info.kind {
-        ProviderKind::DeepSeek => Some(
-            std::env::var("DEEPSEEK_BASE_URL")
-                .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string()),
-        ),
-        ProviderKind::Glm => Some(
-            std::env::var("GLM_BASE_URL")
-                .unwrap_or_else(|_| "https://open.bigmodel.cn/api/coding/paas/v4".to_string()),
-        ),
-        ProviderKind::Custom => info
-            .base_url
-            .or_else(|| std::env::var("CUSTOM_BASE_URL").ok()),
-        _ => info.base_url,
-    };
-
-    match info.kind {
-        ProviderKind::OpenAI => {
-            let mut b = openai::CompletionsClient::builder().api_key(&key);
-            if let Some(base_url) = &base_url {
-                b = b.base_url(base_url);
-            }
-            Ok(AnyClient::OpenAI(b.build()?))
-        }
-        ProviderKind::Anthropic => {
-            let mut b = anthropic::Client::builder().api_key(&key);
-            if let Some(base_url) = &base_url {
-                b = b.base_url(base_url);
-            }
-            Ok(AnyClient::Anthropic(b.build()?))
-        }
-        ProviderKind::Gemini => {
-            let mut b = gemini::Client::builder().api_key(&key);
-            if let Some(base_url) = &base_url {
-                b = b.base_url(base_url);
-            }
-            Ok(AnyClient::Gemini(b.build()?))
-        }
-        ProviderKind::DeepSeek => {
-            let b = openai::CompletionsClient::builder()
-                .api_key(&key)
-                .base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"));
-            Ok(AnyClient::DeepSeek(b.build()?))
-        }
-        ProviderKind::Glm => {
-            let b = openai::CompletionsClient::builder().api_key(&key).base_url(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://open.bigmodel.cn/api/coding/paas/v4"),
-            );
-            Ok(AnyClient::Glm(b.build()?))
-        }
-        ProviderKind::Ollama => {
-            let key: ollama::OllamaApiKey = key.as_str().into();
-            let mut b = ollama::Client::builder().api_key(key);
-            if let Some(base_url) = &base_url {
-                b = b.base_url(base_url);
-            }
-            Ok(AnyClient::Ollama(b.build()?))
-        }
-        ProviderKind::OpenRouter => {
-            let mut b = openrouter::Client::builder().api_key(&key);
-            if let Some(base_url) = &base_url {
-                b = b.base_url(base_url);
-            }
-            Ok(AnyClient::OpenRouter(b.build()?))
-        }
-        ProviderKind::Custom => {
-            let base_url = base_url.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "CUSTOM_BASE_URL environment variable must be set for custom provider"
-                )
-            })?;
-            let b = openai::CompletionsClient::builder()
-                .api_key(&key)
-                .base_url(&base_url);
-            Ok(AnyClient::Custom(b.build()?))
-        }
-    }
+    client::create_client(provider_name, api_key, custom_providers)
 }
 
 pub async fn build_agent(
@@ -1218,6 +1139,7 @@ mod tests {
 
     // --- C6/C7: compaction prefix is full + includes tool calls -----
 
+    use super::summarize;
     use crate::session::{MessageRole, SessionMessage, ToolCallEntry, ToolCallState};
     use compact_str::CompactString;
 
@@ -1253,7 +1175,7 @@ mod tests {
                 }],
             ),
         ];
-        let out = serialize_conversation(&msgs);
+        let out = summarize::serialize_conversation(&msgs);
         assert!(out.contains("[User]"), "missing role tag: {out}");
         assert!(
             out.contains("[Tool: find_files("),
@@ -1288,7 +1210,7 @@ mod tests {
                 },
             ],
         )];
-        let out = serialize_conversation(&msgs);
+        let out = summarize::serialize_conversation(&msgs);
         assert!(out.contains("<interrupted>"), "got: {out}");
         assert!(out.contains("<failed: no such file>"), "got: {out}");
     }
@@ -1309,7 +1231,7 @@ mod tests {
                 state: ToolCallState::Completed { result: big },
             }],
         )];
-        let out = serialize_conversation(&msgs);
+        let out = summarize::serialize_conversation(&msgs);
         assert!(
             out.contains("(truncated, 5000 bytes total)"),
             "expected truncation marker; got: {out}"
@@ -1326,7 +1248,7 @@ mod tests {
         let msgs: Vec<SessionMessage> = (0..200)
             .map(|i| sm(MessageRole::Assistant, &format!("turn {i}"), vec![]))
             .collect();
-        let out = serialize_conversation(&msgs);
+        let out = summarize::serialize_conversation(&msgs);
         // 200 turns × ~10 chars each = ~2000 chars; below the old
         // 6000 cap but the principle still holds: the function is
         // a pure mapper, no length cap. Confirm by checking the

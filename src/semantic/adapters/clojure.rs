@@ -22,13 +22,7 @@ impl ClojureAdapter {
     // `node_text` and `make_range` previously lived here; now from
     // `crate::semantic::common`. The local wrapper functions are
     // kept as thin shims so the rest of this adapter reads
-    // unchanged — `self.node_text(n, s)` etc.
-    fn node_text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn make_range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
+    // unchanged — `node_text(n, s)` etc.
 
     /// The text of a `sym_lit` is in its `sym_name` child. For
     /// namespace-qualified symbols like `clojure.string/blank?` the
@@ -43,13 +37,13 @@ impl ClojureAdapter {
             if let Some(c) = sym_lit.named_child(i)
                 && c.kind() == "sym_name"
             {
-                return Some(self.node_text(c, source));
+                return Some(node_text(c, source));
             }
         }
         // Fallback: raw node text with the `ns/` prefix stripped so
         // `clojure.string/blank?` is normalized to `blank?`. Symbols
         // with no namespace prefix pass through unchanged.
-        let raw = self.node_text(sym_lit, source);
+        let raw = node_text(sym_lit, source);
         Some(raw.rsplit_once('/').map(|(_, leaf)| leaf).unwrap_or(raw))
     }
 
@@ -70,7 +64,7 @@ impl ClojureAdapter {
     /// body element. For `(defn foo [x y] (+ x y))` returns
     /// `(defn foo [x y]`. Used as the symbol signature for display.
     fn signature_line(&self, node: Node, source: &[u8]) -> String {
-        let text = self.node_text(node, source);
+        let text = node_text(node, source);
         // First newline cap; many Clojure defs sprawl over multiple
         // lines once they include docstrings + bodies, but the leading
         // line is enough for the listing.
@@ -108,7 +102,7 @@ impl ClojureAdapter {
             return;
         };
 
-        let range = self.make_range(list_lit);
+        let range = ByteRange::from(list_lit);
         let signature = self.signature_line(list_lit, source);
 
         match head_name {
@@ -165,7 +159,7 @@ impl ClojureAdapter {
                     // `(defmethod shape :square …)`), so anchor the
                     // method to that dispatch value instead. Falls
                     // back to `None` when forms[2] isn't extractable.
-                    let dispatch_val = forms.get(2).map(|n| self.node_text(*n, source).to_string());
+                    let dispatch_val = forms.get(2).map(|n| node_text(*n, source).to_string());
                     symbols.push(Symbol {
                         kind: SymbolKind::Method,
                         name: name.to_string(),
@@ -208,7 +202,7 @@ impl ClojureAdapter {
                             symbols.push(Symbol {
                                 kind: SymbolKind::Method,
                                 name: method_name.to_string(),
-                                range: self.make_range(*body_form),
+                                range: ByteRange::from(*body_form),
                                 signature: self.signature_line(*body_form, source),
                                 is_exported: true,
                                 parent_class: Some(proto_name.clone()),
@@ -249,7 +243,7 @@ impl ClojureAdapter {
                     if directive.kind() != "kwd_lit" {
                         continue;
                     }
-                    let dir_text = self.node_text(*directive, source);
+                    let dir_text = node_text(*directive, source);
                     if dir_text != ":require" && dir_text != ":use" {
                         continue;
                     }

@@ -20,12 +20,6 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbo
 pub struct JavaAdapter;
 
 impl JavaAdapter {
-    fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
     fn signature(&self, n: Node, s: &[u8]) -> String {
         // Prefer the body field (set by tree-sitter-java for
         // class/interface/method bodies); fall back to walking
@@ -58,7 +52,7 @@ impl JavaAdapter {
             if let Some(c) = n.named_child(i)
                 && c.kind() == "modifiers"
             {
-                let text = self.text(c, s);
+                let text = node_text(c, s);
                 return text.split_whitespace().any(|t| t == "public");
             }
         }
@@ -69,7 +63,7 @@ impl JavaAdapter {
         for i in 0..n.named_child_count() {
             let c = n.named_child(i)?;
             if c.kind() == "identifier" {
-                return Some(self.text(c, s).to_string());
+                return Some(node_text(c, s).to_string());
             }
         }
         None
@@ -89,7 +83,7 @@ impl JavaAdapter {
                             kind: SymbolKind::Method,
                             is_exported: self.is_public(c, s),
                             name,
-                            range: self.range(c),
+                            range: ByteRange::from(c),
                             signature: self.signature(c, s),
                             parent_class: Some(parent.to_string()),
                         });
@@ -104,7 +98,7 @@ impl JavaAdapter {
                             kind: SymbolKind::Method,
                             is_exported: self.is_public(c, s),
                             name,
-                            range: self.range(c),
+                            range: ByteRange::from(c),
                             signature: self.signature(c, s),
                             parent_class: Some(parent.to_string()),
                         });
@@ -121,13 +115,13 @@ impl JavaAdapter {
                             && let Some(name_n) = decl.named_child(0)
                             && name_n.kind() == "identifier"
                         {
-                            let name = self.text(name_n, s).to_string();
+                            let name = node_text(name_n, s).to_string();
                             symbols.push(Symbol {
                                 kind: SymbolKind::Variable,
                                 is_exported: is_pub,
                                 name,
-                                range: self.range(c),
-                                signature: self.text(c, s).lines().next().unwrap_or("").to_string(),
+                                range: ByteRange::from(c),
+                                signature: node_text(c, s).lines().next().unwrap_or("").to_string(),
                                 parent_class: Some(parent.to_string()),
                             });
                         }
@@ -158,7 +152,7 @@ impl JavaAdapter {
                     kind: SymbolKind::Class,
                     is_exported: is_pub,
                     name: name.clone(),
-                    range: self.range(n),
+                    range: ByteRange::from(n),
                     signature: self.signature(n, s),
                     parent_class: None,
                 });
@@ -175,7 +169,7 @@ impl JavaAdapter {
                     kind: SymbolKind::Interface,
                     is_exported: is_pub,
                     name: name.clone(),
-                    range: self.range(n),
+                    range: ByteRange::from(n),
                     signature: self.signature(n, s),
                     parent_class: None,
                 });
@@ -200,7 +194,7 @@ impl JavaAdapter {
                     kind: SymbolKind::Class,
                     is_exported: is_pub,
                     name: name.clone(),
-                    range: self.range(n),
+                    range: ByteRange::from(n),
                     signature: self.signature(n, s),
                     parent_class: None,
                 });
@@ -220,7 +214,7 @@ impl JavaAdapter {
             if let Some(c) = n.named_child(i)
                 && matches!(c.kind(), "scoped_identifier" | "identifier")
             {
-                let path = self.text(c, s).to_string();
+                let path = node_text(c, s).to_string();
                 imports.push(Import {
                     names: vec![path.clone()],
                     source: path,

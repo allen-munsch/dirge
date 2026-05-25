@@ -1,5 +1,8 @@
+pub mod allowlist;
 pub mod ask;
 pub mod checker;
+pub mod engine;
+pub mod path;
 pub mod pattern;
 
 /// Push the active prompt's `deny_tools` list into the permission

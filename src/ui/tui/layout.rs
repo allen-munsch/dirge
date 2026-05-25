@@ -157,6 +157,7 @@ impl Layout {
     }
 
     /// Convenience: chat content height in rows.
+    #[allow(dead_code)]
     pub fn chat_height(&self) -> u16 {
         self.chat.height
     }

@@ -4,6 +4,7 @@ mod semantic_tests {
     use std::sync::Arc;
 
     use crate::semantic::adapters::AdapterRegistry;
+    use crate::semantic::types::SymbolKind;
     use crate::semantic::{LanguageAdapter, SymbolIndex};
 
     fn fixtures_dir() -> PathBuf {

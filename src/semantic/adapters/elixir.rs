@@ -19,12 +19,6 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbo
 pub struct ElixirAdapter;
 
 impl ElixirAdapter {
-    fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
     fn signature(&self, n: Node, s: &[u8]) -> String {
         signature_first_line(n, s)
     }
@@ -47,7 +41,7 @@ impl ElixirAdapter {
         if target.kind() != "identifier" {
             return None;
         }
-        let kw = self.text(target, s);
+        let kw = node_text(target, s);
         (Self::MODULE_DEFS.contains(&kw) || Self::FUNCTION_DEFS.contains(&kw)).then_some(kw)
     }
 
@@ -83,15 +77,15 @@ impl ElixirAdapter {
                 continue;
             };
             match c.kind() {
-                "alias" => return Some(self.text(c, s).to_string()),
+                "alias" => return Some(node_text(c, s).to_string()),
                 "dot" => {
                     // Dotted module name: `MyApp.User`
                     if let Some(left) = c.child_by_field_name("left") {
                         let right = c
                             .child_by_field_name("right")
-                            .map(|n| self.text(n, s))
+                            .map(|n| node_text(n, s))
                             .unwrap_or("");
-                        return Some(format!("{}.{right}", self.text(left, s)));
+                        return Some(format!("{}.{right}", node_text(left, s)));
                     }
                 }
                 _ => {}
@@ -111,13 +105,13 @@ impl ElixirAdapter {
                 continue;
             };
             match c.kind() {
-                "identifier" => return Some(self.text(c, s).to_string()),
+                "identifier" => return Some(node_text(c, s).to_string()),
                 "call" => {
                     // `greet(name)` — the inner call's target is the name.
                     if let Some(target) = c.child_by_field_name("target")
                         && target.kind() == "identifier"
                     {
-                        return Some(self.text(target, s).to_string());
+                        return Some(node_text(target, s).to_string());
                     }
                 }
                 _ => continue,
@@ -174,7 +168,7 @@ impl ElixirAdapter {
                 symbols.push(Symbol {
                     kind,
                     name: name.clone(),
-                    range: self.range(call),
+                    range: ByteRange::from(call),
                     signature: self.signature(call, s),
                     is_exported: true,
                     parent_class: inside_parent.map(str::to_string),
@@ -192,7 +186,7 @@ impl ElixirAdapter {
             symbols.push(Symbol {
                 kind: SymbolKind::Function,
                 name,
-                range: self.range(call),
+                range: ByteRange::from(call),
                 signature: self.signature(call, s),
                 is_exported,
                 parent_class: inside_parent.map(str::to_string),
@@ -210,7 +204,7 @@ impl ElixirAdapter {
             Some(t) if t.kind() == "identifier" => t,
             _ => return,
         };
-        let kw = self.text(target, s);
+        let kw = node_text(target, s);
         if !matches!(kw, "import" | "alias" | "require" | "use") {
             return;
         }
@@ -225,7 +219,7 @@ impl ElixirAdapter {
             };
             match c.kind() {
                 "alias" => {
-                    let name = self.text(c, s).to_string();
+                    let name = node_text(c, s).to_string();
                     if source.is_empty() {
                         source = name.clone();
                     }
@@ -234,7 +228,7 @@ impl ElixirAdapter {
                 "dot" => {
                     // `alias MyApp.{Repo, User}` — dot with tuple.
                     // Reconstruct the full source text.
-                    let raw = self.text(c, s).to_string();
+                    let raw = node_text(c, s).to_string();
                     if source.is_empty() {
                         source = raw.clone();
                     }

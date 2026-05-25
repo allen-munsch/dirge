@@ -21,13 +21,6 @@ impl TypescriptAdapter {
         }
     }
 
-    fn node_text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn make_range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
-
     fn signature_from_node(&self, node: Node, source: &[u8]) -> String {
         let body = node.child_by_field_name("body");
         let end = body.map(|b| b.start_byte()).unwrap_or(node.end_byte());
@@ -37,14 +30,14 @@ impl TypescriptAdapter {
 
     fn extract_import(&self, node: Node, source: &[u8]) -> Option<Import> {
         let source_node = node.child_by_field_name("source")?;
-        let module_path = self.node_text(source_node, source);
+        let module_path = node_text(source_node, source);
         let module_path = module_path.trim_matches(&['\'', '"'][..]).to_string();
 
         let mut names = Vec::new();
 
         if let Some(clause) = node.child_by_field_name("import") {
             if let Some(name_node) = clause.child_by_field_name("name") {
-                names.push(self.node_text(name_node, source).to_string());
+                names.push(node_text(name_node, source).to_string());
             }
             for i in 0..clause.named_child_count() {
                 if let Some(child) = clause.named_child(i) {
@@ -53,7 +46,7 @@ impl TypescriptAdapter {
                             if let Some(spec) = child.named_child(j) {
                                 if spec.kind() == "import_specifier" {
                                     if let Some(n) = spec.child_by_field_name("name") {
-                                        names.push(self.node_text(n, source).to_string());
+                                        names.push(node_text(n, source).to_string());
                                     }
                                 }
                             }
@@ -76,7 +69,7 @@ impl TypescriptAdapter {
             "export_statement" => {
                 if let Some(decl) = node.child_by_field_name("declaration") {
                     if let Some(name) = decl.child_by_field_name("name") {
-                        exports.push(self.node_text(name, source).to_string());
+                        exports.push(node_text(name, source).to_string());
                     }
                 }
                 if let Some(export_clause) = node.child_by_field_name("export") {
@@ -84,7 +77,7 @@ impl TypescriptAdapter {
                         if let Some(spec) = export_clause.named_child(i) {
                             if spec.kind() == "export_specifier" {
                                 if let Some(n) = spec.child_by_field_name("name") {
-                                    exports.push(self.node_text(n, source).to_string());
+                                    exports.push(node_text(n, source).to_string());
                                 }
                             }
                         }
@@ -93,7 +86,7 @@ impl TypescriptAdapter {
             }
             "function_declaration" | "class_declaration" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    exports.push(self.node_text(name, source).to_string());
+                    exports.push(node_text(name, source).to_string());
                 }
             }
             "lexical_declaration" | "variable_declaration" => {
@@ -103,7 +96,7 @@ impl TypescriptAdapter {
                             if let Some(decl) = node.named_child(i) {
                                 if decl.kind() == "variable_declarator" {
                                     if let Some(name) = decl.child_by_field_name("name") {
-                                        exports.push(self.node_text(name, source).to_string());
+                                        exports.push(node_text(name, source).to_string());
                                     }
                                 }
                             }
@@ -129,8 +122,8 @@ impl TypescriptAdapter {
                 if let Some(parent) = node.parent() {
                     if parent.kind() == "variable_declarator" {
                         if let Some(name_node) = parent.child_by_field_name("name") {
-                            let name = self.node_text(name_node, source).to_string();
-                            let range = self.make_range(parent);
+                            let name = node_text(name_node, source).to_string();
+                            let range = ByteRange::from(parent);
                             let signature = format!(
                                 "const {} = {}",
                                 name,
@@ -163,8 +156,8 @@ impl TypescriptAdapter {
             if let Some(child) = node.named_child(i) {
                 if child.kind() == "method_definition" {
                     if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = self.node_text(name_node, source).to_string();
-                        let range = self.make_range(child);
+                        let name = node_text(name_node, source).to_string();
+                        let range = ByteRange::from(child);
                         let signature = self.signature_from_node(child, source);
                         symbols.push(Symbol {
                             kind: SymbolKind::Method,
@@ -232,8 +225,8 @@ impl TypescriptAdapter {
         match node.kind() {
             "function_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = self.node_text(name_node, source).to_string();
-                    let range = self.make_range(node);
+                    let name = node_text(name_node, source).to_string();
+                    let range = ByteRange::from(node);
                     let signature = self.signature_from_node(node, source);
                     symbols.push(Symbol {
                         kind: SymbolKind::Function,
@@ -247,8 +240,8 @@ impl TypescriptAdapter {
             }
             "class_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = self.node_text(name_node, source).to_string();
-                    let range = self.make_range(node);
+                    let name = node_text(name_node, source).to_string();
+                    let range = ByteRange::from(node);
                     let signature = self.signature_from_node(node, source);
                     symbols.push(Symbol {
                         kind: SymbolKind::Class,
@@ -265,8 +258,8 @@ impl TypescriptAdapter {
             }
             "interface_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = self.node_text(name_node, source).to_string();
-                    let range = self.make_range(node);
+                    let name = node_text(name_node, source).to_string();
+                    let range = ByteRange::from(node);
                     let signature = self.signature_from_node(node, source);
                     symbols.push(Symbol {
                         kind: SymbolKind::Interface,
@@ -280,8 +273,8 @@ impl TypescriptAdapter {
             }
             "type_alias_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = self.node_text(name_node, source).to_string();
-                    let range = self.make_range(node);
+                    let name = node_text(name_node, source).to_string();
+                    let range = ByteRange::from(node);
                     let signature = self.signature_from_node(node, source);
                     symbols.push(Symbol {
                         kind: SymbolKind::TypeAlias,
@@ -306,8 +299,8 @@ impl TypescriptAdapter {
                                     is_exported,
                                 );
                             } else if let Some(name_node) = decl.child_by_field_name("name") {
-                                let name = self.node_text(name_node, source).to_string();
-                                let range = self.make_range(decl);
+                                let name = node_text(name_node, source).to_string();
+                                let range = ByteRange::from(decl);
                                 symbols.push(Symbol {
                                     kind: SymbolKind::Variable,
                                     name,

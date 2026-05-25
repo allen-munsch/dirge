@@ -929,10 +929,16 @@ mod tests {
             .map(|e| e.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(blob.contains('\t'), "tab must survive for code indent: {blob:?}");
+        assert!(
+            blob.contains('\t'),
+            "tab must survive for code indent: {blob:?}"
+        );
         // Syntax highlighting wraps `fn` in ANSI SGR escapes, so
         // "fn main" may not be contiguous in the rendered output.
         let plain = ansi::strip_ansi(&blob);
-        assert!(plain.contains("fn main"), "code text must survive: {plain:?}");
+        assert!(
+            plain.contains("fn main"),
+            "code text must survive: {plain:?}"
+        );
     }
 }

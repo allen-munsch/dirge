@@ -525,10 +525,7 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                f.render_widget(
-                    ChatPane::new(&layout, &lines, 0).selection(sel),
-                    area,
-                );
+                f.render_widget(ChatPane::new(&layout, &lines, 0).selection(sel), area);
             })
             .unwrap();
         backend = terminal.backend().clone();

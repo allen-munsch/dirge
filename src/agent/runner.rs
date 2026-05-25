@@ -1,14 +1,9 @@
-use futures::StreamExt;
-use rig::agent::{Agent, MultiTurnStreamItem};
-use rig::completion::{CompletionModel, Message};
-use rig::streaming::{StreamedAssistantContent, StreamingChat};
+use rig::completion::Message;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::agent::recovery::{self, RecoveryPolicy};
 use crate::event::AgentEvent;
 use crate::session::{MessageRole, Session};
-use crate::ui::ansi::{self, StripPolicy};
 
 /// Per-chunk read deadline for streaming provider responses. Applied
 /// to every `stream.next().await` in both the interactive and
@@ -130,260 +125,17 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
 /// dirge-rmk: emit one stream-json event line to stdout. NDJSON shape
 /// matches Claude Code so tooling written against `claude --print
 /// --output-format stream-json` works against dirge unchanged.
-fn emit_stream_json_event(value: serde_json::Value) {
+pub(crate) fn emit_stream_json_event(value: serde_json::Value) {
     if let Ok(s) = serde_json::to_string(&value) {
         println!("{}", s);
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 }
 
-pub async fn run_print<M, P>(
-    agent: &Agent<M, P>,
-    prompt: &str,
-    max_turns: usize,
-    chunk_timeout: std::time::Duration,
-    output_format: crate::cli::OutputFormat,
-) -> anyhow::Result<String>
-where
-    M: CompletionModel + 'static,
-    M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
-    P: rig::agent::PromptHook<M> + 'static,
-{
-    let start_instant = std::time::Instant::now();
-    let session_id = uuid_v4_simple();
-    let mut num_turns: u32 = 0;
-
-    // Plugin `on-prompt` dispatch. Headless modes (--print, --loop)
-    // previously skipped this — plugins that mutate the user prompt
-    // or block it never fired in CI/script contexts.
-    let effective_prompt: String = {
-        #[cfg(feature = "plugin")]
-        {
-            if let Some(pm_arc) = crate::plugin::hook::global() {
-                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
-                resolve_prompt_with_hooks(prompt, &mut mgr)
-            } else {
-                prompt.to_string()
-            }
-        }
-        #[cfg(not(feature = "plugin"))]
-        {
-            prompt.to_string()
-        }
-    };
-    // For Json / StreamJson modes the assistant text is BUFFERED
-    // (never streamed inline to stdout) so the JSON envelope is the
-    // only thing the user sees on stdout. Text mode keeps the prior
-    // streaming behavior.
-    let suppress_inline = !matches!(output_format, crate::cli::OutputFormat::Text);
-
-    // StreamJson init event — fires once at startup so downstream
-    // tools can pick up cwd/session/model before any turns stream.
-    // Ported from maki print.rs:67-75 (InitEvent shape).
-    if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        emit_stream_json_event(serde_json::json!({
-            "type": "system",
-            "subtype": "init",
-            "cwd": cwd,
-            "session_id": session_id,
-            "tools": Vec::<String>::new(),
-            "model": "",
-        }));
-    }
-    // Retry loop. Print mode (`dirge --print "..."`) is commonly used
-    // in scripts and CI where a single transient 502 or rate-limit
-    // would otherwise turn a 5-line shell snippet into a flaky one.
-    // Use the same RecoveryPolicy as the interactive path.
-    //
-    // Caveat: we only retry when NO bytes of the response have been
-    // emitted to stdout yet. Once a byte is out, retrying would
-    // duplicate visible output — better to surface the error and let
-    // the script decide whether to re-run. This matches what
-    // opencode does for its non-interactive path.
-    let policy = RecoveryPolicy::default();
-    let mut attempts: usize = 0;
-    loop {
-        let mut stream = agent
-            .stream_chat(effective_prompt.clone(), Vec::<Message>::new())
-            .multi_turn(max_turns)
-            .await;
-
-        let mut full_response = String::new();
-        let mut had_output = false;
-        let mut stream_error: Option<String> = None;
-
-        loop {
-            let item = match tokio::time::timeout(chunk_timeout, stream.next()).await {
-                Ok(Some(item)) => item,
-                Ok(None) => break,
-                Err(_) => {
-                    stream_error = Some(format!(
-                        "stream chunk timed out after {}s (provider stalled or connection silently dropped) — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
-                        chunk_timeout.as_secs(),
-                    ));
-                    break;
-                }
-            };
-            match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
-                    text,
-                ))) => {
-                    full_response.push_str(&text.text);
-                    if !suppress_inline {
-                        let safe = ansi::strip_controls(&text.text, StripPolicy::KEEP_NEWLINE);
-                        print!("{safe}");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
-                    }
-                    had_output = true;
-                }
-                Ok(MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::Reasoning(r),
-                )) => {
-                    if !suppress_inline {
-                        // Json / StreamJson modes: reasoning is the
-                        // model's internal thinking — not part of the
-                        // user-visible result. Suppressing keeps the
-                        // JSON output clean of chain-of-thought
-                        // noise.
-                        let display = r.display_text();
-                        let safe = ansi::strip_controls(&display, StripPolicy::KEEP_NEWLINE);
-                        eprint!("{safe}");
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
-                    }
-                }
-                Ok(MultiTurnStreamItem::FinalResponse(_)) => break,
-                Ok(_) => {}
-                Err(e) => {
-                    stream_error = Some(e.to_string());
-                    break;
-                }
-            }
-        }
-
-        if let Some(msg) = stream_error {
-            let kind = recovery::classify_error(&msg);
-            if !had_output && policy.should_retry(attempts, kind) {
-                let delay = policy.backoff_duration_for_msg(attempts, &msg);
-                eprintln!(
-                    "(retry {}/{} in {:.1}s — {:?})",
-                    attempts + 1,
-                    policy.max_retries(),
-                    delay.as_secs_f64(),
-                    kind,
-                );
-                tokio::time::sleep(delay).await;
-                attempts += 1;
-                continue;
-            }
-            // Either we already wrote bytes to stdout (can't safely
-            // retry without duplicating) or the retry policy says
-            // give up. Newline-terminate any in-flight output before
-            // the error so the diagnostic doesn't share a line with
-            // half a response.
-            if had_output {
-                println!();
-            }
-            eprintln!("Error: {}", msg);
-            return Err(anyhow::anyhow!("{}", msg));
-        }
-
-        // dirge-rmk: turn complete. Bump turn counter; emit per-format
-        // closing payload. Ported from maki print.rs:51-64
-        // (`PrintResult`) and the StreamJson assistant event shape.
-        num_turns += 1;
-
-        // Plugin `on-response` + `on-complete` + `prepare-next-run`
-        // dispatch. Headless modes previously skipped these. The
-        // on-response hook can replace the final response via
-        // harness/replace-result — used (for example) by a
-        // formatting plugin that wraps the agent's output in a
-        // structured envelope. Errors go to stderr; we keep the
-        // run going so the user still sees the unmodified response.
-        //
-        // NOTE: text mode has already streamed full_response to
-        // stdout BYTE BY BYTE during the loop above — a
-        // replace-result mutation can't roll those bytes back, so
-        // text mode prints the mutated tail after a separator
-        // rather than silently dropping the upstream content. JSON
-        // / StreamJson modes buffer (`suppress_inline`), so the
-        // mutation cleanly replaces.
-        #[cfg(feature = "plugin")]
-        if let Some(pm_arc) = crate::plugin::hook::global() {
-            let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
-            let result = apply_response_hooks(&full_response, &mut mgr);
-            if let Some(replacement) = result.replacement {
-                if suppress_inline {
-                    full_response = replacement;
-                } else {
-                    // Text mode already streamed the original — show
-                    // the replacement on a new line with a marker so
-                    // the user understands what happened.
-                    println!();
-                    println!("[plugin replace-result]");
-                    let safe = ansi::strip_controls(&replacement, StripPolicy::KEEP_NEWLINE);
-                    println!("{safe}");
-                    full_response = replacement;
-                }
-            }
-            // `prepare-next-run`'s `set-next-model` value (if any) is
-            // left in `PluginManager` for the caller to drain. `--loop`
-            // rebuilds the agent on it; `--print` warns and ignores.
-        }
-
-        match output_format {
-            crate::cli::OutputFormat::Text => {
-                println!();
-            }
-            crate::cli::OutputFormat::Json => {
-                // Single Claude-shaped result object. `total_cost_usd`
-                // is 0.0 until provider cost plumbing lands.
-                let result = serde_json::json!({
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": false,
-                    "duration_ms": start_instant.elapsed().as_millis() as u64,
-                    "num_turns": num_turns,
-                    "result": full_response.clone(),
-                    "session_id": session_id,
-                    "total_cost_usd": 0.0,
-                });
-                if let Ok(s) = serde_json::to_string(&result) {
-                    println!("{}", s);
-                }
-            }
-            crate::cli::OutputFormat::StreamJson => {
-                // Per-turn assistant event + closing result event.
-                emit_stream_json_event(serde_json::json!({
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": full_response.clone()}],
-                    },
-                    "session_id": session_id,
-                }));
-                emit_stream_json_event(serde_json::json!({
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": false,
-                    "duration_ms": start_instant.elapsed().as_millis() as u64,
-                    "num_turns": num_turns,
-                    "result": full_response.clone(),
-                    "session_id": session_id,
-                    "total_cost_usd": 0.0,
-                }));
-            }
-        }
-        return Ok(full_response);
-    }
-}
-
 /// Generate a UUIDv4-shaped session id without pulling the `uuid`
 /// crate (dirge already has enough deps). Random bytes via system
 /// time + thread id seeded into a small xorshift.
-fn uuid_v4_simple() -> String {
+pub(crate) fn uuid_v4_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

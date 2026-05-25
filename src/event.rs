@@ -172,12 +172,21 @@ pub enum UserEvent {
     /// Left mouse button pressed at terminal cell `(row, col)` — starts
     /// an app-level drag selection. Consumed by `ui::selection::handle`
     /// before any UI-state-specific consumer sees it.
-    MouseDown { row: u16, col: u16 },
+    MouseDown {
+        row: u16,
+        col: u16,
+    },
     /// Left mouse button dragged to terminal cell `(row, col)` — extends
     /// the active selection.
-    MouseDrag { row: u16, col: u16 },
+    MouseDrag {
+        row: u16,
+        col: u16,
+    },
     /// Left mouse button released at terminal cell `(row, col)` —
     /// finalizes the selection, copies it to the clipboard, and clears
     /// the highlight.
-    MouseUp { row: u16, col: u16 },
+    MouseUp {
+        row: u16,
+        col: u16,
+    },
 }

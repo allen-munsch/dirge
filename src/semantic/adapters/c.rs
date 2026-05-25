@@ -20,12 +20,6 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbo
 pub struct CAdapter;
 
 impl CAdapter {
-    fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
     fn signature(&self, n: Node, s: &[u8]) -> String {
         signature_up_to_body(n, s)
     }
@@ -37,7 +31,7 @@ impl CAdapter {
         for i in 0..n.named_child_count() {
             if let Some(c) = n.named_child(i)
                 && c.kind() == "storage_class_specifier"
-                && self.text(c, s) == "static"
+                && node_text(c, s) == "static"
             {
                 return true;
             }
@@ -51,7 +45,7 @@ impl CAdapter {
     /// `parenthesized_declarator` (function pointers).
     fn declarator_name<'a>(&self, n: Node<'a>, s: &'a [u8]) -> Option<String> {
         match n.kind() {
-            "identifier" => Some(self.text(n, s).to_string()),
+            "identifier" => Some(node_text(n, s).to_string()),
             "function_declarator" | "pointer_declarator" | "parenthesized_declarator" => {
                 // First named child that resolves to an identifier wins.
                 for i in 0..n.named_child_count() {
@@ -91,7 +85,7 @@ impl CAdapter {
             kind: SymbolKind::Function,
             is_exported: !self.is_static(n, s),
             name,
-            range: self.range(n),
+            range: ByteRange::from(n),
             signature: self.signature(n, s),
             parent_class: None,
         });
@@ -109,7 +103,7 @@ impl CAdapter {
         for i in 0..n.named_child_count() {
             let Some(c) = n.named_child(i) else { continue };
             if c.kind() == "type_identifier" && name.is_none() {
-                name = Some(self.text(c, s).to_string());
+                name = Some(node_text(c, s).to_string());
             }
             if c.kind() == "field_declaration_list" {
                 has_body = true;
@@ -123,8 +117,8 @@ impl CAdapter {
             kind: SymbolKind::Class,
             is_exported: true,
             name,
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
     }
@@ -142,7 +136,7 @@ impl CAdapter {
             match c.kind() {
                 "type_identifier" => {
                     if name.is_none() {
-                        name = Some(self.text(c, s).to_string());
+                        name = Some(node_text(c, s).to_string());
                     }
                 }
                 "enumerator_list" => enumerator_list = Some(c),
@@ -155,8 +149,8 @@ impl CAdapter {
                 kind: SymbolKind::Class,
                 is_exported: true,
                 name,
-                range: self.range(n),
-                signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+                range: ByteRange::from(n),
+                signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
                 parent_class: None,
             });
         }
@@ -177,9 +171,9 @@ impl CAdapter {
                             symbols.push(Symbol {
                                 kind: SymbolKind::Variable,
                                 is_exported: true,
-                                name: self.text(id, s).to_string(),
-                                range: self.range(e),
-                                signature: self.text(e, s).to_string(),
+                                name: node_text(id, s).to_string(),
+                                range: ByteRange::from(e),
+                                signature: node_text(e, s).to_string(),
                                 parent_class: parent_name.clone(),
                             });
                             break;
@@ -223,7 +217,7 @@ impl CAdapter {
             if let Some(c) = n.named_child(i)
                 && c.kind() == "type_identifier"
             {
-                alias = Some(self.text(c, s).to_string());
+                alias = Some(node_text(c, s).to_string());
                 break;
             }
         }
@@ -232,8 +226,8 @@ impl CAdapter {
             kind: SymbolKind::TypeAlias,
             is_exported: true,
             name,
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
     }
@@ -245,7 +239,7 @@ impl CAdapter {
             let Some(c) = n.named_child(i) else { continue };
             match c.kind() {
                 "system_lib_string" => {
-                    let raw = self.text(c, s);
+                    let raw = node_text(c, s);
                     let path = raw
                         .trim_matches(|ch: char| ch == '<' || ch == '>')
                         .to_string();
@@ -261,7 +255,7 @@ impl CAdapter {
                         if let Some(sub) = c.named_child(j)
                             && sub.kind() == "string_content"
                         {
-                            let path = self.text(sub, s).to_string();
+                            let path = node_text(sub, s).to_string();
                             imports.push(Import {
                                 names: vec![path.clone()],
                                 source: path,

@@ -17,12 +17,6 @@ impl GoAdapter {
     // Thin wrappers around the shared helpers in
     // `crate::semantic::common`. Method-shape preserved so the
     // bulk of this adapter reads unchanged.
-    fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
     /// Signature is the prefix up to the function body's opening
     /// brace. `func Foo(x int) int { ... }` → `func Foo(x int) int`.
     fn signature(&self, n: Node, s: &[u8]) -> String {
@@ -56,13 +50,13 @@ impl GoAdapter {
                 for k in 0..pd.named_child_count() {
                     let t = pd.named_child(k)?;
                     match t.kind() {
-                        "type_identifier" => return Some(self.text(t, s).to_string()),
+                        "type_identifier" => return Some(node_text(t, s).to_string()),
                         "pointer_type" => {
                             for m in 0..t.named_child_count() {
                                 if let Some(inner) = t.named_child(m)
                                     && inner.kind() == "type_identifier"
                                 {
-                                    return Some(self.text(inner, s).to_string());
+                                    return Some(node_text(inner, s).to_string());
                                 }
                             }
                         }
@@ -80,12 +74,12 @@ impl GoAdapter {
         let Some(name_node) = n.named_child(0).filter(|c| c.kind() == "identifier") else {
             return;
         };
-        let name = self.text(name_node, s).to_string();
+        let name = node_text(name_node, s).to_string();
         symbols.push(Symbol {
             kind: SymbolKind::Function,
             is_exported: self.is_exported(&name),
             name,
-            range: self.range(n),
+            range: ByteRange::from(n),
             signature: self.signature(n, s),
             parent_class: None,
         });
@@ -99,7 +93,7 @@ impl GoAdapter {
             if let Some(c) = n.named_child(i)
                 && c.kind() == "field_identifier"
             {
-                name = Some(self.text(c, s).to_string());
+                name = Some(node_text(c, s).to_string());
                 break;
             }
         }
@@ -111,7 +105,7 @@ impl GoAdapter {
             is_exported: self.is_exported(&name),
             parent_class: self.method_receiver_type(n, s),
             name,
-            range: self.range(n),
+            range: ByteRange::from(n),
             signature: self.signature(n, s),
         });
     }
@@ -133,7 +127,7 @@ impl GoAdapter {
             else {
                 continue;
             };
-            let name = self.text(name_node, s).to_string();
+            let name = node_text(name_node, s).to_string();
             // The second child is the actual type expression.
             let kind = if let Some(t) = spec.named_child(1) {
                 match t.kind() {
@@ -155,14 +149,14 @@ impl GoAdapter {
                         && let Some(mn) =
                             m.named_child(0).filter(|c| c.kind() == "field_identifier")
                     {
-                        let mname = self.text(mn, s).to_string();
+                        let mname = node_text(mn, s).to_string();
                         symbols.push(Symbol {
                             kind: SymbolKind::Method,
                             is_exported: self.is_exported(&mname),
                             parent_class: Some(name.clone()),
                             name: mname,
-                            range: self.range(m),
-                            signature: self.text(m, s).to_string(),
+                            range: ByteRange::from(m),
+                            signature: node_text(m, s).to_string(),
                         });
                     }
                 }
@@ -171,8 +165,8 @@ impl GoAdapter {
                 kind,
                 is_exported: self.is_exported(&name),
                 name,
-                range: self.range(spec),
-                signature: self.text(spec, s).lines().next().unwrap_or("").to_string(),
+                range: ByteRange::from(spec),
+                signature: node_text(spec, s).lines().next().unwrap_or("").to_string(),
                 parent_class: None,
             });
         }
@@ -189,13 +183,13 @@ impl GoAdapter {
                 if let Some(id) = spec.named_child(j)
                     && id.kind() == "identifier"
                 {
-                    let name = self.text(id, s).to_string();
+                    let name = node_text(id, s).to_string();
                     symbols.push(Symbol {
                         kind: SymbolKind::Variable,
                         is_exported: self.is_exported(&name),
                         name,
-                        range: self.range(spec),
-                        signature: self.text(spec, s).lines().next().unwrap_or("").to_string(),
+                        range: ByteRange::from(spec),
+                        signature: node_text(spec, s).lines().next().unwrap_or("").to_string(),
                         parent_class: None,
                     });
                 }
@@ -229,7 +223,7 @@ impl GoAdapter {
                 if let Some(lit) = spec.named_child(j)
                     && lit.kind() == "interpreted_string_literal"
                 {
-                    let raw = self.text(lit, s);
+                    let raw = node_text(lit, s);
                     let path = raw.trim_matches('"').to_string();
                     imports.push(Import {
                         names: vec![path.clone()],

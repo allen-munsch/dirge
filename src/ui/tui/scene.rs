@@ -74,8 +74,8 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     }
 
     // Chat region (content + ║ verticals).
-    let mut chat = ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset)
-        .border_style(frame_style);
+    let mut chat =
+        ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset).border_style(frame_style);
     if let Some(sel) = scene.chat_selection {
         chat = chat.selection(sel);
     }
@@ -141,10 +141,12 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
 
 /// Single empty editor row, used as the default `rows` slice when
 /// no input has been typed yet.
+#[allow(dead_code)]
 pub const EMPTY_ROWS: &[String] = &[];
 
 /// Convenience builder for a Scene with sensible defaults — useful
 /// in tests and in early-startup paths where most state is empty.
+#[allow(dead_code)]
 pub fn empty_scene<'a>(
     chat_buffer: &'a [LineEntry],
     panel_data: &'a PanelData,

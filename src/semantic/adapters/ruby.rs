@@ -23,12 +23,6 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbo
 pub struct RubyAdapter;
 
 impl RubyAdapter {
-    fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
     fn signature(&self, n: Node, s: &[u8]) -> String {
         signature_first_line(n, s)
     }
@@ -40,7 +34,7 @@ impl RubyAdapter {
         for i in 0..n.named_child_count() {
             let c = n.named_child(i)?;
             match c.kind() {
-                "identifier" | "constant" | "operator" => return Some(self.text(c, s).to_string()),
+                "identifier" | "constant" | "operator" => return Some(node_text(c, s).to_string()),
                 _ => {}
             }
         }
@@ -54,7 +48,7 @@ impl RubyAdapter {
         for i in 0..n.named_child_count() {
             let c = n.named_child(i)?;
             if c.kind() == "constant" {
-                return Some(self.text(c, s).to_string());
+                return Some(node_text(c, s).to_string());
             }
             if c.kind() == "scope_resolution" {
                 // Reach the rightmost `constant` inside.
@@ -63,7 +57,7 @@ impl RubyAdapter {
                     if let Some(sub) = c.named_child(j)
                         && sub.kind() == "constant"
                     {
-                        last = Some(self.text(sub, s));
+                        last = Some(node_text(sub, s));
                     }
                 }
                 return last.map(str::to_string);
@@ -94,7 +88,7 @@ impl RubyAdapter {
             // are `call` nodes — we ignore those (they only toggle
             // the named target, not subsequent defs).
             if c.kind() == "identifier" {
-                let txt = self.text(c, s);
+                let txt = node_text(c, s);
                 match txt {
                     "public" => {
                         visibility_public = true;
@@ -113,7 +107,7 @@ impl RubyAdapter {
                         symbols.push(Symbol {
                             kind: SymbolKind::Method,
                             name,
-                            range: self.range(c),
+                            range: ByteRange::from(c),
                             signature: self.signature(c, s),
                             is_exported: visibility_public,
                             parent_class: Some(parent.to_string()),
@@ -128,7 +122,7 @@ impl RubyAdapter {
                         if let Some(sub) = c.named_child(j)
                             && sub.kind() == "identifier"
                         {
-                            name = Some(self.text(sub, s).to_string());
+                            name = Some(node_text(sub, s).to_string());
                             break;
                         }
                     }
@@ -136,7 +130,7 @@ impl RubyAdapter {
                         symbols.push(Symbol {
                             kind: SymbolKind::Method,
                             name,
-                            range: self.range(c),
+                            range: ByteRange::from(c),
                             signature: self.signature(c, s),
                             // Class methods (`def self.foo`) don't
                             // participate in instance-method
@@ -189,7 +183,7 @@ impl RubyAdapter {
                 symbols.push(Symbol {
                     kind: SymbolKind::Class,
                     name: name.clone(),
-                    range: self.range(n),
+                    range: ByteRange::from(n),
                     signature: self.signature(n, s),
                     is_exported: true,
                     parent_class: inside_parent.clone(),
@@ -210,7 +204,7 @@ impl RubyAdapter {
                 symbols.push(Symbol {
                     kind: SymbolKind::Interface,
                     name: name.clone(),
-                    range: self.range(n),
+                    range: ByteRange::from(n),
                     signature: self.signature(n, s),
                     is_exported: true,
                     parent_class: inside_parent.clone(),
@@ -228,7 +222,7 @@ impl RubyAdapter {
                     symbols.push(Symbol {
                         kind: SymbolKind::Function,
                         name,
-                        range: self.range(n),
+                        range: ByteRange::from(n),
                         signature: self.signature(n, s),
                         is_exported: true,
                         parent_class: None,
@@ -249,7 +243,7 @@ impl RubyAdapter {
         let Some(id) = n.named_child(0).filter(|c| c.kind() == "identifier") else {
             return;
         };
-        let id_text = self.text(id, s);
+        let id_text = node_text(id, s);
         if !matches!(id_text, "require" | "require_relative" | "load") {
             return;
         }
@@ -263,7 +257,7 @@ impl RubyAdapter {
                 if let Some(arg) = c.named_child(j)
                     && arg.kind() == "string"
                 {
-                    let raw = self.text(arg, s);
+                    let raw = node_text(arg, s);
                     let path = raw
                         .trim_matches(|c: char| c == '"' || c == '\'')
                         .to_string();

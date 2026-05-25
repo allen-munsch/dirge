@@ -1,3 +1,4 @@
+pub mod compact;
 pub mod storage;
 
 use std::collections::HashMap;
@@ -86,7 +87,7 @@ pub struct SessionMessage {
 }
 
 /// Generate a fresh message id. Extracted for `#[serde(default = ...)]`.
-fn new_message_id() -> CompactString {
+pub(crate) fn new_message_id() -> CompactString {
     CompactString::new(Uuid::new_v4().to_string())
 }
 
@@ -769,25 +770,15 @@ impl Session {
     }
 
     pub fn needs_compaction(&self, reserve_tokens: u64) -> bool {
-        if self.context_window == 0 {
-            return false;
-        }
-        self.total_estimated_tokens > self.context_window.saturating_sub(reserve_tokens)
+        compact::needs_compaction(
+            self.total_estimated_tokens,
+            self.context_window,
+            reserve_tokens,
+        )
     }
 
     pub fn compacted_context(&self) -> (Option<&str>, usize) {
-        match self.compactions.last() {
-            // Clamp `first_kept_index` to `messages.len()` defensively
-            // in case the session was edited externally or shrunk by
-            // `switch_to_leaf` / `pop_last_message` after the
-            // compaction was recorded. Without this, callers doing
-            // `messages[first_kept..]` would panic on stale indices.
-            Some(c) => (
-                Some(c.summary.as_str()),
-                c.first_kept_index.min(self.messages.len()),
-            ),
-            None => (None, 0),
-        }
+        compact::compacted_context(&self.compactions, self.messages.len())
     }
 
     /// Legacy wrapper retained for tests that don't care about the
@@ -796,7 +787,7 @@ impl Session {
     /// notification to the user when sibling subtrees are dropped.
     #[cfg(test)]
     pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
-        let _ = self.compress_reporting(summary, first_kept_index, token_savings);
+        compact::compress(self, summary, first_kept_index, token_savings);
     }
 
     /// Same as `compress` but returns the number of NON-active-path
@@ -814,237 +805,7 @@ impl Session {
         first_kept_index: usize,
         token_savings: u64,
     ) -> usize {
-        // Bounds check — callers compute `first_kept_index` from a
-        // reverse-scan of `messages` so it should always be in range,
-        // but a buggy/racy caller could pass out-of-bounds. Clamp
-        // rather than panic on `drain(..)` so a misuse degrades to
-        // "summarize everything" instead of a hard crash.
-        let first_kept_index = first_kept_index.min(self.messages.len());
-        let summarized_count = first_kept_index;
-
-        // Subtract the saved tokens from estimated total
-        self.total_estimated_tokens = self.total_estimated_tokens.saturating_sub(token_savings);
-        // Add back estimated tokens for the summary itself
-        let summary_tokens = Self::estimate_tokens(&summary);
-        self.total_estimated_tokens = self.total_estimated_tokens.saturating_add(summary_tokens);
-
-        // Insert a System message with the summary at the boundary
-        let summary_id = new_message_id();
-        let summary_ts = chrono::Utc::now().timestamp();
-        let summary_msg = SessionMessage {
-            role: MessageRole::System,
-            content: CompactString::from(summary.clone()),
-            estimated_tokens: summary_tokens,
-            id: summary_id.clone(),
-            timestamp: summary_ts,
-            tool_calls: Vec::new(),
-        };
-
-        // Collect the IDs of the messages we're about to drop so we
-        // can prune them from the tree and store too.
-        let dropped_ids: Vec<CompactString> = self.messages[..first_kept_index]
-            .iter()
-            .map(|m| m.id.clone())
-            .collect();
-        let dropped_set: std::collections::HashSet<CompactString> =
-            dropped_ids.iter().cloned().collect();
-
-        // Remove summarized messages and insert summary
-        self.messages.drain(..first_kept_index);
-        self.messages.insert(0, summary_msg.clone());
-
-        // Mirror into the tree + store: remove dropped nodes, insert
-        // the new summary node as the new root, and re-parent the
-        // first kept node to point at the summary.
-        self.ensure_back_compat_initialized();
-
-        // Sibling-branch prune (Phase 2). When a dropped message has
-        // children that live in a forked sibling branch (not on the
-        // active path), those children — and their descendants —
-        // would be left with a `parent` pointing at a removed id.
-        // Walk the tree and add all such descendants to the prune
-        // set, then drop the union from tree + store. Tracks the
-        // count of NON-active-path nodes removed so the host can
-        // notify the user.
-        //
-        // Active-path messages (the ones still in `self.messages`
-        // after drain + summary insert) are EXCLUDED from the
-        // prune set — they'd otherwise get caught because the new
-        // first-kept message's parent is still pointing at a dropped
-        // id at this point in the function. The re-parent to summary
-        // happens further below.
-        let active_ids: std::collections::HashSet<CompactString> =
-            self.messages.iter().map(|m| m.id.clone()).collect();
-
-        // Algorithm: fixed-point iteration. Start with the directly-
-        // dropped ids. For each pass, find any tree entry whose
-        // parent is in the prune set AND which is not on the active
-        // path, then add it. Repeat until a pass adds nothing.
-        // O(N * K) worst case where K = avg branch depth; typically
-        // tiny in practice.
-        let mut to_prune: std::collections::HashSet<CompactString> = dropped_set.clone();
-        loop {
-            let new_ids: Vec<CompactString> = self
-                .tree
-                .entries
-                .iter()
-                .filter(|(id, node)| {
-                    !to_prune.contains(id.as_str())
-                        && !active_ids.contains(id.as_str())
-                        && node
-                            .parent
-                            .as_ref()
-                            .map(|p| to_prune.contains(p))
-                            .unwrap_or(false)
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            if new_ids.is_empty() {
-                break;
-            }
-            for id in new_ids {
-                to_prune.insert(id);
-            }
-        }
-
-        // Count of pruned nodes that were NOT on the active-path
-        // (the dropped messages). Active drops are visible to the
-        // user as the chat shrinking; sibling drops are silent
-        // without a notification, hence the count.
-        let sibling_pruned_count = to_prune.len().saturating_sub(dropped_set.len());
-
-        // Phase 4: capture a BranchSummary per pruned subtree
-        // BEFORE removing nodes (we need to read the root sibling's
-        // content + label). A "subtree root" is a node that's in
-        // `to_prune` AND whose parent is in `dropped_set` (i.e. the
-        // closest dropped-path ancestor). Each unique subtree root
-        // yields one summary.
-        let now_rfc = chrono::Utc::now().to_rfc3339();
-        let mut subtree_summaries: Vec<BranchSummary> = Vec::new();
-        for id in &to_prune {
-            if dropped_set.contains(id) {
-                // Active-path node; not a sibling subtree root.
-                continue;
-            }
-            let node = match self.tree.entries.get(id) {
-                Some(n) => n,
-                None => continue,
-            };
-            let parent = match &node.parent {
-                Some(p) => p,
-                None => continue,
-            };
-            if !dropped_set.contains(parent) {
-                // Not at the top of its subtree (some ancestor is
-                // also a sibling being pruned). Skip — only the
-                // closest-to-active-path ancestor gets a summary.
-                continue;
-            }
-            // Walk the subtree rooted here to count nodes.
-            let mut count = 0usize;
-            let mut stack = vec![id.clone()];
-            while let Some(cur) = stack.pop() {
-                if !to_prune.contains(&cur) {
-                    continue;
-                }
-                count += 1;
-                for (child_id, child_node) in self.tree.entries.iter() {
-                    if child_node.parent.as_ref() == Some(&cur) {
-                        stack.push(child_id.clone());
-                    }
-                }
-            }
-            // Preview: branch label (if any) + first chars of the
-            // root's message content. Keeps the user oriented when
-            // browsing `/tree`.
-            let label_prefix = node
-                .label
-                .as_deref()
-                .map(|l| format!("[{}] ", l))
-                .unwrap_or_default();
-            let body_preview = self
-                .message_store
-                .get(id)
-                .map(|m| {
-                    let s: String = m.content.chars().take(80).collect();
-                    if m.content.chars().count() > 80 {
-                        format!("{}…", s)
-                    } else {
-                        s
-                    }
-                })
-                .unwrap_or_default();
-            subtree_summaries.push(BranchSummary {
-                root_id: id.clone(),
-                parent_id: parent.clone(),
-                message_count: count,
-                preview: format!("{}{}", label_prefix, body_preview),
-                created_at: now_rfc.clone(),
-            });
-        }
-        self.branch_summaries.extend(subtree_summaries);
-
-        for id in &to_prune {
-            self.tree.entries.remove(id);
-            self.message_store.remove(id);
-        }
-        let new_root = TreeNode {
-            id: summary_id.clone(),
-            parent: None,
-            timestamp: summary_ts,
-            label: None,
-        };
-        self.tree.entries.insert(summary_id.clone(), new_root);
-        self.message_store.insert(summary_id.clone(), summary_msg);
-        // The new "first kept" message (index 1 in the cache, after
-        // the summary at index 0) becomes the summary's child. If
-        // every prior message was dropped, the summary is also the
-        // new leaf.
-        if let Some(first_kept) = self.messages.get(1) {
-            if let Some(node) = self.tree.entries.get_mut(&first_kept.id) {
-                node.parent = Some(summary_id.clone());
-            }
-        } else {
-            self.tree.leaf_id = Some(summary_id.clone());
-        }
-        // Re-point the tree leaf if the previous leaf was one of the
-        // pruned nodes (e.g. a branched session compressed the branch
-        // that owned the leaf). Without this the leaf dangles at an
-        // id that no longer exists in `tree.entries`.
-        let leaf_dropped = self
-            .tree
-            .leaf_id
-            .as_ref()
-            .map(|id| dropped_set.contains(id))
-            .unwrap_or(false);
-        if leaf_dropped {
-            // Anchor the leaf to the new first-kept message, or to the
-            // summary if nothing else survived.
-            self.tree.leaf_id = self
-                .messages
-                .get(1)
-                .map(|m| m.id.clone())
-                .or(Some(summary_id.clone()));
-        }
-
-        // On compress we replace every prior compaction record with a
-        // single fresh one. `Compaction::first_kept_index` is meant to
-        // mark the message-index boundary for the *latest* compaction
-        // only — keeping a stale list of records from earlier compresses
-        // makes their indices meaningless after subsequent drains. The
-        // latest summary IS the conversation prefix; older summaries
-        // are folded into it via `previous_summary` in the LLM context.
-        self.compactions.clear();
-        self.compactions.push(Compaction {
-            summary: CompactString::from(summary),
-            first_kept_index: 1, // The summary is at index 0
-            summarized_count,
-            token_savings,
-            created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
-        });
-
-        self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
-        sibling_pruned_count
+        compact::compress_reporting(self, summary, first_kept_index, token_savings)
     }
 }
 

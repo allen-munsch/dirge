@@ -88,52 +88,8 @@ pub enum PanelMode {
     Off,
 }
 
-/// Snapshot of the data the info panel displays. Built fresh by the UI loop
-/// at each redraw because the underlying state (todos, modified files, etc.)
-/// is mutated by the agent and we don't want stale reads.
-#[derive(Default, Clone)]
-pub struct PanelData {
-    /// (server name, connected) — connected currently always true because the
-    /// MCP manager drops failed connections at connect time; future health
-    /// tracking can flip this to false.
-    pub mcp: Vec<(String, bool)>,
-    /// (server_id, short root path, ok) — ok=false for broken servers.
-    pub lsp: Vec<(String, String, bool)>,
-    /// (status glyph, todo text). Status is single-char shorthand
-    /// like "[ ]", "[~]", "[x]" depending on the todo state.
-    pub todos: Vec<(String, String)>,
-    /// Recent modified file paths, shortened relative to cwd when possible.
-    pub modified: Vec<String>,
-    /// ui-redesign: latest system load snapshot for the
-    /// [SYSTEM LOAD] sub-panel. `None` when the polling task hasn't
-    /// produced a reading yet (very early startup) — painter skips
-    /// the section in that case.
-    pub sysload: Option<crate::ui::sysload::SysLoadSnapshot>,
-}
-
-/// dirge-gek: one row in the left-gutter subagent panel. Rendered as
-/// `<status-glyph> <short-id> <truncated-prompt>` so a quick glance
-/// shows what's running. The UI loop rebuilds these from
-/// `bg_store.list()` on each lifecycle event and pushes via
-/// `Renderer::set_subagent_status`.
-#[derive(Debug, Clone, Default)]
-pub struct SubagentStatusRow {
-    pub id_short: String,
-    pub state: String,
-    pub prompt_short: String,
-}
-
-/// ui-redesign: idle-state info for the left panel. When no
-/// subagents are active, the left gutter paints this card: ASCII
-/// DIRGE logo + agent metadata. Updated at session-start (and on
-/// `/model` switch / `/prompt` switch) by the UI loop.
-#[derive(Debug, Clone, Default)]
-pub struct LeftPanelInfo {
-    pub agent_id: String,
-    pub model: String,
-    pub focus: String,
-}
-
+// Re-exported from submodules so existing imports don't break.
+pub use crate::ui::panel_data::{LeftPanelInfo, PanelData, SubagentStatusRow};
 /// Normalized selection range — `start <= end` in row-major order.
 /// Coordinates are `(buffer_line_idx, char_offset_in_line)`. Used by
 /// the chat pane to apply REVERSED styling to selected cells.
@@ -425,12 +381,8 @@ impl Renderer {
         // they're identical. The terminal::size() probe used here
         // matches what render_frame sees because both go through the
         // same /dev/tty winsize.
-        let chat_rect_now = crate::ui::tui::layout::Layout::new(
-            cols_q,
-            rows_q,
-            effective_input_rows,
-        )
-        .chat;
+        let chat_rect_now =
+            crate::ui::tui::layout::Layout::new(cols_q, rows_q, effective_input_rows).chat;
         *cached_chat_rect = Some(chat_rect_now);
 
         let chat_selection = if *selection_active {
@@ -468,9 +420,19 @@ impl Renderer {
         use crossterm::ExecutableCommand as _;
         use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
         let mut stdout = std::io::stdout();
-        let _ = stdout.execute(BeginSynchronizedUpdate);
+        // Guard synchronization brackets so they never leak escape
+        // codes into non-TTY stdout (e.g. `cargo test`, CI logs,
+        // redirected output). Terminals ignore unsupported DECSET
+        // sequences, but the raw bytes in test output / logs are
+        // noise.
+        let sync = std::io::IsTerminal::is_terminal(&stdout);
+        if sync {
+            let _ = stdout.execute(BeginSynchronizedUpdate);
+        }
         let draw_result = terminal.draw(|f| render_frame(&scene, f));
-        let _ = stdout.execute(EndSynchronizedUpdate);
+        if sync {
+            let _ = stdout.execute(EndSynchronizedUpdate);
+        }
         draw_result?;
         Ok(())
     }
@@ -839,9 +801,8 @@ impl Renderer {
             (rect.y, rect.height as usize)
         } else {
             let (_, rows) = self.terminal_size();
-            let v = rows.saturating_sub(
-                self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS,
-            ) as usize;
+            let v = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS)
+                as usize;
             (1, v)
         };
         if visible == 0 {
@@ -1357,7 +1318,11 @@ pub(crate) fn display_col_to_char_index(s: &str, display_col: usize) -> usize {
 /// `cursor_byte` is the byte offset into `full`; conversion to
 /// display cells handles multi-byte UTF-8 (the cursor column is
 /// the display width of the row prefix up to the byte).
-fn wrap_editor(full: &str, cursor_byte: usize, wrap_w: usize) -> (Vec<String>, u16, u16) {
+pub(crate) fn wrap_editor(
+    full: &str,
+    cursor_byte: usize,
+    wrap_w: usize,
+) -> (Vec<String>, u16, u16) {
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let wrap_w = wrap_w.max(1);
     let mut rows: Vec<String> = Vec::new();
@@ -1708,8 +1673,11 @@ mod tests {
             .collect();
         r.replace_from(repl_start, new_lines);
 
-        assert_eq!(view_start(&r), pinned_start,
-            "view drifted after replace-with-more");
+        assert_eq!(
+            view_start(&r),
+            pinned_start,
+            "view drifted after replace-with-more"
+        );
 
         // Now replace with FEWER lines (response got shorter via
         // re-render). The view should not drift upward past where

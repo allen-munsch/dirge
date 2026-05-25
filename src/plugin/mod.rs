@@ -2446,6 +2446,7 @@ pub use worker::{DialogReply, DialogRequest};
 #[cfg(feature = "plugin")]
 pub mod extension;
 pub mod hook;
+pub mod loader;
 pub mod worker;
 
 /// Spawn a background task that drains plugin dialog requests in
@@ -2538,43 +2539,15 @@ pub fn decide_post_done_action(
 /// present rather than spamming "plugin dir not found" warnings.
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub fn filter_existing_dirs(candidates: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
-    candidates.iter().filter(|p| p.is_dir()).cloned().collect()
+    loader::filter_existing_dirs(candidates)
 }
 
-/// All hook names the host knows about. Plugins define functions with
-/// these names (bare or stem-prefixed) and the loader hooks them up.
-/// Centralized so the loader and any future telemetry stay in sync.
-pub const HOOK_NAMES: &[&str] = &[
-    "on-init",
-    "on-prompt",
-    "on-response",
-    "on-turn-start",
-    "on-turn-end",
-    "on-message-update",
-    "on-tool-start",
-    "on-tool-end",
-    "on-error",
-    "on-complete",
-    // Fires AFTER a run completes (Done event) and BEFORE the next
-    // user prompt is processed. Plugins read this to mutate
-    // session-level state that should affect the next run — most
-    // notably swapping the model via `harness-next-model`. Scoped
-    // to between-run boundaries because rig's multi-turn stream
-    // owns state that doesn't survive a mid-stream model swap.
-    "prepare-next-run",
-];
 
 /// One loaded plugin's stem (used for hook-name namespacing) and the
 /// source path(s) that contributed code. For single-file plugins this
 /// is one path; for directory plugins it's every `.janet` file inside
 /// in load order.
-#[cfg_attr(not(feature = "plugin"), allow(dead_code))]
-#[derive(Debug, Clone)]
-pub struct LoadedPlugin {
-    pub stem: String,
-    pub files: Vec<std::path::PathBuf>,
-    pub hooks_registered: Vec<String>,
-}
+pub use loader::LoadedPlugin;
 
 /// Discover, evaluate, and register a plugin from `path`.
 ///
@@ -2599,70 +2572,7 @@ pub fn load_plugin(
     mgr: &mut PluginManager,
     path: &std::path::Path,
 ) -> Result<LoadedPlugin, String> {
-    let (stem, files) = if path.is_dir() {
-        let dir_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("plugin dir has no name: {}", path.display()))?
-            .to_string();
-        let mut janet_files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
-            .map_err(|e| format!("cannot read plugin dir {}: {}", path.display(), e))?
-            .filter_map(|e| e.ok().map(|x| x.path()))
-            .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "janet"))
-            .collect();
-        janet_files.sort();
-        if janet_files.is_empty() {
-            return Err(format!(
-                "plugin dir {} contains no .janet files",
-                path.display()
-            ));
-        }
-        (dir_name, janet_files)
-    } else {
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("plugin file has no stem: {}", path.display()))?
-            .to_string();
-        (stem, vec![path.to_path_buf()])
-    };
-
-    for file in &files {
-        mgr.load_file(file)
-            .map_err(|e| format!("failed to load {}: {}", file.display(), e))?;
-    }
-
-    // Promote any bare hook symbols to stem-prefixed copies so a later
-    // plugin redefining the bare name can't shadow ours. We construct
-    // the prefixed name at runtime via curenv-mutation because Janet's
-    // `def` requires a literal symbol.
-    let mut hooks_registered = Vec::new();
-    for hook in HOOK_NAMES {
-        let prefixed = format!("{}-{}", stem, hook);
-        let escaped_hook = escape_janet_string(hook);
-        let escaped_prefixed = escape_janet_string(&prefixed);
-        let alias_code = format!(
-            r#"(let [env (curenv)
-                    bare-sym (symbol "{bare}")
-                    prefixed-sym (symbol "{prefixed}")
-                    bare-entry (get env bare-sym)]
-                 (when (and bare-entry (not (get env prefixed-sym)))
-                   (put env prefixed-sym bare-entry)))"#,
-            bare = escaped_hook,
-            prefixed = escaped_prefixed,
-        );
-        let _ = mgr.eval(&alias_code);
-        if mgr.has_symbol(&prefixed) {
-            mgr.register(hook, &prefixed);
-            hooks_registered.push(hook.to_string());
-        }
-    }
-
-    Ok(LoadedPlugin {
-        stem,
-        files,
-        hooks_registered,
-    })
+    loader::load_plugin(mgr, path)
 }
 
 pub struct PluginManager {

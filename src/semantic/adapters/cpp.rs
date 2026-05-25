@@ -24,12 +24,6 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbo
 pub struct CppAdapter;
 
 impl CppAdapter {
-    fn text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
     fn signature(&self, n: Node, s: &[u8]) -> String {
         signature_up_to_body(n, s)
     }
@@ -40,7 +34,7 @@ impl CppAdapter {
     fn declarator_name<'a>(&self, n: Node<'a>, s: &'a [u8]) -> Option<String> {
         match n.kind() {
             "identifier" | "field_identifier" | "destructor_name" | "operator_name" => {
-                Some(self.text(n, s).to_string())
+                Some(node_text(n, s).to_string())
             }
             "qualified_identifier" | "template_function" => {
                 // Last named child holds the name.
@@ -108,7 +102,7 @@ impl CppAdapter {
             // visibility tracking — treat as exported.
             is_exported: true,
             name,
-            range: self.range(n),
+            range: ByteRange::from(n),
             signature: self.signature(n, s),
             parent_class: parent,
         });
@@ -140,7 +134,7 @@ impl CppAdapter {
             // Take all text before the trailing `::name`. tree-sitter
             // exposes scope vs name fields, but we use raw text since
             // it round-trips namespaces correctly.
-            let raw = self.text(inner, s);
+            let raw = node_text(inner, s);
             if let Some((scope, _name)) = raw.rsplit_once("::") {
                 return Some(scope.to_string());
             }
@@ -169,7 +163,7 @@ impl CppAdapter {
             };
             match c.kind() {
                 "access_specifier" => {
-                    public = self.text(c, s).trim_end_matches(':') == "public";
+                    public = node_text(c, s).trim_end_matches(':') == "public";
                 }
                 "function_definition" | "declaration" => {
                     // Field name is reachable via the same
@@ -179,7 +173,7 @@ impl CppAdapter {
                             kind: SymbolKind::Method,
                             is_exported: public,
                             name,
-                            range: self.range(c),
+                            range: ByteRange::from(c),
                             signature: self.signature(c, s),
                             parent_class: Some(parent.to_string()),
                         });
@@ -194,8 +188,8 @@ impl CppAdapter {
                             kind: SymbolKind::Method,
                             is_exported: public,
                             name,
-                            range: self.range(c),
-                            signature: self.text(c, s).lines().next().unwrap_or("").to_string(),
+                            range: ByteRange::from(c),
+                            signature: node_text(c, s).lines().next().unwrap_or("").to_string(),
                             parent_class: Some(parent.to_string()),
                         });
                     }
@@ -214,7 +208,7 @@ impl CppAdapter {
             if let Some(c) = n.named_child(i)
                 && c.kind() == "type_identifier"
             {
-                return Some(self.text(c, s).to_string());
+                return Some(node_text(c, s).to_string());
             }
         }
         None
@@ -234,8 +228,8 @@ impl CppAdapter {
             kind: SymbolKind::Class,
             is_exported: true,
             name: name.clone(),
-            range: self.range(n),
-            signature: self.text(n, s).lines().next().unwrap_or("").to_string(),
+            range: ByteRange::from(n),
+            signature: node_text(n, s).lines().next().unwrap_or("").to_string(),
             parent_class: None,
         });
         for i in 0..n.named_child_count() {
@@ -280,7 +274,7 @@ impl CppAdapter {
             if let Some(c) = n.named_child(i)
                 && matches!(c.kind(), "qualified_identifier" | "identifier")
             {
-                let path = self.text(c, s).to_string();
+                let path = node_text(c, s).to_string();
                 imports.push(Import {
                     names: vec![path.clone()],
                     source: path,
@@ -296,7 +290,7 @@ impl CppAdapter {
             let Some(c) = n.named_child(i) else { continue };
             match c.kind() {
                 "system_lib_string" => {
-                    let raw = self.text(c, s);
+                    let raw = node_text(c, s);
                     let path = raw
                         .trim_matches(|ch: char| ch == '<' || ch == '>')
                         .to_string();
@@ -312,7 +306,7 @@ impl CppAdapter {
                         if let Some(sub) = c.named_child(j)
                             && sub.kind() == "string_content"
                         {
-                            let path = self.text(sub, s).to_string();
+                            let path = node_text(sub, s).to_string();
                             imports.push(Import {
                                 names: vec![path.clone()],
                                 source: path,

@@ -10,13 +10,6 @@ use crate::semantic::types::{ByteRange, ExtractedFile, Import, ImportKind, Symbo
 pub struct PythonAdapter;
 
 impl PythonAdapter {
-    fn node_text<'a>(&self, n: Node<'a>, s: &'a [u8]) -> &'a str {
-        node_text(n, s)
-    }
-    fn make_range(&self, n: Node) -> ByteRange {
-        ByteRange::from(n)
-    }
-
     fn signature_from_node(&self, node: Node, source: &[u8]) -> String {
         let body = node.child_by_field_name("body");
         let end = body.map(|b| b.start_byte()).unwrap_or(node.end_byte());
@@ -40,7 +33,7 @@ impl PythonAdapter {
                     "decorated_definition" => {
                         if let Some(inner) = child.child_by_field_name("definition") {
                             if inner.kind() == "function_definition" {
-                                let range = self.make_range(child);
+                                let range = ByteRange::from(child);
                                 self.push_method_with_range(
                                     inner, range, source, symbols, class_name,
                                 );
@@ -54,7 +47,7 @@ impl PythonAdapter {
     }
 
     fn push_method(&self, node: Node, source: &[u8], symbols: &mut Vec<Symbol>, class_name: &str) {
-        let range = self.make_range(node);
+        let range = ByteRange::from(node);
         self.push_method_with_range(node, range, source, symbols, class_name);
     }
 
@@ -67,7 +60,7 @@ impl PythonAdapter {
         class_name: &str,
     ) {
         if let Some(name_node) = node.child_by_field_name("name") {
-            let name = self.node_text(name_node, source).to_string();
+            let name = node_text(name_node, source).to_string();
             let signature = self.signature_from_node(node, source);
             symbols.push(Symbol {
                 kind: SymbolKind::Method,
@@ -100,13 +93,13 @@ impl PythonAdapter {
                         if let Some(c) = child.named_child(j) {
                             match c.kind() {
                                 "dotted_name" => {
-                                    names.push(self.node_text(c, source).to_string());
+                                    names.push(node_text(c, source).to_string());
                                 }
                                 "aliased_import" => {
                                     if let Some(alias) = c.child_by_field_name("alias") {
-                                        names.push(self.node_text(alias, source).to_string());
+                                        names.push(node_text(alias, source).to_string());
                                     } else if let Some(n) = c.child_by_field_name("name") {
-                                        names.push(self.node_text(n, source).to_string());
+                                        names.push(node_text(n, source).to_string());
                                     }
                                 }
                                 _ => {}
@@ -115,12 +108,12 @@ impl PythonAdapter {
                     }
                     if names.is_empty() {
                         if let Some(name_node) = child.child_by_field_name("name") {
-                            names.push(self.node_text(name_node, source).to_string());
+                            names.push(node_text(name_node, source).to_string());
                         }
                     }
                     if module.is_empty() {
                         if let Some(name_node) = child.child_by_field_name("name") {
-                            module = self.node_text(name_node, source).to_string();
+                            module = node_text(name_node, source).to_string();
                         }
                     }
                     imports.push(Import {
@@ -132,18 +125,18 @@ impl PythonAdapter {
                 "import_from_statement" => {
                     let module = child
                         .child_by_field_name("module_name")
-                        .map(|n| self.node_text(n, source).to_string())
+                        .map(|n| node_text(n, source).to_string())
                         .unwrap_or_default();
                     let mut names = Vec::new();
                     for j in 0..child.named_child_count() {
                         if let Some(c) = child.named_child(j) {
                             if c.kind() == "dotted_name" {
-                                names.push(self.node_text(c, source).to_string());
+                                names.push(node_text(c, source).to_string());
                             } else if c.kind() == "aliased_import" {
                                 if let Some(alias) = c.child_by_field_name("alias") {
-                                    names.push(self.node_text(alias, source).to_string());
+                                    names.push(node_text(alias, source).to_string());
                                 } else if let Some(n) = c.child_by_field_name("name") {
-                                    names.push(self.node_text(n, source).to_string());
+                                    names.push(node_text(n, source).to_string());
                                 }
                             }
                         }
@@ -162,7 +155,7 @@ impl PythonAdapter {
                     };
                     if let Some(node) = func_node {
                         if let Some(name_node) = node.child_by_field_name("name") {
-                            let name = self.node_text(name_node, source).to_string();
+                            let name = node_text(name_node, source).to_string();
                             // Dunder methods (`__init__`, `__call__`, `__repr__`, …)
                             // are part of Python's public protocol; they look
                             // "private" by the leading-underscore heuristic but
@@ -171,7 +164,7 @@ impl PythonAdapter {
                             // stay non-exported.
                             let is_dunder = name.starts_with("__") && name.ends_with("__");
                             let is_exported = is_dunder || !name.starts_with('_');
-                            let range = self.make_range(child);
+                            let range = ByteRange::from(child);
                             let signature = self.signature_from_node(node, source);
                             symbols.push(Symbol {
                                 kind: SymbolKind::Function,
@@ -186,9 +179,9 @@ impl PythonAdapter {
                 }
                 "class_definition" => {
                     if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = self.node_text(name_node, source).to_string();
+                        let name = node_text(name_node, source).to_string();
                         let is_exported = !name.starts_with('_');
-                        let range = self.make_range(child);
+                        let range = ByteRange::from(child);
                         let signature = self.signature_from_node(child, source);
                         symbols.push(Symbol {
                             kind: SymbolKind::Class,

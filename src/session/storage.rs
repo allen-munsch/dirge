@@ -396,6 +396,307 @@ mod tests {
         let dir = session_dir();
         let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
     }
+
+    // --- Integration: full persistence round-trips -------------------
+
+    fn unique_test_id(prefix: &str) -> String {
+        format!(
+            "test-{prefix}-{}",
+            std::process::id() as u64 * 1000
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        )
+    }
+
+    fn cleanup_session(id: &str) {
+        let dir = session_dir();
+        let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        // Also clean any conflict files.
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(id))
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    /// Full cycle: new session → add messages → save → load → verify.
+    #[test]
+    fn roundtrip_session_with_messages_survives_save_and_load() {
+        use crate::session::{MessageRole, Session};
+        let id = unique_test_id("roundtrip-msgs");
+        let mut s = Session::new("anthropic", "claude-opus", 200_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.add_message(MessageRole::User, "what is the answer?");
+        s.add_message(MessageRole::Assistant, "the answer is 42");
+        let orig_msg_count = s.messages.len();
+        let orig_tokens = s.total_estimated_tokens;
+
+        save_session(&s).expect("save");
+        let loaded = load_session(&id).expect("load");
+        cleanup_session(&id);
+
+        assert_eq!(loaded.messages.len(), orig_msg_count);
+        assert_eq!(loaded.messages[0].role, MessageRole::User);
+        assert_eq!(loaded.messages[0].content.as_str(), "what is the answer?");
+        assert_eq!(loaded.messages[1].role, MessageRole::Assistant);
+        assert_eq!(loaded.messages[1].content.as_str(), "the answer is 42");
+        assert_eq!(loaded.total_estimated_tokens, orig_tokens);
+        assert_eq!(loaded.model, "claude-opus");
+        assert_eq!(loaded.provider, "anthropic");
+        assert_eq!(loaded.context_window, 200_000);
+        assert!(loaded.loaded_mtime.is_some(), "load must record mtime");
+    }
+
+    /// Messages with structured tool calls must survive the round-trip.
+    #[test]
+    fn roundtrip_tool_calls_survive_save_and_load() {
+        use crate::session::{MessageRole, Session, ToolCallEntry, ToolCallState};
+        let id = unique_test_id("roundtrip-tools");
+        let mut s = Session::new("openai", "gpt-4", 128_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.add_message(MessageRole::User, "read the file");
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            "let me check",
+            vec![ToolCallEntry {
+                id: "call_abc".to_string(),
+                name: "read".to_string(),
+                args: serde_json::json!({"path": "/tmp/data.txt"}),
+                state: ToolCallState::Completed {
+                    result: "hello world\n".to_string(),
+                },
+            }],
+        );
+
+        save_session(&s).expect("save");
+        let loaded = load_session(&id).expect("load");
+        cleanup_session(&id);
+
+        let last = loaded.messages.last().unwrap();
+        assert_eq!(last.tool_calls.len(), 1);
+        assert_eq!(last.tool_calls[0].id, "call_abc");
+        assert_eq!(last.tool_calls[0].name, "read");
+        match &last.tool_calls[0].state {
+            ToolCallState::Completed { result } => {
+                assert_eq!(result, "hello world\n");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// Permission allowlist entries survive save/load.
+    #[test]
+    fn roundtrip_permission_allowlist_survives() {
+        use crate::session::{PermissionAllowEntry, Session};
+        let id = unique_test_id("roundtrip-perm");
+        let mut s = Session::new("openrouter", "test", 100_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.permission_allowlist.push(PermissionAllowEntry {
+            tool: "bash".to_string(),
+            pattern: "cargo *".to_string(),
+        });
+        s.permission_allowlist.push(PermissionAllowEntry {
+            tool: "read".to_string(),
+            pattern: "/tmp/**".to_string(),
+        });
+
+        save_session(&s).expect("save");
+        let loaded = load_session(&id).expect("load");
+        cleanup_session(&id);
+
+        assert_eq!(loaded.permission_allowlist.len(), 2);
+        assert_eq!(loaded.permission_allowlist[0].tool, "bash");
+        assert_eq!(loaded.permission_allowlist[0].pattern, "cargo *");
+        assert_eq!(loaded.permission_allowlist[1].tool, "read");
+        assert_eq!(loaded.permission_allowlist[1].pattern, "/tmp/**");
+    }
+
+    /// Compaction records persist through save/load.
+    #[test]
+    fn roundtrip_compaction_persists() {
+        use crate::session::{Compaction, MessageRole, Session};
+        let id = unique_test_id("roundtrip-compact");
+        let mut s = Session::new("p", "m", 100_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.add_message(MessageRole::User, "long conversation part 1");
+        s.add_message(MessageRole::Assistant, "reply 1");
+        s.add_message(MessageRole::User, "long conversation part 2");
+        s.add_message(MessageRole::Assistant, "reply 2");
+        s.compress("summary of first 4 messages".to_string(), 4, 50);
+
+        save_session(&s).expect("save");
+        let loaded = load_session(&id).expect("load");
+        cleanup_session(&id);
+
+        assert_eq!(loaded.compactions.len(), 1);
+        assert_eq!(
+            loaded.compactions[0].summary.as_str(),
+            "summary of first 4 messages"
+        );
+        assert_eq!(loaded.compactions[0].summarized_count, 4);
+        // After compress: summary at index 0, then any remaining messages.
+        assert_eq!(loaded.messages[0].role, MessageRole::System);
+        assert!(
+            loaded.messages[0]
+                .content
+                .contains("summary of first 4 messages")
+        );
+    }
+
+    /// Tree + message_store round-trip (fork/clone/switch surfaces
+    /// the same branches after reload).
+    #[test]
+    fn roundtrip_tree_and_message_store_survives() {
+        use crate::session::{MessageRole, Session};
+        let id = unique_test_id("roundtrip-tree");
+        let mut s = Session::new("p", "m", 100_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.add_message(MessageRole::User, "root question");
+        s.add_message(MessageRole::Assistant, "first answer");
+        let fork_target = s.messages[1].id.clone();
+        s.fork_at(&fork_target).expect("fork");
+        s.add_message(MessageRole::Assistant, "alternate answer");
+
+        save_session(&s).expect("save");
+        let loaded = load_session(&id).expect("load");
+        cleanup_session(&id);
+
+        // Tree must contain all 3 messages' nodes (root + fork-original
+        // + alternate). Messages shows only the active branch (2).
+        assert_eq!(
+            loaded.tree.entries.len(),
+            3,
+            "tree must hold all 3 nodes: got {}",
+            loaded.tree.entries.len(),
+        );
+        assert_eq!(
+            loaded.messages.len(),
+            2,
+            "active branch has 2 messages: got {}",
+            loaded.messages.len(),
+        );
+        assert_eq!(
+            loaded.message_store.len(),
+            3,
+            "store must hold all 3 messages (root + fork original + alternate): got {}",
+            loaded.message_store.len(),
+        );
+        // Leaf points to current end.
+        assert_eq!(loaded.tree.leaf_id.as_ref(), Some(&loaded.messages[1].id));
+        // The original fork target is still in the store (not in messages).
+        assert!(loaded.message_store.contains_key(&fork_target));
+    }
+
+    /// Plugin entries survive save/load round-trip.
+    #[test]
+    fn roundtrip_plugin_entries_survives() {
+        use crate::session::Session;
+        let id = unique_test_id("roundtrip-plugin");
+        let mut s = Session::new("p", "m", 100_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.append_plugin_entry("bookmark", "save point 1", true);
+        s.append_plugin_entry("stats", r#"{"tokens": 500}"#, false);
+
+        save_session(&s).expect("save");
+        let loaded = load_session(&id).expect("load");
+        cleanup_session(&id);
+
+        assert_eq!(loaded.extra_entries.len(), 2);
+        assert_eq!(loaded.extra_entries[0].custom_type, "bookmark");
+        assert_eq!(loaded.extra_entries[0].data, "save point 1");
+        assert!(loaded.extra_entries[0].display);
+        assert_eq!(loaded.extra_entries[1].custom_type, "stats");
+        assert!(!loaded.extra_entries[1].display);
+        // seq values are monotonic and unique.
+        assert!(loaded.extra_entries[0].seq < loaded.extra_entries[1].seq);
+        assert!(loaded.next_entry_seq >= 2);
+    }
+
+    /// Session metadata (schema_version, id, name, created_at) survives
+    /// a double save — the second save updates updated_at but preserves
+    /// the rest.
+    #[test]
+    fn roundtrip_resave_preserves_metadata() {
+        use crate::session::Session;
+        let id = unique_test_id("roundtrip-resave");
+        let mut s = Session::new("openrouter", "test", 100_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        let orig_created = s.created_at.clone();
+        save_session(&s).expect("save");
+
+        // Load, modify, re-save.
+        let mut loaded = load_session(&id).expect("load");
+        loaded.add_message(crate::session::MessageRole::User, "added after reload");
+        save_session(&loaded).expect("resave");
+
+        let reloaded = load_session(&id).expect("reload");
+        cleanup_session(&id);
+
+        assert_eq!(reloaded.id, loaded.id);
+        assert_eq!(reloaded.created_at, orig_created);
+        assert_eq!(reloaded.messages.len(), 1);
+        assert_eq!(reloaded.messages[0].content.as_str(), "added after reload");
+        // updated_at must advance (or at least be present).
+        assert!(!reloaded.updated_at.is_empty());
+    }
+
+    /// Deleting a session then loading it returns an error with
+    /// the file path in the message.
+    #[test]
+    fn delete_session_removes_file() {
+        use crate::session::Session;
+        let id = unique_test_id("roundtrip-delete");
+        let mut s = Session::new("p", "m", 100_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        save_session(&s).expect("save");
+
+        delete_session(&id).expect("delete");
+        let err = load_session(&id).expect_err("load after delete must fail");
+        cleanup_session(&id); // best-effort — file already gone
+
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("o such file") || msg.contains("No such file"),
+            "error must mention missing file: {msg}"
+        );
+    }
+
+    /// Branch summaries survive save/load (Phase 4 — pruned subtree
+    /// records).
+    #[test]
+    fn roundtrip_branch_summaries_survive() {
+        use crate::session::{BranchSummary, Session};
+        let id = unique_test_id("roundtrip-branch");
+        let mut s = Session::new("p", "m", 100_000);
+        s.id = compact_str::CompactString::from(id.clone());
+        s.branch_summaries.push(BranchSummary {
+            root_id: compact_str::CompactString::from("root-1"),
+            parent_id: compact_str::CompactString::from("parent-1"),
+            message_count: 12,
+            preview: "alternative approach...".to_string(),
+            created_at: "2026-05-01T00:00:00Z".to_string(),
+        });
+
+        save_session(&s).expect("save");
+        let loaded = load_session(&id).expect("load");
+        cleanup_session(&id);
+
+        assert_eq!(loaded.branch_summaries.len(), 1);
+        assert_eq!(loaded.branch_summaries[0].root_id, "root-1");
+        assert_eq!(loaded.branch_summaries[0].parent_id, "parent-1");
+        assert_eq!(loaded.branch_summaries[0].message_count, 12);
+        assert_eq!(
+            loaded.branch_summaries[0].preview,
+            "alternative approach..."
+        );
+    }
 }
 
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
