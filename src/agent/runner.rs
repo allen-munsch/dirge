@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 use crate::agent::recovery::{self, RecoveryPolicy};
 use crate::event::AgentEvent;
 use crate::session::{MessageRole, Session};
+use crate::ui::ansi::{self, StripPolicy};
 
 /// Per-chunk read deadline for streaming provider responses. Applied
 /// to every `stream.next().await` in both the interactive and
@@ -232,7 +233,8 @@ where
                 ))) => {
                     full_response.push_str(&text.text);
                     if !suppress_inline {
-                        print!("{}", text.text);
+                        let safe = ansi::strip_controls(&text.text, StripPolicy::KEEP_NEWLINE);
+                        print!("{safe}");
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                     had_output = true;
@@ -246,7 +248,9 @@ where
                         // user-visible result. Suppressing keeps the
                         // JSON output clean of chain-of-thought
                         // noise.
-                        eprint!("{}", r.display_text());
+                        let display = r.display_text();
+                        let safe = ansi::strip_controls(&display, StripPolicy::KEEP_NEWLINE);
+                        eprint!("{safe}");
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                     }
                 }
@@ -319,7 +323,8 @@ where
                     // the user understands what happened.
                     println!();
                     println!("[plugin replace-result]");
-                    println!("{}", replacement);
+                    let safe = ansi::strip_controls(&replacement, StripPolicy::KEEP_NEWLINE);
+                    println!("{safe}");
                     full_response = replacement;
                 }
             }

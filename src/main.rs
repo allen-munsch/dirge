@@ -35,6 +35,7 @@ use crate::lsp::spawn::{ProcessCommand, ProcessSpawner};
 use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::{PermCheck, PermissionChecker};
 use crate::permission::{PermissionConfig, SecurityMode};
+use crate::ui::ansi::{self, StripPolicy};
 
 /// Per-session channels and shared state, threaded through the agent build
 /// chain in place of a ten-position tuple. Cloneable senders + shared state
@@ -1057,7 +1058,8 @@ async fn run_headless_loop(
                     } else {
                         format!("{}\n{}", stdout, stderr)
                     };
-                    eprintln!("{}", combined);
+                    let safe = ansi::strip_controls(&combined, StripPolicy::KEEP_NEWLINE);
+                    eprintln!("{safe}");
                     Some(combined)
                 }
                 Err(e) => {

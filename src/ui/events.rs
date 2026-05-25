@@ -218,27 +218,39 @@ pub fn sanitize_output(text: &str) -> CompactString {
     let mut chars = stripped.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
+            // Strip ALL escape sequences, not just CSI/OSC.
+            // CSI: ESC [ ... final-byte
+            // OSC: ESC ] ... BEL or ESC \
+            // DCS/APC/PM/SOS: ESC P/X/^/_ ... ESC \
+            // Single-byte: ESC + any other char (reset, etc.)
             match chars.next() {
                 Some('[') | Some(']') => {
+                    // Consume until sequence terminator (alphabetic,
+                    // tilde, or BEL for OSC).
                     for next in &mut chars {
-                        if next.is_ascii_alphabetic() || next == '~' {
+                        if next.is_ascii_alphabetic() || next == '~' || next == '\x07' {
                             break;
                         }
                     }
                 }
-                Some(_) => {}
+                // DCS/APC/PM/SOS — consume until ST (ESC \).
+                Some('P') | Some('X') | Some('^') | Some('_') => {
+                    let mut prev = '\0';
+                    for next in &mut chars {
+                        if prev == '\x1b' && next == '\\' {
+                            break;
+                        }
+                        prev = next;
+                    }
+                }
+                Some(_) => {} // Single-byte esc sequence — skip the second byte.
                 None => break,
             }
-        } else if c.is_ascii_control() && c != '\n' && c != '\t' {
-            // Strip carriage returns too. \r moves the cursor to
-            // column 0 mid-line, which inside a tool chamber row
-            // overwrites the left border. Previously sanitize_output
-            // let \r through (originally allowed for CRLF
-            // preservation), so a bash tool printing progress with
-            // `\rstep N/M` could collapse the chamber rendering.
-            // The display path normalizes CRLF before reaching
-            // here when needed.
-            continue;
+        } else if c.is_ascii_control() || (0x80..=0x9F).contains(&(c as u32)) {
+            if c != '\n' && c != '\t' {
+                continue;
+            }
+            result.push(c);
         } else {
             result.push(c);
         }
