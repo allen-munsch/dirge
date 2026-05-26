@@ -175,6 +175,13 @@ impl SkillManager {
         self.skills_dir.join(name).join("SKILL.md").is_file()
     }
 
+    /// Read a skill's full SKILL.md content.
+    pub fn read_content(&self, name: &str) -> Result<String, String> {
+        let path = self.skills_dir.join(name).join("SKILL.md");
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read skill '{}': {e}", name))
+    }
+
     /// List all skill names in the skills directory.
     pub fn list(&self) -> Result<Vec<String>, String> {
         if !self.skills_dir.is_dir() {

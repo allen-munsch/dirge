@@ -1,4 +1,4 @@
-Legacy: run_agent_loop_continue + LoopError removed. New way: mid-run steering via get_steering_messages. Interjected variant IS actively constructed by bridge (rig stream cancellation). Don't mark dead_code.
+Session DB pitfalls: (1) FTS5 external content tables — `'rebuild'` re-indexes using OLD trigger formula; to change indexed content need DELETE + INSERT SELECT. (2) `cargo test` parallelism: env var mutations need `Mutex<()>` serialization. (3) `SkillState` enum: `PartialEq` + move means check equality BEFORE assigning. (4) `atomic_write_sync` returns `Result<(), Error>` not `Result<(), String>` — need `.map_err`. (5) Migration chain: user_version gating, `IF NOT EXISTS` for FTS triggers, handle "duplicate column name" in ALTER TABLE.
 §
 Learning loop gaps: R1 fixed — per-turn session DB writes + FTS5 tool_name/tool_calls indexing + v2 backfill migration. Remaining: compression (fold flag unused), skill usage tracking, fuzzy patches, curator stub, skills in preamble. 14-gap audit in PLAN_LEARNING.md.
 §

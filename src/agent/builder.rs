@@ -155,6 +155,34 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         };
     let skill_manager = crate::extras::skills::manager::SkillManager::new(&paths);
 
+    // Inject available project skills into the preamble so the
+    // model knows what procedural knowledge exists for this project.
+    // Skills are listed with name + description; the model loads
+    // full content on demand via the `skill` tool.
+    match skill_manager.list() {
+        Ok(names) if !names.is_empty() => {
+            let mut skill_lines = Vec::new();
+            for name in &names {
+                if let Ok(content) = skill_manager.read_content(name) {
+                    if let Some(spec) = crate::extras::skills::format::parse_skill_spec(&content, name) {
+                        let desc = if spec.description.is_empty() { "(no description)".to_string() } else { spec.description.clone() };
+                        skill_lines.push(format!("  - **{name}**: {desc}"));
+                    }
+                }
+            }
+            if !skill_lines.is_empty() {
+                preamble.push_str("\n\n## Project Skills\n\n");
+                preamble.push_str("The following skills are available for this project. ");
+                preamble.push_str("Use the `skill` tool with action='view' to load full content.\n\n");
+                for line in &skill_lines {
+                    preamble.push_str(line);
+                    preamble.push('\n');
+                }
+            }
+        }
+        _ => {}
+    }
+
     // Inject mode-specific reminders
     if let Some(prompt_name) = &context.current_prompt_name {
         let plan_exists = std::env::current_dir()

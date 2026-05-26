@@ -16,5 +16,8 @@ Compiler catches all non-exhaustive patterns. Run `cargo test --bin dirge` (1261
 - Schema versioning: `PRAGMA user_version`, sequential migrate() checks
 - Env var tests: `static ENV_LOCK: Mutex<()>` + `EnvGuard` RAII with Drop cleanup
 §
-## Learning loop implementation status
-Plan at PLAN_LEARNING.md — 14 gaps, 10 rounds. Round 1 DONE (FTS5 tool_name indexing, per-turn DB writes via `persist_turn_to_db()` at Done/Interjected/ContextOverflow/Error boundaries). Rounds 3-6 launched as parallel subagents. Remaining: R2 (trigram FTS5, schema fields), R7 (lineage dedup, FTS5 sanitize), R8 (curator transitions), R9 (actual compression), R10 (skills in system prompt). Verifies: `cargo test --bin dirge` (1261), `cargo check --bin dirge` = 0 warnings.
+## Learning loop implementation — status + porting rules
+PLAN_LEARNING.md v2: 14 gaps, 10 rounds. Completed: R1 (FTS5 tool_name indexing, per-turn DB writes at all 4 boundaries), R2 (trigram FTS5, _last_init_error, v4/v5 schema columns, end_session()), R3 (regex threat patterns, +6 security tests), R4 (skill usage tracking sidecar, .usage.json, +11 tests), R6 (Hermes-complete review prompt, action summary, prompt override). Remaining: R5 (fuzzy matching — running), R7-10.
+Porting rules: read Hermes first, port every guard clause, match error messages, no simplifications, test after every round. FTS5 backfill: DELETE + INSERT SELECT (NOT 'rebuild'). Env var tests: Mutex + EnvGuard RAII.
+§
+Build commands: `cargo check --bin dirge` for type checking, `cargo test --bin dirge` for full test suite (1286 tests, 2.3s). Tests run in parallel by default — env var mutations need Mutex serialization. `cargo test --bin dirge <filter>` for targeted test runs.
