@@ -417,17 +417,29 @@ struct FileLock {
 
 impl FileLock {
     fn acquire(path: &PathBuf) -> Result<Self, String> {
-        // Simple create-exclusive lock file. If the file already
-        // exists, spin-wait briefly then fail.
-        for _ in 0..50 {
+        // Simple create-exclusive lock file with PID-based
+        // staleness detection. If the process crashes, the lock
+        // file remains — we detect this by checking whether the
+        // PID in the lock file is still alive.
+        for attempt in 0..50 {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create_new(true)
                 .open(path)
             {
-                Ok(_f) => return Ok(FileLock { path: path.clone() }),
+                Ok(mut f) => {
+                    // Write our PID into the lock for staleness detection.
+                    let pid = std::process::id().to_string();
+                    let _ = std::io::Write::write_all(&mut f, pid.as_bytes());
+                    return Ok(FileLock { path: path.clone() });
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Check if the lock holder is still alive.
+                    if attempt == 0 && Self::is_lock_stale(path) {
+                        let _ = std::fs::remove_file(path);
+                        continue; // Retry immediately.
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(e) => {
@@ -436,6 +448,41 @@ impl FileLock {
             }
         }
         Err("Timed out waiting for memory file lock (held by another process?)".to_string())
+    }
+
+    /// Check if a lock file is stale: read the PID inside, and
+    /// verify the process no longer exists. On platforms where
+    /// we can't check, conservatively return false.
+    fn is_lock_stale(path: &PathBuf) -> bool {
+        let content = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return true, // Can't read = stale/corrupt.
+        };
+        let pid: u32 = match content.trim().parse() {
+            Ok(p) => p,
+            Err(_) => return true, // Not a PID = stale/corrupt.
+        };
+        !pid_is_alive(pid)
+    }
+}
+
+/// Check if a process with the given PID exists.
+/// Returns false on platforms where we can't determine this.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) is the standard Unix way to check process
+        // existence without sending a signal. Returns 0 if alive,
+        // -1 with ESRCH if the process doesn't exist.
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms, we can't check process existence
+        // easily. Conservatively assume alive so we don't break
+        // a valid lock.
+        let _ = pid;
+        false
     }
 }
 

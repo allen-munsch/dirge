@@ -48,13 +48,11 @@ This is what the Pi project got right about extensibility: if you expose the age
 
 You might've heard how open models like DeepSeek are bad at tool calling. The conventional wisdom says that if you want reliable tool use, you pay for a model like Claude Opus that internalized every API contract during pretraining.
 
-We spent two days looking at billions of tokens through a sibling CLI and came to a different conclusion: **"bad at tool calling" is almost always a harness problem, not a model problem.**
-
-By the end of that investigation, DeepSeek v4-pro was beating Opus 4.7 on our internal evals 6 out of 10 times. The model didn't change. The harness got more forgiving in the places it needed to be.
+But I've different conclusion, having looked at how the model interacts with Dirge, which is that bad at tool calling is almost always a harness problem rather than a model problem. The harness simply needs to be more accomodating in a way that the model expects.
 
 ### The four shape failures
 
-Across DeepSeek-flash, DeepSeek v4-pro, GLM, and Qwen, the same four mistakes repeat with almost identical distribution:
+Across DeepSeek-flash, DeepSeek v4-pro, GLM, and Qwen, the same four mistakes tend to occur with almost identical distribution:
 
 1. **`null` for optional field** — emitting `{"path": "x", "offset": null}` instead of omitting `offset`
 2. **JSON-string instead of array** — emitting `{"paths": "[\"a\",\"b\"]"}` as a string containing JSON
