@@ -140,7 +140,14 @@ impl Curator {
             return Ok(Vec::new());
         }
 
+        // Load usage tracking for pin/activity checks.
+        let usage = match crate::extras::skills::usage::UsageStore::load(&self.paths) {
+            Ok(u) => Some(u),
+            Err(_) => None,
+        };
+
         let mut stale_names: Vec<String> = Vec::new();
+        let mut reactivated: Vec<String> = Vec::new();
 
         for entry in std::fs::read_dir(&skills_dir)
             .map_err(|e| format!("Failed to read skills directory: {e}"))?
@@ -154,36 +161,75 @@ impl Curator {
             }
 
             // Skip archived skills (already in .archive/).
-            if path.file_name().map(|n| n == ".archive").unwrap_or(false) {
+            let file_name = path.file_name().and_then(|n| n.to_str());
+            if file_name == Some(".archive") {
                 continue;
             }
 
-            // Check last modified time.
-            let mod_time = match std::fs::metadata(path.join("SKILL.md")) {
-                Ok(meta) => meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(now),
-                Err(_) => continue,
+            let name = match file_name {
+                Some(n) => n.to_string(),
+                None => continue,
             };
 
-            let age_days = Duration::from_secs(now.saturating_sub(mod_time)).as_secs() / 86400;
-
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s.to_string());
-
-            if let Some(name) = name {
-                if age_days >= ARCHIVE_AFTER_STALE_DAYS {
-                    // Archive this skill.
-                    self.archive_skill(&name)?;
-                } else if age_days >= STALE_AFTER_DAYS {
-                    stale_names.push(name);
+            // Skip pinned skills — they're exempt from all auto-transitions.
+            if let Some(ref usage) = usage {
+                if usage.get(&name).map(|u| u.pinned).unwrap_or(false) {
+                    continue;
+                }
+                // Skip bundled skills (not agent-created).
+                if !usage.is_agent_created(&name) {
+                    // Bundled skill — skip transition but still track.
+                    continue;
                 }
             }
+
+            // Get activity age from usage tracking if available,
+            // fall back to file modification time.
+            let age_seconds = if let Some(ref usage) = usage {
+                usage.activity_age_seconds(&name).unwrap_or_else(|| {
+                    // Fallback: compute from file modification time.
+                    file_mod_age(&path.join("SKILL.md"), now)
+                })
+            } else {
+                file_mod_age(&path.join("SKILL.md"), now)
+            };
+
+            let age_days = age_seconds / 86400;
+
+            if age_days >= ARCHIVE_AFTER_STALE_DAYS {
+                // Archive this skill.
+                self.archive_skill(&name)?;
+                // Update usage state if loaded.
+                if let Some(ref usage) = usage {
+                    let mut u = crate::extras::skills::usage::UsageStore::load(&self.paths)
+                        .unwrap_or_else(|_| unreachable!());
+                    let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Archived);
+                }
+            } else if age_days >= STALE_AFTER_DAYS {
+                stale_names.push(name.clone());
+                if let Some(ref usage) = usage {
+                    let mut u = crate::extras::skills::usage::UsageStore::load(&self.paths)
+                        .unwrap_or_else(|_| unreachable!());
+                    let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Stale);
+                }
+            } else if let Some(ref usage) = usage {
+                // Recent activity on a stale skill → reactivate.
+                if usage.get(&name).map(|u| matches!(u.state, crate::extras::skills::usage::SkillState::Stale)).unwrap_or(false) {
+                    let mut u = crate::extras::skills::usage::UsageStore::load(&self.paths)
+                        .unwrap_or_else(|_| unreachable!());
+                    let _ = u.set_state(&name, crate::extras::skills::usage::SkillState::Active);
+                    reactivated.push(name);
+                }
+            }
+        }
+
+        if !reactivated.is_empty() {
+            tracing::info!(
+                target: "dirge::curator",
+                count = %reactivated.len(),
+                "Reactivated {} stale skills with recent activity",
+                reactivated.len()
+            );
         }
 
         self.state.last_run = Some(now);
@@ -233,6 +279,16 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Fallback: compute file modification age in seconds.
+fn file_mod_age(path: &std::path::Path, now: u64) -> u64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| now.saturating_sub(d.as_secs()))
+        .unwrap_or(now)
 }
 
 #[cfg(test)]

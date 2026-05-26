@@ -545,6 +545,67 @@ impl SessionDb {
         Ok(results)
     }
 
+    /// Search messages via the trigram FTS5 index (CJK/substring queries).
+    /// The trigram tokenizer creates overlapping 3-character sequences,
+    /// making substring matching work natively for any script.
+    /// Port of Hermes's trigram search path (hermes_state.py:2245-2350).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn search_messages_trigram(
+        &self,
+        query: &str,
+        role_filter: Option<&str>,
+    ) -> Result<Vec<SearchResult>, String> {
+        fn map_row(row: &rusqlite::Row) -> rusqlite::Result<SearchResult> {
+            Ok(SearchResult {
+                session_id: row.get(0)?,
+                content: row.get(1)?,
+                role: row.get(2)?,
+                timestamp: row.get(3)?,
+            })
+        }
+
+        let (sql, has_role) = if role_filter.is_some() {
+            (
+                "SELECT m.session_id, m.content, m.role, m.timestamp
+                 FROM messages_fts_trigram f
+                 JOIN messages m ON f.rowid = m.id
+                 WHERE messages_fts_trigram MATCH ?1 AND m.role = ?2
+                 ORDER BY rank
+                 LIMIT 50",
+                true,
+            )
+        } else {
+            (
+                "SELECT m.session_id, m.content, m.role, m.timestamp
+                 FROM messages_fts_trigram f
+                 JOIN messages m ON f.rowid = m.id
+                 WHERE messages_fts_trigram MATCH ?1
+                 ORDER BY rank
+                 LIMIT 50",
+                false,
+            )
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| format!("Failed to prepare trigram search: {e}"))?;
+
+        let results: Vec<SearchResult> = if has_role {
+            stmt.query_map(params![query, role_filter.unwrap()], map_row)
+                .map_err(|e| format!("Trigram FTS5 search failed: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            stmt.query_map(params![query], map_row)
+                .map_err(|e| format!("Trigram FTS5 search failed: {e}"))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        Ok(results)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_parent_session(&self, session_id: &str, parent_id: &str) -> Result<(), String> {
         self.conn

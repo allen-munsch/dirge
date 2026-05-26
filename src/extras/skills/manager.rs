@@ -193,7 +193,8 @@ impl SkillManager {
                 let entry = entry.ok()?;
                 let path = entry.path();
                 if path.is_dir() && path.join("SKILL.md").is_file() {
-                    path.file_name()?.to_str().map(|s| s.to_string())
+                    let name = path.file_name()?.to_str()?.to_string();
+                    if name == ".archive" { None } else { Some(name) }
                 } else {
                     None
                 }
@@ -201,6 +202,38 @@ impl SkillManager {
             .collect();
         names.sort();
         Ok(names)
+    }
+
+    /// Archive a skill — move to `.archive/`. Does not delete.
+    pub fn archive(&self, name: &str) -> Result<(), String> {
+        let src = self.skills_dir.join(name);
+        if !src.is_dir() {
+            return Err(format!("Skill '{}' does not exist", name));
+        }
+        let archive_dir = self.skills_dir.join(".archive");
+        std::fs::create_dir_all(&archive_dir)
+            .map_err(|e| format!("Failed to create archive dir: {e}"))?;
+        let dest = archive_dir.join(name);
+        if dest.exists() {
+            return Err(format!("Skill '{}' already archived", name));
+        }
+        std::fs::rename(&src, &dest)
+            .map_err(|e| format!("Failed to archive skill '{}': {}", name, e))
+    }
+
+    /// Restore an archived skill.
+    pub fn restore(&self, name: &str) -> Result<(), String> {
+        let archive_dir = self.skills_dir.join(".archive");
+        let src = archive_dir.join(name);
+        if !src.is_dir() {
+            return Err(format!("Archived skill '{}' not found", name));
+        }
+        let dest = self.skills_dir.join(name);
+        if dest.exists() {
+            return Err(format!("Skill '{}' already exists", name));
+        }
+        std::fs::rename(&src, &dest)
+            .map_err(|e| format!("Failed to restore skill '{}': {}", name, e))
     }
 }
 
