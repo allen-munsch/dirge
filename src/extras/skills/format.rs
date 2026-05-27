@@ -44,24 +44,26 @@ pub fn parse_skill_spec(content: &str, dir_name: &str) -> Option<SkillSpec> {
         return None;
     }
 
-    let yaml = parse_yaml_frontmatter(&frontmatter);
+    let yaml = parse_yaml_frontmatter(&frontmatter)?;
 
-    let name = yaml
-        .scalar("name")
+    let name = yaml_scalar(&yaml, "name")
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| dir_name.to_string());
 
-    let description = yaml.scalar("description").unwrap_or_default();
+    // Block scalars (`|` / `>`) in YAML 1.2 keep a single trailing
+    // newline by default (clip chomping). Trim it so callers see a
+    // clean string — matches the previous hand-rolled behavior.
+    let description = yaml_scalar(&yaml, "description")
+        .map(|s| s.trim_end().to_string())
+        .unwrap_or_default();
 
     // Tags / related can live either at the top level or nested
     // under `metadata.dirge.*`. Try both — top level wins.
-    let tags = yaml
-        .list("tags")
-        .or_else(|| yaml.list_at_path(&["metadata", "dirge", "tags"]))
+    let tags = yaml_list(&yaml["tags"])
+        .or_else(|| yaml_list(&yaml["metadata"]["dirge"]["tags"]))
         .unwrap_or_default();
-    let related = yaml
-        .list("related_skills")
-        .or_else(|| yaml.list_at_path(&["metadata", "dirge", "related_skills"]))
+    let related = yaml_list(&yaml["related_skills"])
+        .or_else(|| yaml_list(&yaml["metadata"]["dirge"]["related_skills"]))
         .unwrap_or_default();
 
     Some(SkillSpec {
@@ -170,353 +172,52 @@ fn split_frontmatter(content: &str) -> Option<(String, String)> {
     Some((fm, body))
 }
 
-// ── Minimal YAML frontmatter parser ────────────────────
+// ── YAML frontmatter parser (yaml-rust2 adapter) ───────
 //
-// A real `serde_yaml` integration would be the obvious solution
-// but the project is intentionally lean on dependencies (see
-// Cargo.toml — minimalist coding agent). `serde_yaml` is also
-// unmaintained since 2024.
-//
-// This hand-rolled parser covers the cases we documented:
-//   - scalar values, optionally quoted with `"…"` or `'…'`
-//     (handles embedded `:` inside quotes)
-//   - block scalars `|` and `>` (multi-line strings)
-//   - flow arrays `[a, b, c]`
-//   - flow maps  `{ key: value, key2: value2 }`
-//   - nested block maps via indentation (2-space convention)
-//   - block list items `- item`
-//
-// We don't model the full YAML 1.2 spec — we model the shape
-// of skill frontmatter we actually see.
+// Thin adapter over `yaml_rust2::YamlLoader`. The crate is the
+// maintained fork of the abandoned `yaml-rust`, fully YAML 1.2
+// compliant — handles block scalars (`|` / `>` with `-`/`+` chomp
+// indicators), flow arrays, flow maps, nested mappings, quoted
+// strings, etc., natively.
 
-/// A minimal YAML value — sum of scalar / sequence / mapping.
-#[derive(Debug, Clone, PartialEq)]
-enum YamlValue {
-    Scalar(String),
-    Sequence(Vec<YamlValue>),
-    Mapping(Vec<(String, YamlValue)>),
+use yaml_rust2::{Yaml, YamlLoader};
+
+/// Parse frontmatter body (between the `---` markers) and return
+/// the first document. Returns `None` if the YAML is malformed —
+/// callers treat that as "ignore frontmatter".
+fn parse_yaml_frontmatter(frontmatter: &str) -> Option<Yaml> {
+    let mut docs = YamlLoader::load_from_str(frontmatter).ok()?;
+    if docs.is_empty() {
+        // Empty frontmatter → behave as an empty mapping so all
+        // lookups produce `BadValue` and resolve to defaults.
+        return Some(Yaml::Hash(Default::default()));
+    }
+    Some(docs.remove(0))
 }
 
-impl YamlValue {
-    /// Get a child value by key (only meaningful for mappings).
-    fn get(&self, key: &str) -> Option<&YamlValue> {
-        if let YamlValue::Mapping(entries) = self {
-            for (k, v) in entries {
-                if k == key {
-                    return Some(v);
-                }
-            }
-        }
-        None
-    }
-
-    /// Get a scalar string at the top-level key.
-    fn scalar(&self, key: &str) -> Option<String> {
-        match self.get(key)? {
-            YamlValue::Scalar(s) => Some(s.clone()),
-            _ => None,
-        }
-    }
-
-    /// Get a list-of-strings at the top-level key. Returns `None`
-    /// if the key is missing; returns `Some(vec![])` if it's
-    /// present but empty.
-    fn list(&self, key: &str) -> Option<Vec<String>> {
-        match self.get(key)? {
-            YamlValue::Sequence(items) => Some(
-                items
-                    .iter()
-                    .filter_map(|v| match v {
-                        YamlValue::Scalar(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            ),
-            YamlValue::Scalar(s) if !s.is_empty() => Some(vec![s.clone()]),
-            _ => None,
-        }
-    }
-
-    /// Walk a path of keys and return a list-of-strings.
-    fn list_at_path(&self, path: &[&str]) -> Option<Vec<String>> {
-        let (last, rest) = path.split_last()?;
-        let mut cur = self;
-        for k in rest {
-            cur = cur.get(k)?;
-        }
-        cur.list(last)
-    }
+/// Get a scalar string at the top-level key. Returns `None` if
+/// missing or non-scalar.
+fn yaml_scalar(yaml: &Yaml, key: &str) -> Option<String> {
+    yaml[key].as_str().map(|s| s.to_string())
 }
 
-/// Parse frontmatter body (between the `---` markers) into a
-/// top-level mapping. Anything that doesn't parse cleanly is
-/// silently skipped — we want the parser to be best-effort, not
-/// a YAML linter.
-fn parse_yaml_frontmatter(frontmatter: &str) -> YamlValue {
-    // Strip blank/comment lines, but keep indentation on real
-    // lines so we can detect block structure.
-    let lines: Vec<&str> = frontmatter
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-        .collect();
-    let (value, _consumed) = parse_block_mapping(&lines, 0, 0);
-    value
-}
-
-/// Count leading-space indent (tabs count as 1 — we don't see them
-/// in our frontmatter and treating them as 1 keeps the math simple).
-fn indent_of(line: &str) -> usize {
-    line.bytes().take_while(|b| *b == b' ').count()
-}
-
-/// Parse a block mapping starting at `lines[start]` with the given
-/// indent. Returns the mapping plus the number of lines consumed.
-fn parse_block_mapping(lines: &[&str], start: usize, indent: usize) -> (YamlValue, usize) {
-    let mut entries: Vec<(String, YamlValue)> = Vec::new();
-    let mut i = start;
-    while i < lines.len() {
-        let line = lines[i];
-        let line_indent = indent_of(line);
-        if line_indent < indent {
-            break;
-        }
-        if line_indent > indent {
-            // Shouldn't happen at this level — skip defensively.
-            i += 1;
-            continue;
-        }
-        let trimmed = &line[line_indent..];
-        // A block list item at this indent terminates the map.
-        if trimmed.starts_with("- ") || trimmed == "-" {
-            break;
-        }
-        let Some((key, rest)) = split_key_value(trimmed) else {
-            // Not a mapping line — give up on this level.
-            break;
-        };
-        i += 1;
-        let rest_trim = rest.trim();
-        // Block scalar markers `|` / `|-` / `>` / `>-`.
-        if rest_trim == "|"
-            || rest_trim == "|-"
-            || rest_trim == "|+"
-            || rest_trim == ">"
-            || rest_trim == ">-"
-            || rest_trim == ">+"
-        {
-            let fold = rest_trim.starts_with('>');
-            let (text, consumed) = parse_block_scalar(lines, i, indent, fold);
-            entries.push((key, YamlValue::Scalar(text)));
-            i += consumed;
-            continue;
-        }
-        if !rest_trim.is_empty() {
-            // Scalar / flow value on the same line.
-            entries.push((key, parse_inline_value(rest_trim)));
-            continue;
-        }
-        // Empty value — look at the next line. May be a nested
-        // mapping or a block sequence.
-        if i < lines.len() {
-            let next = lines[i];
-            let next_indent = indent_of(next);
-            if next_indent > indent {
-                let next_trim = &next[next_indent..];
-                if next_trim.starts_with("- ") || next_trim == "-" {
-                    let (seq, consumed) = parse_block_sequence(lines, i, next_indent);
-                    entries.push((key, seq));
-                    i += consumed;
-                } else {
-                    let (sub, consumed) = parse_block_mapping(lines, i, next_indent);
-                    entries.push((key, sub));
-                    i += consumed;
-                }
-                continue;
-            }
-        }
-        // No value, no children — empty scalar.
-        entries.push((key, YamlValue::Scalar(String::new())));
-    }
-    (YamlValue::Mapping(entries), i - start)
-}
-
-/// Parse a block sequence at the given indent.
-fn parse_block_sequence(lines: &[&str], start: usize, indent: usize) -> (YamlValue, usize) {
-    let mut items: Vec<YamlValue> = Vec::new();
-    let mut i = start;
-    while i < lines.len() {
-        let line = lines[i];
-        let line_indent = indent_of(line);
-        if line_indent < indent {
-            break;
-        }
-        if line_indent > indent {
-            i += 1;
-            continue;
-        }
-        let trimmed = &line[line_indent..];
-        let Some(item_text) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| if trimmed == "-" { Some("") } else { None })
-        else {
-            break;
-        };
-        i += 1;
-        let item_text = item_text.trim();
-        if item_text.is_empty() {
-            // Possibly a nested mapping at greater indent.
-            if i < lines.len() {
-                let next_indent = indent_of(lines[i]);
-                if next_indent > indent {
-                    let (sub, consumed) = parse_block_mapping(lines, i, next_indent);
-                    items.push(sub);
-                    i += consumed;
-                    continue;
-                }
-            }
-            items.push(YamlValue::Scalar(String::new()));
-        } else {
-            items.push(parse_inline_value(item_text));
-        }
-    }
-    (YamlValue::Sequence(items), i - start)
-}
-
-/// Parse a block scalar (literal `|` or folded `>`). Returns the
-/// joined text plus number of lines consumed.
-fn parse_block_scalar(
-    lines: &[&str],
-    start: usize,
-    parent_indent: usize,
-    fold: bool,
-) -> (String, usize) {
-    let mut content_lines: Vec<&str> = Vec::new();
-    let mut i = start;
-    let mut block_indent: Option<usize> = None;
-    while i < lines.len() {
-        let line = lines[i];
-        let line_indent = indent_of(line);
-        if line_indent <= parent_indent {
-            break;
-        }
-        let indent = *block_indent.get_or_insert(line_indent);
-        // Strip the block's indent off the front, defensively.
-        let stripped = if line.len() >= indent {
-            &line[indent..]
-        } else {
-            ""
-        };
-        content_lines.push(stripped);
-        i += 1;
-    }
-    let joined = if fold {
-        content_lines.join(" ")
-    } else {
-        content_lines.join("\n")
-    };
-    (joined.trim_end().to_string(), i - start)
-}
-
-/// Split a line `key: value` into `(key, value-text)`. Handles
-/// quoted keys minimally — most skill frontmatter uses bare keys.
-/// Skips `:` chars inside `"…"` / `'…'` quotes so values like
-/// `description: "foo: bar"` work correctly.
-fn split_key_value(line: &str) -> Option<(String, &str)> {
-    let bytes = line.as_bytes();
-    let mut in_double = false;
-    let mut in_single = false;
-    let mut idx = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'"' if !in_single => in_double = !in_double,
-            b'\'' if !in_double => in_single = !in_single,
-            b':' if !in_double && !in_single => {
-                // Require either end-of-line or a following space —
-                // matches YAML's mapping-indicator rule.
-                let next = bytes.get(i + 1).copied();
-                if next.is_none() || next == Some(b' ') || next == Some(b'\t') {
-                    idx = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let idx = idx?;
-    let key_raw = line[..idx].trim();
-    let key = strip_quotes(key_raw).to_string();
-    if key.is_empty() {
-        return None;
-    }
-    Some((key, &line[idx + 1..]))
-}
-
-/// Strip a surrounding `"…"` or `'…'` quote pair.
-fn strip_quotes(s: &str) -> &str {
-    let s = s.trim();
-    if s.len() >= 2 {
-        let bytes = s.as_bytes();
-        if (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
-        {
-            return &s[1..s.len() - 1];
-        }
-    }
-    s
-}
-
-/// Parse a single-line YAML value. Recognises `[…]` flow arrays,
-/// `{…}` flow maps, quoted strings, or bare scalars.
-fn parse_inline_value(s: &str) -> YamlValue {
-    let s = s.trim();
-    if s.starts_with('[') && s.ends_with(']') {
-        return YamlValue::Sequence(
-            split_flow(&s[1..s.len() - 1])
-                .into_iter()
-                .map(|item| parse_inline_value(&item))
+/// Coerce a YAML node to a list-of-strings. Returns:
+///   - `None` if the node is missing or null
+///   - `Some(vec![])` if the node is an empty sequence
+///   - `Some(vec![s])` if the node is a bare scalar (promoted)
+///   - `Some(vec)` for sequences (non-string items filtered out)
+fn yaml_list(node: &Yaml) -> Option<Vec<String>> {
+    match node {
+        Yaml::BadValue | Yaml::Null => None,
+        Yaml::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect(),
-        );
+        ),
+        Yaml::String(s) if !s.is_empty() => Some(vec![s.clone()]),
+        _ => None,
     }
-    if s.starts_with('{') && s.ends_with('}') {
-        let entries = split_flow(&s[1..s.len() - 1])
-            .into_iter()
-            .filter_map(|item| {
-                let (k, v) = split_key_value(&item)?;
-                Some((k, parse_inline_value(v.trim())))
-            })
-            .collect();
-        return YamlValue::Mapping(entries);
-    }
-    YamlValue::Scalar(strip_quotes(s).to_string())
-}
-
-/// Split flow-style content (inside `[…]` or `{…}`) by top-level
-/// commas, respecting nested brackets and quotes.
-fn split_flow(s: &str) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut depth = 0i32;
-    let mut in_double = false;
-    let mut in_single = false;
-    let mut start = 0;
-    let bytes = s.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        match b {
-            b'"' if !in_single => in_double = !in_double,
-            b'\'' if !in_double => in_single = !in_single,
-            b'[' | b'{' if !in_double && !in_single => depth += 1,
-            b']' | b'}' if !in_double && !in_single => depth -= 1,
-            b',' if depth == 0 && !in_double && !in_single => {
-                items.push(s[start..i].trim().to_string());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    let tail = s[start..].trim();
-    if !tail.is_empty() {
-        items.push(tail.to_string());
-    }
-    items.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 #[cfg(test)]
@@ -676,14 +377,14 @@ mod tests {
 
     #[test]
     fn yaml_empty_list_for_missing_key() {
-        let yaml = parse_yaml_frontmatter("name: foo\n");
-        assert!(yaml.list("tags").is_none());
+        let yaml = parse_yaml_frontmatter("name: foo\n").unwrap();
+        assert!(yaml_list(&yaml["tags"]).is_none());
     }
 
     #[test]
     fn yaml_single_scalar_promoted_to_list() {
-        let yaml = parse_yaml_frontmatter("tags: rust\n");
-        assert_eq!(yaml.list("tags"), Some(vec!["rust".to_string()]));
+        let yaml = parse_yaml_frontmatter("tags: rust\n").unwrap();
+        assert_eq!(yaml_list(&yaml["tags"]), Some(vec!["rust".to_string()]));
     }
 
     #[test]
