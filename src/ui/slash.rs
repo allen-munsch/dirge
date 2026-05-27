@@ -1794,7 +1794,7 @@ pub async fn handle_slash(
                 c_result(),
             )?;
             renderer.write_line(
-                "  /compress [instr]      compress with custom instructions",
+                "  /compress [focus]      compress; focus text guides what to preserve",
                 c_result(),
             )?;
             renderer.write_line(

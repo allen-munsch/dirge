@@ -365,6 +365,15 @@ pub enum LoopEvent {
         new_session_id: String,
         tokens_before: u64,
         tokens_after: u64,
+        /// Hermes-style summary body the consumer should push into
+        /// `Session::compress_reporting`. Empty if the LLM-summary
+        /// path didn't run (pruner-only fallback).
+        summary: String,
+        /// Index of the first message KEPT in the compacted
+        /// transcript. Passed straight through to
+        /// `Session::compress_reporting` so it knows which middle
+        /// turns were folded.
+        first_kept_index: usize,
     },
 
     /// PROV-2: the retry layer is about to re-attempt the stream.

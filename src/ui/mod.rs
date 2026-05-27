@@ -3585,6 +3585,8 @@ pub async fn run_interactive(
                         ref new_session_id,
                         tokens_before,
                         tokens_after,
+                        ref summary,
+                        first_kept_index,
                     } => {
                         // Persist session rotation to DB: end the old session
                         // with reason "compression", insert the new session.
@@ -3612,6 +3614,34 @@ pub async fn run_interactive(
                                 &now,
                             );
                             let _ = db.set_parent_session(new_session_id, &old_sid);
+                        }
+                        // SESS-2 follow-up #1: mutate the in-memory
+                        // Session to match the rotation and push a
+                        // Compaction entry, then persist to disk.
+                        // Without this the on-disk session file kept
+                        // the OLD id and the compaction was lost on
+                        // next resume. Mirrors Hermes
+                        // conversation_compression.py lines 380-397.
+                        let token_savings =
+                            tokens_before.saturating_sub(tokens_after);
+                        if !summary.is_empty() {
+                            session.compress_reporting(
+                                summary.to_string(),
+                                first_kept_index,
+                                token_savings,
+                            );
+                        }
+                        session.id = compact_str::CompactString::new(
+                            new_session_id.as_str(),
+                        );
+                        if let Err(e) =
+                            crate::session::storage::save_session(&session)
+                        {
+                            tracing::warn!(
+                                target: "dirge::ui",
+                                error = %e,
+                                "could not persist rotated session after compaction",
+                            );
                         }
                         renderer.write_line(
                             &format!(

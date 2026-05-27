@@ -1,15 +1,18 @@
 //! Phase 4.5h-7 smoke tests against real provider APIs.
 //!
-//! These tests are `#[ignore]` by default so they don't run in
-//! normal `cargo test`. To run them you must:
+//! Each test runs unconditionally in `cargo test` but auto-skips
+//! cleanly (prints `[skipped]` and returns Ok) when no provider
+//! key is found in env — `detect_provider()` returns None and the
+//! test bails before any HTTP request. When at least one of
+//! DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY /
+//! GEMINI_API_KEY / OPENROUTER_API_KEY is set, the test exercises
+//! the real provider and validates loop integration end-to-end.
 //!
-//!   - Have a provider API key in env (DEEPSEEK_API_KEY is the
-//!     canonical choice; others auto-detected)
-//!   - Pass `-- --ignored` to cargo test:
+//! Run with --nocapture to see the [skipped] messages:
 //!
-//!     ```
-//!     cargo test agent_loop::h7_smoke -- --ignored --nocapture
-//!     ```
+//!   ```
+//!   cargo test agent_loop::h7_smoke -- --nocapture
+//!   ```
 //!
 //! Each test exercises a different scenario from
 //! `docs/H7_AGENT_LOOP_TEST.md`. Failures here indicate the new
@@ -171,7 +174,9 @@ fn dump_events(events: &[AgentEvent]) {
 /// Verifies: stream factory works against a real provider;
 /// Token events fire; Done arrives with non-empty response.
 #[tokio::test]
-#[ignore = "requires provider API key"]
+// h7-real-api: passes via runtime skip when no key is set;
+// exercises real provider when DEEPSEEK_API_KEY / OPENAI_API_KEY /
+// ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY is set.
 async fn h7_scenario_1_simple_text() {
     let stream_fn = match build_stream_fn() {
         Some(f) => f,
@@ -237,7 +242,9 @@ async fn h7_scenario_1_simple_text() {
 /// loop produces TurnStart + TurnEnd + Done in the expected
 /// order, the Done's response is sensible.
 #[tokio::test]
-#[ignore = "requires provider API key"]
+// h7-real-api: passes via runtime skip when no key is set;
+// exercises real provider when DEEPSEEK_API_KEY / OPENAI_API_KEY /
+// ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY is set.
 async fn h7_scenario_2_turn_boundaries() {
     let stream_fn = match build_stream_fn() {
         Some(f) => f,
@@ -301,7 +308,9 @@ async fn h7_scenario_2_turn_boundaries() {
 /// versions of this test mutated `DEEPSEEK_API_KEY` and raced
 /// with parallel tests reading the same var).
 #[tokio::test]
-#[ignore = "requires provider API key"]
+// h7-real-api: passes via runtime skip when no key is set;
+// exercises real provider when DEEPSEEK_API_KEY / OPENAI_API_KEY /
+// ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY is set.
 async fn h7_scenario_5_auth_error_surfaces() {
     // Skip if no provider is configured at all.
     let provider = match detect_provider() {
@@ -393,7 +402,9 @@ async fn h7_scenario_5_auth_error_surfaces() {
 /// rig stream → tool call extraction → LoopTool execute →
 /// finalize → next LLM turn.
 #[tokio::test]
-#[ignore = "requires provider API key"]
+// h7-real-api: passes via runtime skip when no key is set;
+// exercises real provider when DEEPSEEK_API_KEY / OPENAI_API_KEY /
+// ANTHROPIC_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY is set.
 async fn h7_scenario_3_tool_dispatch() {
     use crate::agent::agent_loop::result::LoopToolResult as ResultT;
     use crate::agent::agent_loop::tool::{AbortSignal, LoopToolUpdate};
@@ -598,7 +609,8 @@ fn build_glm_stream_fn() -> Option<crate::agent::agent_loop::StreamFn> {
 
 /// GLM Scenario 1 — simple text Q&A.
 #[tokio::test]
-#[ignore = "requires ZHIPU_API_KEY"]
+// h7-glm: passes via runtime skip when ZHIPU_API_KEY is unset;
+// exercises GLM when ZHIPU_API_KEY is set.
 async fn h7_glm_scenario_1_simple_text() {
     let stream_fn = match build_glm_stream_fn() {
         Some(f) => f,
@@ -638,7 +650,8 @@ async fn h7_glm_scenario_1_simple_text() {
 /// GLM Scenario 3 — tool dispatch. Uses the same inline echo
 /// tool as the DeepSeek scenario but routed through GLM.
 #[tokio::test]
-#[ignore = "requires ZHIPU_API_KEY"]
+// h7-glm: passes via runtime skip when ZHIPU_API_KEY is unset;
+// exercises GLM when ZHIPU_API_KEY is set.
 async fn h7_glm_scenario_3_tool_dispatch() {
     use crate::agent::agent_loop::result::LoopToolResult as ResultT;
     use crate::agent::agent_loop::tool::{AbortSignal, LoopToolUpdate};

@@ -467,10 +467,32 @@ impl AnyClient {
         // and opencode both feed the full prefix.
         let conversation = summarize::serialize_conversation(messages);
 
+        // `/compress <focus>` argument: when the user passes free-form
+        // text after the slash command, treat it as a Hermes-style
+        // FOCUS TOPIC. The summarizer is asked to allocate ~60-70%
+        // of its budget to information related to the topic. Maps
+        // hermes-agent/context_compressor.py:1050-1054.
+        let instructions_block = match instructions {
+            Some(text) if !text.trim().is_empty() => format!(
+                "FOCUS TOPIC: \"{}\"\n\
+                 The user has requested that this compaction PRIORITISE preserving \
+                 all information related to the focus topic above. For content \
+                 related to \"{}\", include full detail — exact values, file paths, \
+                 command outputs, error messages, and decisions. For content NOT \
+                 related to the focus topic, summarise more aggressively. The \
+                 focus topic sections should receive roughly 60-70% of the \
+                 summary token budget. Even for the focus topic, NEVER preserve \
+                 API keys, tokens, passwords, or credentials — use [REDACTED].",
+                text.trim(),
+                text.trim(),
+            ),
+            _ => "(none)".to_string(),
+        };
+
         let prompt = prompt::COMPACTION_PROMPT
             .replace("{conversation}", &conversation)
             .replace("{previous_summary}", previous_summary.unwrap_or("(none)"))
-            .replace("{instructions}", instructions.unwrap_or("(none)"));
+            .replace("{instructions}", &instructions_block);
 
         let model = self.completion_model(model_name.to_string());
         let response = summarize::summarize_with_model(model, prompt).await?;

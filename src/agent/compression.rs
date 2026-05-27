@@ -250,7 +250,7 @@ pub fn build_summary_prompt(
     turns_to_summarize: &[Value],
     summary_budget: u64,
     previous_summary: Option<&str>,
-    _focus_topic: Option<&str>, // reserved for future /compress <focus>
+    focus_topic: Option<&str>,
 ) -> String {
     let _summarizer_preamble = "\
 You are a summarization agent creating a context checkpoint. \
@@ -260,6 +260,26 @@ Produce only the structured summary; do not add a greeting, \
 preamble, or prefix. \
 Write the summary in the same language the user was using in the \
 conversation — do not translate or switch to English.";
+
+    // /compress <focus> argument. When the caller supplies a focus
+    // topic, ask the model to allocate ~60-70% of its budget to
+    // content related to that topic. Verbatim port of Hermes's
+    // FOCUS TOPIC framing (context_compressor.py:1050-1054). Empty
+    // / whitespace-only topics are ignored.
+    let focus_block: String = match focus_topic.map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        Some(topic) => format!(
+            "\n\nFOCUS TOPIC: \"{topic}\"\nThe user has requested that this \
+            compaction PRIORITISE preserving all information related to the focus \
+            topic above. For content related to \"{topic}\", include full detail — \
+            exact values, file paths, command outputs, error messages, and \
+            decisions. For content NOT related to the focus topic, summarise more \
+            aggressively (brief one-liners or omit if truly irrelevant). The focus \
+            topic sections should receive roughly 60-70% of the summary token \
+            budget. Even for the focus topic, NEVER preserve API keys, tokens, \
+            passwords, or credentials — use [REDACTED]."
+        ),
+        None => String::new(),
+    };
 
     let _template_sections = format!(
         "## Active Task\n\
@@ -319,7 +339,7 @@ You are updating a context compaction summary. A previous compaction \
 produced the summary below. New conversation turns have occurred since \
 then and need to be incorporated.\n\n\
 PREVIOUS SUMMARY:\n{prev}\n\n\
-NEW TURNS TO INCORPORATE:\n{serialized}\n\n\
+NEW TURNS TO INCORPORATE:\n{serialized}{focus_block}\n\n\
 Update the summary using this exact structure. PRESERVE all existing \
 information that is still relevant. CRITICAL: Update \"## Active Task\" \
 to reflect the user's most recent unfulfilled request.\n\n\
@@ -331,7 +351,7 @@ to reflect the user's most recent unfulfilled request.\n\n\
 Create a structured checkpoint summary for the conversation after earlier \
 turns are compacted. The summary should preserve enough detail for \
 continuity without re-reading the original turns.\n\n\
-TURNS TO SUMMARIZE:\n{serialized}\n\n\
+TURNS TO SUMMARIZE:\n{serialized}{focus_block}\n\n\
 Use this exact structure:\n\n\
 {_template_sections}"
         )

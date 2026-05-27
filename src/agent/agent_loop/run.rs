@@ -95,6 +95,21 @@ async fn run_compaction_pass(
     protect_tail: usize,
     emit: &mpsc::Sender<LoopEvent>,
 ) {
+    run_compaction_pass_with_focus(current_context, summarize_fn, protect_tail, None, emit).await
+}
+
+/// Same as `run_compaction_pass` but accepts an optional focus
+/// topic to splice into the Hermes-style summary prompt. Wired by
+/// the `/compress <focus>` slash command path. The auto-triggered
+/// compaction (`PostUsageDecisionKind::Fold` / `ExitWithSummary`)
+/// continues to use the no-focus wrapper above.
+async fn run_compaction_pass_with_focus(
+    current_context: &mut Context,
+    summarize_fn: &Option<crate::agent::compression::SummarizeFn>,
+    protect_tail: usize,
+    focus_topic: Option<String>,
+    emit: &mpsc::Sender<LoopEvent>,
+) {
     use crate::agent::compression;
 
     let before = compression::estimate_messages_tokens(&current_context.messages);
@@ -109,6 +124,12 @@ async fn run_compaction_pass(
     // structured prompt, call the auxiliary model, validate the
     // returned summary, and replace the middle section.
     let mut after_summary = after_prune;
+    let mut applied_summary = String::new();
+    // first_kept_index defaults to "no message was folded out" —
+    // pruner-only path doesn't drop messages by index, just trims
+    // their content in place. compress_reporting handles that
+    // gracefully (zero-width fold).
+    let mut applied_first_kept = current_context.messages.len();
     if let Some(sfn) = summarize_fn {
         let (start, end) = compression::compute_compress_window(
             &current_context.messages,
@@ -128,7 +149,7 @@ async fn run_compaction_pass(
                 &middle,
                 budget,
                 prev.as_deref(),
-                None, // focus_topic reserved for future /compress <focus>
+                focus_topic.as_deref(),
             );
             match sfn(prompt).await {
                 Ok(summary) if compression::validate_summary(&summary) => {
@@ -140,6 +161,14 @@ async fn run_compaction_pass(
                     );
                     current_context.messages = new_msgs;
                     after_summary = compression::estimate_messages_tokens(&current_context.messages);
+                    applied_summary = summary;
+                    // After apply_summary, the head (0..start) is
+                    // preserved, then a single summary message
+                    // takes the place of the middle, then the tail
+                    // resumes. The first KEPT original-index slot
+                    // is therefore `start` — anything below was
+                    // protected, anything above was folded.
+                    applied_first_kept = start;
                 }
                 Ok(_) => {
                     tracing::warn!(
@@ -164,6 +193,8 @@ async fn run_compaction_pass(
             new_session_id: new_id,
             tokens_before: before,
             tokens_after: after_summary,
+            summary: applied_summary,
+            first_kept_index: applied_first_kept,
         })
         .await;
 }

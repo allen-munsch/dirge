@@ -88,11 +88,18 @@ pub enum AgentEvent {
         error: CompactString,
     },
     /// Context was compacted mid-run — old tool results pruned,
-    /// session rotated. The UI persists the split via session DB.
+    /// session rotated. The UI persists the split via session DB,
+    /// mutates `Session::id` in-place, and calls
+    /// `Session::compress_reporting(summary, first_kept_index, …)`
+    /// to push a `Compaction` entry. `summary` is empty when only
+    /// the cheap tool-output pruner ran (no LLM summary was
+    /// generated).
     ContextCompacted {
         new_session_id: CompactString,
         tokens_before: u64,
         tokens_after: u64,
+        summary: CompactString,
+        first_kept_index: usize,
     },
     Done {
         response: CompactString,

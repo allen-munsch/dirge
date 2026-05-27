@@ -106,18 +106,24 @@ impl EventBridge {
                 ref new_session_id,
                 tokens_before,
                 tokens_after,
+                ref summary,
+                first_kept_index,
             } => {
                 tracing::info!(
                     target: "dirge::agent_loop",
                     session_id = %new_session_id,
                     tokens_before,
                     tokens_after,
+                    has_summary = !summary.is_empty(),
+                    first_kept_index,
                     "context compacted — session rotated"
                 );
                 vec![AgentEvent::ContextCompacted {
                     new_session_id: CompactString::new(new_session_id),
                     tokens_before,
                     tokens_after,
+                    summary: CompactString::new(summary),
+                    first_kept_index,
                 }]
             }
 
