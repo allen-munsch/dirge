@@ -925,7 +925,7 @@ mod tests {
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let default_fn = labelled_stream("default", observed.clone());
 
-        let mut config = build_config(identity_converter());
+        let config = build_config(identity_converter());
         // No escalation_stream_fn set — misconfigured.
         *config.escalation_pending.lock().unwrap() = Some(EscalationReason::RepairExhausted {
             tool: "write".to_string(),

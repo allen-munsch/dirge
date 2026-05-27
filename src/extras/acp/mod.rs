@@ -316,7 +316,14 @@ async fn run_prompt(
             AgentEvent::TurnStart { .. }
             | AgentEvent::TurnEnd { .. }
             | AgentEvent::ContextCompacted { .. }
-            | AgentEvent::RetryNotice { .. } => {}
+            | AgentEvent::RetryNotice { .. }
+            | AgentEvent::RepairStats { .. }
+            | AgentEvent::EscalationActivated { .. } => {
+                // Observability markers — no ACP-protocol
+                // equivalent. The interactive UI is the only
+                // renderer for these; drop on the ACP path so
+                // they don't perturb the structured stream.
+            }
             AgentEvent::UserMessage { .. } => {
                 // Steering-injected user message mid-run — ACP
                 // doesn't support mid-stream interjection; drop.
