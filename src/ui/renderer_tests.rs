@@ -726,3 +726,145 @@ fn osc_reset_title_releases_to_shell() {
     let bytes = super::osc_reset_title();
     assert_eq!(bytes, b"\x1b]0;\x1b\\");
 }
+
+/// dirge-b11: helper — build a `PanelData` with `n` synthetic
+/// modified-file entries. Keeps the unit tests for the scroll
+/// offset state machine self-contained.
+fn panel_with_modified(n: usize) -> PanelData {
+    PanelData {
+        modified: (0..n).map(|i| format!("f{i}.rs")).collect(),
+        ..PanelData::default()
+    }
+}
+
+/// dirge-b11: scrolling beyond the list's tail clamps to
+/// `total - visible_rows`. Scrolling by a positive delta repeatedly
+/// must not strand the offset past the last visible page.
+#[test]
+fn modified_offset_clamps_to_list_size() {
+    let mut r = Renderer::new().unwrap();
+    r.set_panel_data(panel_with_modified(20));
+    // Visible window = 5 rows → max offset = 15. Scrolling by 100
+    // must clamp, not overshoot.
+    r.panel_modified_scroll(100, 5);
+    assert_eq!(r.modified_offset, 15);
+    // And scrolling further forward is a no-op (returns false).
+    let changed = r.panel_modified_scroll(10, 5);
+    assert!(!changed);
+    assert_eq!(r.modified_offset, 15);
+    // Scrolling backwards past 0 clamps to 0.
+    r.panel_modified_scroll(-1000, 5);
+    assert_eq!(r.modified_offset, 0);
+}
+
+/// dirge-b11: when the underlying MODIFIED list grows (a new file
+/// modification just landed) the renderer must reset the scroll
+/// offset to 0 so the user immediately sees the newest entry —
+/// otherwise an in-progress investigation would scroll past
+/// fresh activity without warning.
+#[test]
+fn modified_offset_resets_on_new_entry() {
+    let mut r = Renderer::new().unwrap();
+    // Seed with 20 entries and scroll into the middle of the list.
+    r.set_panel_data(panel_with_modified(20));
+    r.panel_modified_scroll(7, 5);
+    assert_eq!(r.modified_offset, 7);
+    // List grows N → N+1: offset must snap back to 0.
+    r.set_panel_data(panel_with_modified(21));
+    assert_eq!(r.modified_offset, 0);
+}
+
+/// dirge-b11: when the list shrinks (entries pruned at the 256-
+/// cap or via cwd change), the offset stays put — the render-time
+/// clamp handles the case where the offset would otherwise point
+/// past the end. Growth is the only event that resets the view.
+#[test]
+fn modified_offset_persists_on_shrink() {
+    let mut r = Renderer::new().unwrap();
+    r.set_panel_data(panel_with_modified(20));
+    r.panel_modified_scroll(7, 5);
+    assert_eq!(r.modified_offset, 7);
+    // Shrink — offset survives because the user might still want
+    // to inspect what's left.
+    r.set_panel_data(panel_with_modified(15));
+    assert_eq!(r.modified_offset, 7);
+}
+
+/// dirge-b11: when the list fits inside the visible window, the
+/// scroll operation is a no-op (and resets a stale offset to 0 as
+/// a safety net). Mouse wheel ticks here must not leave the
+/// footer reading `↑ N newer / ↓ M older` against an empty older
+/// segment.
+#[test]
+fn modified_offset_no_op_when_list_fits() {
+    let mut r = Renderer::new().unwrap();
+    r.set_panel_data(panel_with_modified(3));
+    // 3 entries fit in 5 visible rows → scroll is no-op and
+    // returns false.
+    let changed = r.panel_modified_scroll(5, 5);
+    assert!(!changed);
+    assert_eq!(r.modified_offset, 0);
+}
+
+/// dirge-b11: when the user has scrolled, the MODIFIED sub-panel's
+/// footer reads `↑ N newer / ↓ M older` so they know there's
+/// content in BOTH directions. When `offset == 0` (default view)
+/// the footer keeps the original `+N older` shape so existing
+/// screenshots / behavior stay intact.
+#[test]
+fn footer_shows_both_directions_when_scrolled() {
+    use crate::ui::tui::layout::Layout;
+    use crate::ui::tui::panels::RightPanel;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    // Build a panel with 20 modified entries — list will overflow
+    // any realistic visible window.
+    let data = panel_with_modified(20);
+    let layout = Layout::new(160, 30, 1);
+    // Render the panel TWICE: once at offset 0, once scrolled
+    // mid-list. Verify the footer flips between the two shapes.
+    let scan_footer = |offset: usize| -> String {
+        let mut backend = TestBackend::new(160, 30);
+        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    RightPanel::new(&data).modified_offset(offset),
+                    layout.right_panel,
+                );
+            })
+            .unwrap();
+        backend = terminal.backend().clone();
+        // The footer occupies the bottom-1 row of the right panel
+        // (above the ╰─╯ border). Scan all panel rows for the
+        // shape — robust against minor layout drift.
+        let mut rows: Vec<String> = Vec::new();
+        for y in layout.right_panel.y..(layout.right_panel.y + layout.right_panel.height) {
+            let row: String = (layout.right_panel.x
+                ..layout.right_panel.x + layout.right_panel.width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            rows.push(row);
+        }
+        rows.join("\n")
+    };
+    let head = scan_footer(0);
+    assert!(
+        head.contains("older"),
+        "default-view footer should still read '+N older'; got:\n{head}"
+    );
+    assert!(
+        !head.contains("newer"),
+        "default-view footer should NOT mention 'newer'; got:\n{head}"
+    );
+    let scrolled = scan_footer(5);
+    // The narrow right panel may truncate the trailing "older"
+    // word at the right border; assert against the "↑ N newer"
+    // half plus the leading "↓" downward arrow that the dual-
+    // direction footer adds. Both arrows together → both
+    // directions surfaced.
+    assert!(
+        scrolled.contains("↑") && scrolled.contains("newer") && scrolled.contains("↓"),
+        "scrolled footer should mention BOTH directions; got:\n{scrolled}"
+    );
+}

@@ -194,9 +194,16 @@ pub enum UserEvent {
     /// Mouse capture is on (see `TerminalGuard::new`) so the wheel reaches
     /// the app instead of being absorbed by the terminal, which under the
     /// alt screen would push the TUI off-view.
-    ScrollUp,
+    ScrollUp {
+        row: u16,
+        col: u16,
+    },
     /// Mouse wheel scrolled down — scroll the output pane down by one line.
-    ScrollDown,
+    /// See `ScrollUp` for the `(row, col)` semantics.
+    ScrollDown {
+        row: u16,
+        col: u16,
+    },
     /// Left mouse button pressed at terminal cell `(row, col)` — starts
     /// an app-level drag selection. Consumed by `ui::selection::handle`
     /// before any UI-state-specific consumer sees it.

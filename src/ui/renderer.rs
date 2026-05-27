@@ -71,7 +71,7 @@ pub const MAX_INPUT_VISIBLE_LINES: usize = 8;
 
 /// ui-redesign: the bottom [ALERT] panel wraps the input area in a
 /// double-line frame. Two reserved rows = top border (with title)
-/// + bottom border. Side borders (║ ... ║) are painted on every
+/// plus bottom border. Side borders (║ ... ║) are painted on every
 /// input row so the entire input area reads as one framed card,
 /// matching the mockup's bottom strip.
 ///
@@ -193,9 +193,9 @@ pub fn normalize_selection_range(a: (usize, usize), b: (usize, usize)) -> Select
 /// pay the snapshot cost.
 ///
 /// dirge-ov2 Phase A: enables multiple subagent chat windows. The
-/// main session is always at index 0; subagent chats start at index
-/// 1. Selection state lives per-chat because a selection in chat A
-/// would be meaningless when chat B is on screen.
+/// main session is always at index 0; subagent chats start at index 1.
+/// Selection state lives per-chat because a selection in chat A would
+/// be meaningless when chat B is on screen.
 pub struct ChatSnapshot {
     pub name: String,
     buffer: Vec<LineEntry>,
@@ -306,6 +306,26 @@ pub struct Renderer {
     /// screen yet").
     cached_chat_rect: Option<ratatui::layout::Rect>,
 
+    /// dirge-b11: user-driven scroll offset into the MODIFIED
+    /// sub-panel. 0 = show the most recent entries (default). Walked
+    /// by mouse-wheel events when the cursor hovers inside the
+    /// modified region (see `panel_modified_scroll`); persisted
+    /// across redraws so a stream of agent events doesn't reset
+    /// the view. Resets to 0 when the underlying list grows (a new
+    /// modification arrives) so the user always sees the newest
+    /// entry without scrolling back.
+    pub(crate) modified_offset: usize,
+    /// dirge-b11: previous MODIFIED list length, used to detect
+    /// growth so we can reset `modified_offset` to 0 on the next
+    /// `set_panel_data` call. `None` before the first push.
+    last_modified_len: Option<usize>,
+    /// dirge-b11: MODIFIED sub-panel rect from the most recent
+    /// paint, used by the mouse-event handler to decide whether a
+    /// scroll wheel tick should walk the modified list or fall
+    /// through to chat scrolling. `None` until the first paint or
+    /// when the panel is hidden.
+    pub(crate) cached_modified_rect: Option<ratatui::layout::Rect>,
+
     #[cfg(feature = "experimental-ui-terminal-tab")]
     cached_terminal_title: String,
     #[cfg(feature = "experimental-ui-terminal-tab")]
@@ -356,6 +376,9 @@ impl Renderer {
             cached_is_running: false,
             cached_completion_preview: String::new(),
             cached_chat_rect: None,
+            modified_offset: 0,
+            last_modified_len: None,
+            cached_modified_rect: None,
 
             #[cfg(feature = "experimental-ui-terminal-tab")]
             cached_terminal_title: String::new(),
@@ -409,6 +432,8 @@ impl Renderer {
             cached_is_running,
             cached_completion_preview,
             cached_chat_rect,
+            modified_offset,
+            cached_modified_rect,
             tui_terminal,
             selection_active,
             selection_start,
@@ -473,9 +498,35 @@ impl Renderer {
         // they're identical. The terminal::size() probe used here
         // matches what render_frame sees because both go through the
         // same /dev/tty winsize.
-        let chat_rect_now =
-            crate::ui::tui::layout::Layout::new(cols_q, rows_q, effective_input_rows).chat;
+        let layout_now =
+            crate::ui::tui::layout::Layout::new(cols_q, rows_q, effective_input_rows);
+        let chat_rect_now = layout_now.chat;
         *cached_chat_rect = Some(chat_rect_now);
+
+        // dirge-b11: compute the MODIFIED sub-panel rect from the
+        // current layout + panel data so the mouse handler can do
+        // hit-testing before the next paint. Also clamp the offset
+        // here so a list that shrunk since the last redraw doesn't
+        // leave the offset stranded past the visible window.
+        // Mirrors the math in `RightPanel::render` — kept in sync
+        // via the shared `compute_modified_rect` helper.
+        let modified_rect_now = if show_side_panels && layout_now.right_panel.width >= 16 {
+            crate::ui::tui::panels::compute_modified_rect(panel_data, layout_now.right_panel)
+        } else {
+            None
+        };
+        *cached_modified_rect = modified_rect_now;
+        if let Some(r) = modified_rect_now {
+            let inner_rows = (r.height as usize).saturating_sub(2);
+            let head_rows = inner_rows.saturating_sub(1).max(1);
+            let total = panel_data.modified.len();
+            let max_off = total.saturating_sub(head_rows);
+            if *modified_offset > max_off {
+                *modified_offset = max_off;
+            }
+        } else {
+            *modified_offset = 0;
+        }
 
         let chat_selection = if *selection_active {
             match (*selection_start, *selection_end) {
@@ -492,6 +543,7 @@ impl Renderer {
             input_rows: effective_input_rows,
             chat_selection,
             panel_data,
+            modified_offset: *modified_offset,
             left_info: left_panel_info,
             subagents: subagent_status,
             avatar,
@@ -600,6 +652,7 @@ impl Renderer {
     /// - If `idx == active`, moves to idx (which becomes the next
     ///   chat after removal) or wraps to 0 if at the end.
     /// - If `idx > active`, active stays unchanged.
+    ///
     /// Refuses to remove the last remaining chat.
     pub fn remove_chat(&mut self, idx: usize) {
         if self.chats.len() <= 1 || idx >= self.chats.len() {
@@ -608,11 +661,10 @@ impl Renderer {
         self.chats.remove(idx);
         if idx < self.active_chat {
             self.active_chat -= 1;
-        } else if idx == self.active_chat {
-            if self.active_chat >= self.chats.len() {
+        } else if idx == self.active_chat
+            && self.active_chat >= self.chats.len() {
                 self.active_chat = 0;
             }
-        }
     }
 
     pub fn active_chat(&self) -> usize {
@@ -736,7 +788,7 @@ impl Renderer {
 
     /// dirge-gek: replace the subagent panel data. UI loop calls this
     /// on each subagent lifecycle event (Spawn / Complete / Failed)
-    /// + on Ctrl-N/P chat switch so the panel reflects current
+    /// and on Ctrl-N/P chat switch so the panel reflects current
     /// state. Cheap — just swaps the Vec; the next `render_viewport`
     /// repaints the gutter.
     pub fn set_subagent_status(&mut self, rows: Vec<SubagentStatusRow>) {
@@ -773,7 +825,47 @@ impl Renderer {
     }
 
     pub fn set_panel_data(&mut self, data: PanelData) {
+        // dirge-b11: when the MODIFIED list GROWS (a new file
+        // modification just entered the tracker) reset the user's
+        // scroll offset so they immediately see the newest entry.
+        // Shrinkage (entries pruned out the back at 256-cap) leaves
+        // the offset alone; the render-time clamp handles the case
+        // where the offset would otherwise point past the end of
+        // the list. First push (last_modified_len is None) is not a
+        // growth event.
+        let new_len = data.modified.len();
+        if let Some(prev) = self.last_modified_len
+            && new_len > prev
+        {
+            self.modified_offset = 0;
+        }
+        self.last_modified_len = Some(new_len);
         self.panel_data = data;
+    }
+
+    /// dirge-b11: walk the MODIFIED sub-panel scroll offset by
+    /// `delta` lines. Positive = older (offset increases), negative
+    /// = newer. No-op when the list is shorter than `visible_rows`.
+    /// Clamps so the offset can't strand past the end of the list —
+    /// `offset.clamp(0, list_len.saturating_sub(visible_rows))`.
+    /// Returns true when the offset actually changed so the caller
+    /// can decide whether to repaint.
+    pub fn panel_modified_scroll(&mut self, delta: isize, visible_rows: usize) -> bool {
+        let total = self.panel_data.modified.len();
+        if total <= visible_rows {
+            // List fits — nothing to scroll. Reset just in case the
+            // user had scrolled the list when it was longer.
+            let was = self.modified_offset;
+            self.modified_offset = 0;
+            return was != 0;
+        }
+        let max_off = total.saturating_sub(visible_rows);
+        let prev = self.modified_offset as isize;
+        let next = (prev + delta).clamp(0, max_off as isize);
+        let next = next as usize;
+        let changed = next != self.modified_offset;
+        self.modified_offset = next;
+        changed
     }
 
     /// Whether the panel will actually be drawn given current mode and
@@ -1465,7 +1557,7 @@ pub(crate) fn wrap_editor(
             let w = ch.width().unwrap_or(0);
             if cur_w + w > wrap_w && !cur.is_empty() {
                 // Find last whitespace to break at a word boundary.
-                let break_at = cur.rfind(|c: char| c == ' ' || c == '\t');
+                let break_at = cur.rfind([' ', '\t']);
                 match break_at {
                     Some(ws_idx) => {
                         // Word-boundary break.  Split at the whitespace:

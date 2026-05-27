@@ -106,6 +106,7 @@ use tool_display::*;
 /// - list_dir → path
 /// - bash → command (truncated to 60 chars)
 /// - others → first string arg or nothing
+///
 /// Extract the unquoted, untruncated value for the chamber banner.
 /// Picks the most informative single argument for each tool — the
 /// path for file ops, the command for bash, etc. Returns `""` for
@@ -119,6 +120,11 @@ use tool_display::*;
 /// Cached state for a collapsed tool result, so Ctrl+O can re-render
 /// it as a fresh chamber with the full body. We hold only the last
 /// one — older collapses live in chat history but aren't addressable.
+// Interactive entry point — every collaborator (client, agent, CLI,
+// config, session, context, hooks, plugin manager, …) is threaded in
+// explicitly so the TUI loop owns no globals. Refactoring into a
+// context struct is tracked separately; silence the lint.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
     client: AnyClient,
     mut agent: AnyAgent,
@@ -478,6 +484,11 @@ pub async fn run_interactive(
                 Ok(false) => continue,
                 Err(_) => break,
             }
+            // `clippy::collapsible_match` suggests moving the `is_err()` check into
+            // a match guard, but doing so tries to move bound values (e.g. `text`
+            // in `Event::Paste(text)`) inside the guard, which is rejected with
+            // E0507. Keep the nested `if`s.
+            #[allow(clippy::collapsible_match)]
             match event::read() {
                 Ok(event::Event::Key(key)) => {
                     // Filter Release / Repeat events. Modern terminals
@@ -500,8 +511,14 @@ pub async fn run_interactive(
                     // no app action and the terminal's own handling
                     // for them takes over (paste, menu, etc.).
                     let ev = match m.kind {
-                        MouseEventKind::ScrollUp => Some(UserEvent::ScrollUp),
-                        MouseEventKind::ScrollDown => Some(UserEvent::ScrollDown),
+                        MouseEventKind::ScrollUp => Some(UserEvent::ScrollUp {
+                            row: m.row,
+                            col: m.column,
+                        }),
+                        MouseEventKind::ScrollDown => Some(UserEvent::ScrollDown {
+                            row: m.row,
+                            col: m.column,
+                        }),
                         MouseEventKind::Down(MouseButton::Left) => Some(UserEvent::MouseDown {
                             row: m.row,
                             col: m.column,
@@ -516,11 +533,10 @@ pub async fn run_interactive(
                         }),
                         _ => None,
                     };
-                    if let Some(ev) = ev {
-                        if user_tx_clone.blocking_send(ev).is_err() {
+                    if let Some(ev) = ev
+                        && user_tx_clone.blocking_send(ev).is_err() {
                             break;
                         }
-                    }
                 }
                 Ok(event::Event::Paste(text)) => {
                     if user_tx_clone.blocking_send(UserEvent::Paste(text)).is_err() {
@@ -573,13 +589,12 @@ pub async fn run_interactive(
         // harness/register-shortcut on the previous turn is now
         // visible to the next keystroke.
         #[cfg(feature = "plugin")]
-        if let Some(pm_arc) = crate::plugin::hook::global() {
-            if let Ok(mut mgr) = pm_arc.try_lock() {
+        if let Some(pm_arc) = crate::plugin::hook::global()
+            && let Ok(mut mgr) = pm_arc.try_lock() {
                 let metas = mgr.list_shortcuts();
                 drop(mgr);
                 plugin_shortcuts = crate::plugin::extension::parse_shortcuts(metas);
             }
-        }
 
         // Drain any pending plugin notifications and surface each as a
         // colored chat line. Done at loop top so notifications posted
@@ -704,8 +719,22 @@ pub async fn run_interactive(
                     UserEvent::MouseDown { .. }
                     | UserEvent::MouseDrag { .. }
                     | UserEvent::MouseUp { .. } => continue,
-                    UserEvent::ScrollUp => {
-                        renderer.scroll_line_up();
+                    UserEvent::ScrollUp { row, col } => {
+                        // dirge-b11: when the wheel ticks while
+                        // hovering inside the MODIFIED sub-panel,
+                        // walk that list instead of the chat. Three
+                        // lines per tick mirrors most terminal wheel
+                        // accel curves. Outside the panel, fall
+                        // through to the existing chat scroll —
+                        // disambiguation by mouse position keeps
+                        // PageUp/Down's chat behaviour intact (no
+                        // key collision; the issue lists this as
+                        // the simplest acceptable path).
+                        if rect_contains_xy(renderer.cached_modified_rect, row, col) {
+                            renderer.panel_modified_scroll(-3, modified_visible_rows(renderer.cached_modified_rect));
+                        } else {
+                            renderer.scroll_line_up();
+                        }
                         renderer.render_viewport()?;
                         renderer.draw_bottom(
                             &input,
@@ -714,8 +743,12 @@ pub async fn run_interactive(
                         )?;
                         continue;
                     }
-                    UserEvent::ScrollDown => {
-                        renderer.scroll_line_down();
+                    UserEvent::ScrollDown { row, col } => {
+                        if rect_contains_xy(renderer.cached_modified_rect, row, col) {
+                            renderer.panel_modified_scroll(3, modified_visible_rows(renderer.cached_modified_rect));
+                        } else {
+                            renderer.scroll_line_down();
+                        }
                         renderer.render_viewport()?;
                         renderer.draw_bottom(
                             &input,
@@ -910,8 +943,8 @@ pub async fn run_interactive(
 
                         if key.code == KeyCode::Esc && !is_running {
                             let now = std::time::Instant::now();
-                            if let Some(prev) = last_esc {
-                                if now.duration_since(prev) < std::time::Duration::from_millis(1500) {
+                            if let Some(prev) = last_esc
+                                && now.duration_since(prev) < std::time::Duration::from_millis(1500) {
                                     last_esc = None;
                                     open_rewind_picker(session, &mut rewind_picker);
                                     rewind_picker.draw()?;
@@ -922,7 +955,6 @@ pub async fn run_interactive(
                                     )?;
                                     continue;
                                 }
-                            }
                             last_esc = Some(now);
                             renderer.write_line("Press Esc again to rewind...", theme::dim())?;
                             renderer.draw_bottom(
@@ -1091,8 +1123,8 @@ pub async fn run_interactive(
                         // worker thread and its return value (if any)
                         // surfaces as a chat line.
                         #[cfg(feature = "plugin")]
-                        if !plugin_shortcuts.is_empty() {
-                            if let Some(hit) = crate::plugin::extension::match_shortcut(&key, &plugin_shortcuts) {
+                        if !plugin_shortcuts.is_empty()
+                            && let Some(hit) = crate::plugin::extension::match_shortcut(&key, &plugin_shortcuts) {
                                 let handler = hit.handler.clone();
                                 let spec = hit.spec.clone();
                                 if let Some(pm_arc) = crate::plugin::hook::global() {
@@ -1114,7 +1146,6 @@ pub async fn run_interactive(
                                 )?;
                                 continue;
                             }
-                        }
 
                         if let Some(text) = input.handle_key(key) {
                             // Review #4: any submission starts a new
@@ -2107,7 +2138,7 @@ pub async fn run_interactive(
                             new_session_id.as_str(),
                         );
                         if let Err(e) =
-                            crate::session::storage::save_session(&session)
+                            crate::session::storage::save_session(session)
                         {
                             tracing::warn!(
                                 target: "dirge::ui",
@@ -2418,6 +2449,10 @@ pub async fn run_interactive(
                                 }
                                 crate::ui::selection::Outcome::NotHandled => {}
                             }
+                            // `match` form is kept (vs the lint's `if let`
+                            // suggestion) so we can later route MouseDown /
+                            // Paste / Resize without restructuring the body.
+                            #[allow(clippy::single_match)]
                             match ev {
                                 UserEvent::Key(key) => {
                                     // Ctrl+C / Ctrl+D in the alert
@@ -2559,14 +2594,13 @@ pub async fn run_interactive(
                         tool: ask_req.tool.clone(),
                         pattern: pattern.clone(),
                     });
-                    if !cli.no_session {
-                        if let Err(e) = crate::session::storage::save_session(session) {
+                    if !cli.no_session
+                        && let Err(e) = crate::session::storage::save_session(session) {
                             renderer.write_line(
                                 &format!("warning: failed to save session: {}", e),
                                 c_error(),
                             )?;
                         }
-                    }
                     // Review #9: blank-line breathing room between
                     // the alert's `╰─╯` and this green confirmation.
                     // Without it the alert bottom and the "allowed"
@@ -3096,7 +3130,7 @@ pub async fn run_interactive(
 
                         match key.code {
                             KeyCode::Up | KeyCode::Char('k') => {
-                                if cursor > 0 { cursor -= 1; }
+                                cursor = cursor.saturating_sub(1);
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let max = if custom { num_options } else { num_options.saturating_sub(1) };
@@ -3113,7 +3147,7 @@ pub async fn run_interactive(
                                             input_anchor,
                                             vec![LineEntry {
                                                 text: compact_str::CompactString::new(
-                                                    &format!("  > {}", buf),
+                                                    format!("  > {}", buf),
                                                 ),
                                                 color: c_perm(),
                                             }],
@@ -3489,14 +3523,13 @@ pub async fn run_interactive(
                     )?;
 
                     // Re-render the session to show new prompt mode
-                    if !cli.print {
-                        if let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
+                    if !cli.print
+                        && let Err(e) = render_session(&mut renderer, session, cli, cfg, context) {
                             renderer.write_line(
                                 &format!("render error: {}", e),
                                 resolve_color(c_error(), cli.no_color),
                             )?;
                         }
-                    }
                 } else {
                     let _ = plan_req.reply.send(PlanSwitchResponse::Rejected);
                 }
@@ -3528,6 +3561,28 @@ pub async fn run_interactive(
     }
 
     Ok(())
+}
+
+/// dirge-b11: hit-test a `(row, col)` terminal cell against an
+/// optional rectangle. `None` means "rectangle doesn't exist yet"
+/// (panel hidden, first paint hasn't happened) → cursor can't be
+/// inside something that's not drawn. Used to disambiguate mouse-
+/// wheel scrolls between the chat and the MODIFIED panel.
+fn rect_contains_xy(rect: Option<ratatui::layout::Rect>, row: u16, col: u16) -> bool {
+    match rect {
+        Some(r) => col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height,
+        None => false,
+    }
+}
+
+/// dirge-b11: how many entries fit inside the MODIFIED sub-panel
+/// body, accounting for the panel's top + bottom border rows AND
+/// the trailing footer row that the renderer reserves. Mirrors
+/// the `head_rows = inner_rows.saturating_sub(1)` math in
+/// `RightPanel::render`. Returns 0 when the rect is missing.
+fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
+    rect.map(|r| (r.height as usize).saturating_sub(2).saturating_sub(1))
+        .unwrap_or(0)
 }
 
 /// Whether a slash command is safe to run while the agent is active.

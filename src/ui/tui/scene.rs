@@ -39,6 +39,13 @@ pub struct Scene<'a> {
     pub chat_selection: Option<SelectionRange>,
     /// Right panel data (MCP, LSP, TODOS, MODIFIED, sysload).
     pub panel_data: &'a PanelData,
+    /// dirge-b11: how many entries to skip from the *top* of the
+    /// MODIFIED list (most-recent-first). Carried in Scene so the
+    /// renderer can paint the scrolled view; persisted across
+    /// redraws by `Renderer`. 0 means "show the most recent
+    /// entries"; clamped at render time so it can't strand past
+    /// the end of the list.
+    pub modified_offset: usize,
     /// Left panel: idle card info (used when subagents is empty).
     pub left_info: &'a LeftPanelInfo,
     /// Left panel: subagent status rows (used when non-empty).
@@ -83,7 +90,10 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
 
     // Right panel — stacked sub-panels. Skip on narrow terminals.
     if scene.show_side_panels && layout.right_panel.width >= 16 {
-        f.render_widget(RightPanel::new(scene.panel_data), layout.right_panel);
+        f.render_widget(
+            RightPanel::new(scene.panel_data).modified_offset(scene.modified_offset),
+            layout.right_panel,
+        );
     }
 
     // Chat bottom frame (╚═══╝ in chat band only).
@@ -160,6 +170,7 @@ pub fn empty_scene<'a>(
         input_rows: 1,
         chat_selection: None,
         panel_data,
+        modified_offset: 0,
         left_info,
         subagents,
         avatar: None,
@@ -262,6 +273,7 @@ mod tests {
             input_rows: 4,
             chat_selection: None,
             panel_data: &pd,
+            modified_offset: 0,
             left_info: &info,
             subagents: &subs,
             avatar: None,
@@ -377,6 +389,7 @@ mod tests {
             input_rows: 1,
             chat_selection: None,
             panel_data: &pd,
+            modified_offset: 0,
             left_info: &info,
             subagents: &subs,
             avatar: None,
@@ -401,6 +414,7 @@ mod tests {
             input_rows: 1,
             chat_selection: None,
             panel_data: &pd,
+            modified_offset: 0,
             left_info: &info,
             subagents: &subs,
             avatar: None,

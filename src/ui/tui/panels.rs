@@ -301,6 +301,10 @@ fn paint_subagent_list(buf: &mut Buffer, area: Rect, rows: &[SubagentStatusRow])
 pub struct RightPanel<'a> {
     data: &'a PanelData,
     style: Style,
+    /// dirge-b11: rows to skip from the top of the MODIFIED list.
+    /// Clamped at render time to `total - visible_rows` so the
+    /// caller doesn't have to know the visible budget.
+    modified_offset: usize,
 }
 
 impl<'a> RightPanel<'a> {
@@ -308,8 +312,57 @@ impl<'a> RightPanel<'a> {
         Self {
             data,
             style: Style::default().fg(RColor::Green),
+            modified_offset: 0,
         }
     }
+
+    /// dirge-b11: set the MODIFIED-list scroll offset. Clamped
+    /// against the list's length at render time so a stale offset
+    /// never points past the end.
+    pub fn modified_offset(mut self, offset: usize) -> Self {
+        self.modified_offset = offset;
+        self
+    }
+}
+
+/// dirge-b11: where would the MODIFIED sub-panel land if `RightPanel`
+/// were rendered into `area` right now? Returns `None` when the
+/// right panel collapses (too narrow / not enough vertical room).
+///
+/// Mirrors the layout math inside `RightPanel::render`: the four
+/// fixed sub-panels (SYSTEM LOAD, MCP, LSP, TODOS) take their
+/// natural height with a one-row spacer between, then MODIFIED
+/// fills whatever's left. Used by the UI loop's mouse handler to
+/// hit-test wheel events against the modified region.
+///
+/// Keeping this as a free function (rather than a method on
+/// RightPanel) means the hit-test path doesn't have to construct
+/// a throwaway widget — just call with `(data, layout.right_panel)`.
+pub fn compute_modified_rect(data: &PanelData, area: Rect) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    // Heights of the four fixed sub-panels (top + N content + bot
+    // = 2 + lines). Matches SubPanel::height(); empty sections use
+    // a single "· (none)" row.
+    let sysload_lines = if data.sysload.is_some() { 2 } else { 1 };
+    let mcp_lines = data.mcp.len().max(1);
+    let lsp_lines = data.lsp.len().max(1);
+    let todos_lines = data.todos.len().max(1);
+    let mut y = area.y + RIGHT_PANEL_TOP_PAD;
+    for body_lines in [sysload_lines, mcp_lines, lsp_lines, todos_lines] {
+        let h = 2 + body_lines as u16;
+        if y + h > area.y + area.height {
+            return None;
+        }
+        y += h + 1; // blank spacer
+    }
+    let remaining = (area.y + area.height).saturating_sub(y);
+    if remaining < 3 {
+        return None;
+    }
+    let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
+    Some(Rect::new(area.x, y, inner_w, remaining))
 }
 
 /// Right-panel top padding (rows). Mirrors LEFT_PANEL_TOP_PAD so
@@ -419,13 +472,32 @@ impl<'a> Widget for RightPanel<'a> {
                     p = p.line(f.clone(), body);
                 }
             } else {
-                // Reserve last row for the "+N older" footer.
+                // dirge-b11: list overflows. Reserve last row for
+                // the scroll footer and slide the visible window
+                // by `modified_offset` rows. Clamp here so a stale
+                // offset never reads past the end. The Renderer
+                // performs the same clamp in tui_redraw, so this
+                // is mainly defensive for direct-Scene callers
+                // (tests).
                 let head_rows = inner_rows.saturating_sub(1);
-                for f in self.data.modified.iter().take(head_rows) {
+                let max_off = total.saturating_sub(head_rows);
+                let offset = self.modified_offset.min(max_off);
+                let end = (offset + head_rows).min(total);
+                for f in self.data.modified.iter().take(end).skip(offset) {
                     p = p.line(f.clone(), body);
                 }
-                let older = total - head_rows;
-                p = p.line(format!("+{} older", older), dim);
+                // Footer: when offset > 0 show both directions
+                // (`↑ N newer / ↓ M older`); when offset == 0 keep
+                // the original `+N older` shape for backwards
+                // compatibility with screenshots / tests.
+                let newer = offset;
+                let older = total.saturating_sub(end);
+                let footer = if newer > 0 {
+                    format!("↑ {} newer / ↓ {} older", newer, older)
+                } else {
+                    format!("+{} older", older)
+                };
+                p = p.line(footer, dim);
             }
             p.render(rect, buf);
         }
