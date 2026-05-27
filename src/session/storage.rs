@@ -54,6 +54,21 @@ fn validate_session_id(id: &str) -> anyhow::Result<()> {
 
 pub fn save_session(session: &Session) -> anyhow::Result<()> {
     validate_session_id(&session.id)?;
+    // SESS-15: refuse to save a session that was loaded from a
+    // file with `schema_version > SCHEMA_VERSION`. Newer-version
+    // fields silently zeroed via `#[serde(default)]` at load;
+    // writing the truncated form would permanently lose data the
+    // newer dirge cared about. Better to surface an explicit
+    // error so the user upgrades dirge instead of silently
+    // corrupting their session.
+    if let Some(file_version) = session.loaded_from_newer_version {
+        anyhow::bail!(
+            "refusing to save session {}: it was loaded from a newer schema (file version {}, this dirge supports {}). Upgrade dirge, or copy the session to a new id to write a fresh file.",
+            session.id,
+            file_version,
+            crate::session::SCHEMA_VERSION,
+        );
+    }
     let dir = session_dir();
     std::fs::create_dir_all(&dir)?;
     // SESS-3: restrict session directory to owner-only (0700).
@@ -151,6 +166,11 @@ pub fn load_session(id: &str) -> anyhow::Result<Session> {
             our_version = crate::session::SCHEMA_VERSION,
             "session file is from a newer dirge version; unknown fields will default. Upgrade dirge to read it fully."
         );
+        // SESS-15: remember that the file was newer so save_session
+        // can refuse to overwrite. Otherwise a downgrade-then-save
+        // permanently loses the newer-version fields that
+        // #[serde(default)] silently zeroed at load.
+        session.loaded_from_newer_version = Some(session.schema_version.into());
     }
     Ok(session)
 }

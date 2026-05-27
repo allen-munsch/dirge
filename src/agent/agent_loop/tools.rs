@@ -125,8 +125,9 @@ pub async fn execute_tool_calls_sequential(
                 is_error,
             },
             PrepareOutcome::Prepared { tool, args } => {
-                // Inflight: add now that we know the tool will actually run.
-                inflight.add(&tool_call.id);
+                // LOOP-5: RAII guard ensures the inflight id is
+                // removed even on cancellation / panic / `?`-bail.
+                let _inflight = inflight.guard(&tool_call.id);
                 let executed =
                     execute_prepared_tool_call(&tool, tool_call, &args, signal, emit).await;
                 finalize_executed_tool_call(
@@ -138,6 +139,7 @@ pub async fn execute_tool_calls_sequential(
                     config,
                 )
                 .await
+                // _inflight dropped here → inflight.delete fires.
             }
         };
 
@@ -147,9 +149,6 @@ pub async fn execute_tool_calls_sequential(
         // 5. tool-result message
         let result_msg = create_tool_result_message(&finalized);
         emit_tool_result_message(&result_msg, emit).await;
-
-        // Finally-contract: delete from inflight.
-        inflight.delete(&tool_call.id);
 
         finalized_calls.push(finalized);
         messages.push(result_msg);
@@ -212,11 +211,23 @@ async fn prepare_tool_call(
             prepared_args
         }
         Ok(Some(rr)) => {
+            // LOOP-2: log the original args alongside the repair
+            // kinds so a future audit can see exactly what the
+            // model emitted vs what the loop dispatched. Truncate
+            // the original to keep telemetry rows bounded —
+            // multi-MB tool-call args are unusual but possible.
+            let original_args = serde_json::to_string(&prepared_args).unwrap_or_default();
+            let original_truncated: String = if original_args.len() > 4096 {
+                format!("{}... ({} bytes truncated)", &original_args[..4096], original_args.len() - 4096)
+            } else {
+                original_args
+            };
             tracing::info!(
                 target: "tool_repair",
                 model = config.model_name.as_deref().unwrap_or("unknown"),
                 tool = %tool_call.name,
                 repair = ?rr.kinds,
+                original_args = %original_truncated,
                 "tool input repaired"
             );
             rr.repaired
@@ -630,7 +641,10 @@ pub async fn execute_tool_calls_parallel(
                 // tool_execution_end at the end. The
                 // tool_execution_end ordering THEREFORE matches
                 // completion order, not source order.
-                inflight.add(&tool_call.id);
+                //
+                // LOOP-5: use the Drop-guard form so a cancel/panic
+                // that aborts the future doesn't leak the inflight
+                // id (which would leave the UI spinner stuck).
                 let tool_call_clone = tool_call.clone();
                 let assistant_clone = assistant_message.clone();
                 let config_clone = config.clone();
@@ -640,6 +654,7 @@ pub async fn execute_tool_calls_parallel(
                 let inflight_clone = inflight.clone();
                 let call_id = tool_call.id.clone();
                 entries.push(Box::pin(async move {
+                    let _guard = inflight_clone.guard(&call_id);
                     let executed = execute_prepared_tool_call(
                         &tool,
                         &tool_call_clone,
@@ -661,8 +676,7 @@ pub async fn execute_tool_calls_parallel(
                     // difference from sequential (which emits
                     // end immediately after each call).
                     emit_tool_execution_end(&finalized, &emit_clone).await;
-                    // Finally-contract: delete from inflight.
-                    inflight_clone.delete(&call_id);
+                    // _guard dropped here → inflight.delete fires.
                     finalized
                 }));
                 if signal.is_cancelled() {

@@ -232,12 +232,22 @@ impl Cli {
     }
 
     pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
-        self.provider
-            .as_deref()
-            .or(cfg.provider.as_deref())
-            .map(CompactString::new)
-            .or_else(|| crate::provider::auto_detect_provider().map(CompactString::new))
-            .unwrap_or_else(|| CompactString::new("openrouter"))
+        if let Some(p) = self.provider.as_deref().or(cfg.provider.as_deref()) {
+            return CompactString::new(p);
+        }
+        // PROV-4: log when autodetect picks a provider from env vars
+        // so users with multiple API keys set understand which one
+        // is being used. Resolution order is fixed and deepseek wins
+        // over openrouter if both are present — surprising silent
+        // behavior previously.
+        if let Some(detected) = crate::provider::auto_detect_provider() {
+            eprintln!(
+                "info: provider auto-detected from environment: {} (set `--provider` or `provider` in config.json to override)",
+                detected,
+            );
+            return CompactString::new(detected);
+        }
+        CompactString::new("openrouter")
     }
 
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {

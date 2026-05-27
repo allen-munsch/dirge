@@ -113,6 +113,15 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
         let mut merged = String::new();
         let mut so = stdout.map(tokio::io::BufReader::new);
         let mut se = stderr.map(tokio::io::BufReader::new);
+        // TOOL-7: streaming cap. Previously this loop appended
+        // every line to `merged` without bound; a child writing
+        // GBs (`cat /dev/urandom | head -c 10G`) would buffer all
+        // of it in memory before the post-drain truncation. Stop
+        // appending once we cross the cap; keep draining so the
+        // child doesn't block on a full pipe buffer (which would
+        // hold open the pgid past the timeout).
+        const DRAIN_CAP_BYTES: usize = 256 * 1024;
+        let mut overflow_bytes: usize = 0;
         loop {
             // Decide presence BEFORE constructing futures — the
             // `if` guards on select! borrow `so` and `se`, which
@@ -143,13 +152,35 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
                 biased;
                 r = so_fut, if has_so => match r {
                     Ok(Some(0)) | Ok(None) | Err(_) => { so = None; }
-                    Ok(Some(_)) => merged.push_str(&so_buf),
+                    Ok(Some(n)) => {
+                        if merged.len() < DRAIN_CAP_BYTES {
+                            merged.push_str(&so_buf);
+                        } else {
+                            overflow_bytes = overflow_bytes.saturating_add(n);
+                        }
+                    },
                 },
                 r = se_fut, if has_se => match r {
                     Ok(Some(0)) | Ok(None) | Err(_) => { se = None; }
-                    Ok(Some(_)) => merged.push_str(&se_buf),
+                    Ok(Some(n)) => {
+                        if merged.len() < DRAIN_CAP_BYTES {
+                            merged.push_str(&se_buf);
+                        } else {
+                            overflow_bytes = overflow_bytes.saturating_add(n);
+                        }
+                    },
                 },
             }
+        }
+        if overflow_bytes > 0 {
+            if !merged.is_empty() && !merged.ends_with('\n') {
+                merged.push('\n');
+            }
+            merged.push_str(&format!(
+                "…[bash output exceeded cap; discarded {} additional bytes streamed after the {}-KiB cap]",
+                overflow_bytes,
+                DRAIN_CAP_BYTES / 1024,
+            ));
         }
         merged
     };

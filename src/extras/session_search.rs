@@ -499,13 +499,24 @@ fn sanitize_fts5_query(query: &str) -> String {
     static LEADING_STAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|\s)\*").unwrap());
     sanitized = LEADING_STAR_RE.replace_all(&sanitized, "$1").to_string();
 
-    // Step 4: Remove dangling boolean operators at start/end
+    // Step 4: Remove dangling boolean operators at start/end.
+    // SESS-7: loop until stable so chained operators like
+    // `AND OR foo` or `foo AND OR` are fully stripped. The single
+    // `replace` (not `replace_all`) only consumed one match per
+    // side and left FTS5-invalid residue that the engine then
+    // rejected.
     static DANGLING_START_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)^(AND|OR|NOT)\b\s*").unwrap());
-    sanitized = DANGLING_START_RE.replace(&sanitized.trim(), "").to_string();
     static DANGLING_END_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)\s+(AND|OR|NOT)\s*$").unwrap());
-    sanitized = DANGLING_END_RE.replace(&sanitized.trim(), "").to_string();
+    loop {
+        let before = sanitized.clone();
+        sanitized = DANGLING_START_RE.replace(sanitized.trim(), "").to_string();
+        sanitized = DANGLING_END_RE.replace(sanitized.trim(), "").to_string();
+        if sanitized == before {
+            break;
+        }
+    }
 
     // Step 5: Wrap hyphenated and dotted terms in quotes.
     // FTS5 tokenizer splits on `-` and `.`, so `chat-send` becomes

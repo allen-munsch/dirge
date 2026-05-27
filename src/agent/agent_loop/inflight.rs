@@ -72,6 +72,33 @@ impl InflightSet {
         };
         ids.clear();
     }
+
+    /// LOOP-5: RAII guard — `add`s the id on construction, `delete`s
+    /// it on Drop. Use this instead of the manual `add` / `delete`
+    /// pair so a cancellation, panic, or `?`-bail anywhere between
+    /// the two never leaves a stale id in the set (the UI then
+    /// shows a spinner indefinitely).
+    pub fn guard(&self, id: &str) -> InflightGuard {
+        self.add(id);
+        InflightGuard {
+            set: self.clone(),
+            id: id.to_string(),
+        }
+    }
+}
+
+/// Drop-guard returned by `InflightSet::guard`. Cleaning up via
+/// Drop survives cancel/panic/`?`-bail paths that a manual
+/// `delete` call would miss.
+pub struct InflightGuard {
+    set: InflightSet,
+    id: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.set.delete(&self.id);
+    }
 }
 
 #[cfg(test)]

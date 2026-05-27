@@ -303,22 +303,66 @@ pub async fn run_loop(
                 let scavenge_result =
                     super::scavenge::scavenge_tool_calls(Some(&reasoning_text), &allowed_names, 4);
                 if !scavenge_result.calls.is_empty() {
+                    // LOOP-12: canonicalize the JSON so different
+                    // key orders or numeric reprs (1 vs 1.0) for the
+                    // same logical call don't slip past dedupe.
+                    // `serde_json::to_string` on a `Map` preserves
+                    // insertion order, which can vary between the
+                    // assistant-emitted call and the scavenge-parsed
+                    // form. `canonical_json` sorts keys and forces
+                    // a stable number representation.
+                    fn canonical_json(v: &serde_json::Value) -> String {
+                        match v {
+                            serde_json::Value::Object(m) => {
+                                let mut keys: Vec<&String> = m.keys().collect();
+                                keys.sort();
+                                let mut s = String::from("{");
+                                for (i, k) in keys.iter().enumerate() {
+                                    if i > 0 {
+                                        s.push(',');
+                                    }
+                                    s.push_str(&serde_json::to_string(k).unwrap_or_default());
+                                    s.push(':');
+                                    s.push_str(&canonical_json(&m[*k]));
+                                }
+                                s.push('}');
+                                s
+                            }
+                            serde_json::Value::Array(a) => {
+                                let mut s = String::from("[");
+                                for (i, e) in a.iter().enumerate() {
+                                    if i > 0 {
+                                        s.push(',');
+                                    }
+                                    s.push_str(&canonical_json(e));
+                                }
+                                s.push(']');
+                                s
+                            }
+                            serde_json::Value::Number(n) => {
+                                // Normalize integers-stored-as-floats
+                                // (`1.0` ≡ `1`) so reps match.
+                                if let Some(i) = n.as_i64() {
+                                    i.to_string()
+                                } else if let Some(f) = n.as_f64() {
+                                    if f.fract() == 0.0 && f.is_finite() {
+                                        (f as i64).to_string()
+                                    } else {
+                                        f.to_string()
+                                    }
+                                } else {
+                                    n.to_string()
+                                }
+                            }
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        }
+                    }
                     let seen_signatures: std::collections::HashSet<String> = tool_calls
                         .iter()
-                        .map(|tc| {
-                            format!(
-                                "{}::{}",
-                                tc.name,
-                                serde_json::to_string(&tc.arguments).unwrap_or_default()
-                            )
-                        })
+                        .map(|tc| format!("{}::{}", tc.name, canonical_json(&tc.arguments)))
                         .collect();
                     for sc in &scavenge_result.calls {
-                        let sig = format!(
-                            "{}::{}",
-                            sc.name,
-                            serde_json::to_string(&sc.arguments).unwrap_or_default()
-                        );
+                        let sig = format!("{}::{}", sc.name, canonical_json(&sc.arguments));
                         if !seen_signatures.contains(&sig) {
                             tool_calls.push(sc.clone());
                         }

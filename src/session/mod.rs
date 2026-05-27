@@ -290,6 +290,16 @@ pub struct Session {
     /// on disk yet) — save always wins in that case.
     #[serde(skip)]
     pub loaded_mtime: Option<std::time::SystemTime>,
+
+    /// SESS-15: when the on-disk file's `schema_version` exceeded
+    /// this binary's `SCHEMA_VERSION` at load time, store the file
+    /// version here. `save_session` refuses to overwrite (the
+    /// older dirge would silently zero out the newer fields,
+    /// permanently losing data the newer version cared about).
+    /// `None` for fresh sessions and ones loaded at-or-below our
+    /// schema. Runtime-only — never serialized.
+    #[serde(skip)]
+    pub loaded_from_newer_version: Option<u64>,
 }
 
 impl Session {
@@ -372,6 +382,7 @@ impl Session {
             branch_summaries: Vec::new(),
             current_prompt_name: None,
             loaded_mtime: None,
+            loaded_from_newer_version: None,
         }
     }
 
@@ -790,6 +801,10 @@ impl Session {
         // over implicitly.
         self.loaded_mtime = None;
         self.current_prompt_name = None;
+        // SESS-15: reset_to_new generates a fresh id, so we own
+        // the on-disk file under that id; the newer-schema flag
+        // belonged to the prior id's file.
+        self.loaded_from_newer_version = None;
         // Note: model/provider/context_window/working_dir preserved
         // so the host can keep the same agent runtime.
     }

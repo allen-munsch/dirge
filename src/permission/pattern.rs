@@ -186,6 +186,22 @@ mod tests {
         // the literal parens.
         assert!(!pat.matches("npm test unit"));
     }
+
+    /// PERM-4: `/etc/**` should match the bare directory and all
+    /// content beneath it. Previous behavior required a `/`-suffixed
+    /// path, silently missing the directory itself.
+    #[test]
+    fn trailing_double_star_matches_bare_dir() {
+        let pat = Pattern::new("/etc/**");
+        assert!(pat.matches("/etc"), "bare directory should match");
+        assert!(pat.matches("/etc/passwd"), "child should match");
+        assert!(
+            pat.matches("/etc/nested/deep/file"),
+            "nested child should match",
+        );
+        // Sibling that shares a prefix must NOT match.
+        assert!(!pat.matches("/etcetera/foo"));
+    }
 }
 
 fn glob_to_regex(pattern: &str, path_style: bool) -> String {
@@ -206,6 +222,18 @@ fn glob_to_regex(pattern: &str, path_style: bool) -> String {
         let head = &pattern[..pattern.len() - 2];
         let head_regex = glob_to_regex_inner(head, path_style);
         return format!("^{head_regex}(?: .*)?$");
+    }
+    // PERM-4: a user-written `/etc/**` should match BOTH the
+    // directory itself and everything beneath it. Default inner
+    // semantics emit `^/etc/.*$` for that pattern, which requires
+    // a slash + content and silently misses the bare-directory
+    // case. Trailing `/**` rewrites the tail to `(?:/.*)?` so both
+    // forms hit. Path-style only; command patterns don't have
+    // this idiom.
+    if path_style && pattern.ends_with("/**") && pattern.len() >= 3 {
+        let head = &pattern[..pattern.len() - 3];
+        let head_regex = glob_to_regex_inner(head, path_style);
+        return format!("^{head_regex}(?:/.*)?$");
     }
     format!("^{}$", glob_to_regex_inner(pattern, path_style))
 }

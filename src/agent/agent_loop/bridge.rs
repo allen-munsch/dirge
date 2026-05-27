@@ -259,6 +259,13 @@ impl EventBridge {
                 // value is the NEXT turn's index. Use
                 // `turn_index - 1` for the closing TurnEnd.
                 let idx = self.turn_index.saturating_sub(1);
+                // LOOP-10: drop tool-id → name entries whose
+                // `ToolExecutionEnd` never landed (cancellation,
+                // panic in dispatch, abnormal termination). Without
+                // this the map grows for the bridge lifetime; on
+                // long sessions with cancellations it becomes a
+                // small leak.
+                self.tool_name_by_id.clear();
                 vec![AgentEvent::TurnEnd { index: idx }]
             }
 

@@ -431,21 +431,53 @@ pub enum AnyModel {
 impl AnyModel {
     pub async fn btw_query(&self, prompt: String) -> anyhow::Result<String> {
         let preamble = "Answer the user's question concisely.";
-        macro_rules! btw {
+        // PROV-3: wrap the bare one-shot prompt in the same recovery
+        // policy used for the main turn loop. Previously a single
+        // 503 from the provider killed every `/btw` and subagent
+        // (`task` tool) call with no retry. Network + rate-limit
+        // failures now get the standard 3-retry exponential backoff;
+        // auth / context-length / other still bail immediately.
+        use crate::agent::recovery::{RecoveryPolicy, classify_error};
+        let policy = RecoveryPolicy::default();
+        macro_rules! one_shot {
             ($m:expr) => {{
-                let agent = rig::agent::AgentBuilder::new($m).preamble(preamble).build();
-                Ok(agent.prompt(prompt).await?)
+                let m = $m;
+                let mut attempts = 0;
+                loop {
+                    let agent = rig::agent::AgentBuilder::new(m.clone())
+                        .preamble(preamble)
+                        .build();
+                    match agent.prompt(prompt.clone()).await {
+                        Ok(reply) => break Ok::<String, anyhow::Error>(reply),
+                        Err(e) => {
+                            let msg = e.to_string();
+                            let kind = classify_error(&msg);
+                            if !policy.should_retry(attempts, kind) {
+                                break Err(e.into());
+                            }
+                            let delay = policy.backoff_duration_for_msg(attempts, &msg);
+                            tracing::warn!(
+                                attempt = attempts + 1,
+                                delay_ms = delay.as_millis() as u64,
+                                error = %msg,
+                                "btw_query retrying",
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempts += 1;
+                        }
+                    }
+                }
             }};
         }
         match self {
-            AnyModel::OpenRouter(m) => btw!(m.clone()),
-            AnyModel::OpenAI(m) => btw!(m.clone()),
-            AnyModel::Anthropic(m) => btw!(m.clone()),
-            AnyModel::Gemini(m) => btw!(m.clone()),
-            AnyModel::DeepSeek(m) => btw!(m.clone()),
-            AnyModel::Glm(m) => btw!(m.clone()),
-            AnyModel::Ollama(m) => btw!(m.clone()),
-            AnyModel::Custom(m) => btw!(m.clone()),
+            AnyModel::OpenRouter(m) => one_shot!(m),
+            AnyModel::OpenAI(m) => one_shot!(m),
+            AnyModel::Anthropic(m) => one_shot!(m),
+            AnyModel::Gemini(m) => one_shot!(m),
+            AnyModel::DeepSeek(m) => one_shot!(m),
+            AnyModel::Glm(m) => one_shot!(m),
+            AnyModel::Ollama(m) => one_shot!(m),
+            AnyModel::Custom(m) => one_shot!(m),
         }
     }
 

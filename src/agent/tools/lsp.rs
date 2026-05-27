@@ -13,7 +13,7 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
+use crate::agent::tools::{AskSender, PermCheck, ToolError};
 use crate::lsp::manager::{LspManager, TouchMode};
 
 #[allow(dead_code)]
@@ -47,7 +47,9 @@ pub struct LspTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     pub manager: Arc<LspManager>,
-    /// Anchor for resolving relative paths. Usually the dirge worktree.
+    /// Anchor for resolving relative paths. Usually the dirge
+    /// worktree. Joined with relative file_path args before the
+    /// permission resolver canonicalizes.
     pub cwd: PathBuf,
 }
 
@@ -212,23 +214,36 @@ impl Tool for LspTool {
             )));
         }
 
-        // Resolve the file path. Permission check uses the resolved absolute
-        // path so allowlist patterns match against the canonical form.
-        let abs_path = args.file_path.as_ref().map(|p| {
+        // TOOL-5: join relative paths against the tool's cwd
+        // anchor FIRST, then route through the canonicalizing
+        // permission resolver. This way `../../etc/passwd`
+        // becomes `{cwd}/../../etc/passwd` which the resolver
+        // canonicalizes to `/etc/passwd` BEFORE the permission
+        // check, defeating any symlink-swap between check-time
+        // and open-time (same pattern as read/write/edit).
+        let abs_path = if let Some(p) = args.file_path.as_ref() {
             let raw = Path::new(p);
-            if raw.is_absolute() {
+            let joined = if raw.is_absolute() {
                 raw.to_path_buf()
             } else {
                 self.cwd.join(raw)
-            }
-        });
+            };
+            let resolved = crate::agent::tools::check_perm_path_resolve(
+                &self.permission,
+                &self.ask_tx,
+                "lsp",
+                &joined.to_string_lossy(),
+            )
+            .await?;
+            Some(std::path::PathBuf::from(resolved))
+        } else {
+            None
+        };
 
-        if let Some(p) = &abs_path {
-            check_perm_path(&self.permission, &self.ask_tx, "lsp", &p.to_string_lossy()).await?;
-
-            if !p.exists() {
-                return Err(ToolError::Msg(format!("file not found: {}", p.display())));
-            }
+        if let Some(p) = &abs_path
+            && !p.exists()
+        {
+            return Err(ToolError::Msg(format!("file not found: {}", p.display())));
         }
 
         // For position-based ops, the file must be in sync with the server.

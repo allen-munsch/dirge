@@ -183,8 +183,27 @@ pub fn fix_tool_call_pairing(messages: &[Value]) -> (Vec<Value>, usize, usize) {
                     out.extend(candidates);
                     i = j - 1;
                 } else {
+                    // LOOP-6: previously we dropped the assistant
+                    // AND all matched-but-incomplete `candidates`,
+                    // losing real tool results the model had
+                    // already seen. Instead, keep the assistant +
+                    // the matched results, and synthesize an
+                    // error-shaped tool result for each missing id
+                    // so the provider sees a complete N-call /
+                    // N-result pair and doesn't 400.
+                    out.push(msg.clone());
+                    out.extend(candidates);
+                    for missing_id in &needed {
+                        let synthetic = serde_json::json!({
+                            "role": "toolResult",
+                            "tool_call_id": missing_id,
+                            "toolCallId": missing_id,
+                            "content": "tool result missing — call was interrupted (cancelled, panic, or session-resume across a partial turn). Treat as a transient failure and retry if needed.",
+                            "is_error": true,
+                        });
+                        out.push(synthetic);
+                    }
                     dropped_assistant_calls += 1;
-                    dropped_stray_tools += candidates.len();
                     i = j - 1;
                 }
                 i += 1;
@@ -298,15 +317,36 @@ mod tests {
         assert_eq!(dropped_t, 0);
     }
 
+    /// LOOP-6: unpaired assistant tool calls are kept and joined to a
+    /// synthetic-error tool result so the provider sees a complete
+    /// N-call / N-result pair (DeepSeek 400s otherwise) instead of
+    /// dropping the assistant entirely.
     #[test]
-    fn pairing_drops_unpaired_assistant_tool_calls() {
+    fn pairing_synthesizes_results_for_unpaired_assistant_tool_calls() {
         let msgs = vec![assistant_msg(
             "calling",
             &[serde_json::json!({"id": "c1", "name": "echo"})],
         )];
         let (out, dropped_a, _) = fix_tool_call_pairing(&msgs);
-        assert_eq!(out.len(), 0);
+        assert_eq!(out.len(), 2, "assistant + 1 synthetic result");
+        // dropped_a still records the partial-match event so the heal
+        // report can surface the recovery to the user.
         assert_eq!(dropped_a, 1);
+        // First message is the original assistant.
+        assert_eq!(
+            out[0].get("role").and_then(|r| r.as_str()),
+            Some("assistant")
+        );
+        // Second is the synthesized error-shaped tool result.
+        assert_eq!(
+            out[1].get("role").and_then(|r| r.as_str()),
+            Some("toolResult"),
+        );
+        assert_eq!(
+            out[1].get("tool_call_id").and_then(|r| r.as_str()),
+            Some("c1"),
+        );
+        assert_eq!(out[1].get("is_error"), Some(&serde_json::Value::Bool(true)));
     }
 
     #[test]
@@ -435,10 +475,13 @@ mod tests {
         assert_eq!(dropped_t, 0);
     }
 
+    /// LOOP-6: when the loop-transcript assistant has tool calls but
+    /// no follow-up tool results, we keep the assistant and append
+    /// a synthetic-error toolResult per missing id, so the next
+    /// turn's request to the provider has a complete N-call/N-result
+    /// pair.
     #[test]
-    fn pairing_drops_unpaired_loop_transcript_assistant() {
-        // Simulates Error/Abort path: assistant emitted toolCalls in
-        // content blocks, but tool execution never ran → no results.
+    fn pairing_synthesizes_results_for_unpaired_loop_transcript_assistant() {
         let msgs = vec![
             user_msg("run a command"),
             loop_assistant_msg(&[serde_json::json!({
@@ -449,17 +492,17 @@ mod tests {
             user_msg("next question"),
         ];
         let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
-        assert_eq!(
-            out.len(),
-            2,
-            "should keep user messages but drop assistant with unpaired tool calls"
-        );
-        assert_eq!(dropped_a, 1);
+        // user + assistant + synthetic toolResult + user = 4
+        assert_eq!(out.len(), 4);
+        assert_eq!(dropped_a, 1, "partial-pair event still recorded");
         assert_eq!(dropped_t, 0);
-        // Verify the assistant was dropped (only user messages remain)
-        for msg in &out {
-            assert_eq!(msg["role"], "user");
-        }
+        // Assistant survives.
+        assert_eq!(out[1]["role"], "assistant");
+        // Synthetic toolResult sits between assistant and the next user.
+        assert_eq!(out[2]["role"], "toolResult");
+        assert_eq!(out[2]["tool_call_id"], "call_abc");
+        assert_eq!(out[2]["is_error"], serde_json::Value::Bool(true));
+        assert_eq!(out[3]["role"], "user");
     }
 
     #[test]
@@ -480,9 +523,11 @@ mod tests {
         assert_eq!(dropped_t, 0);
     }
 
+    /// LOOP-6: two tool calls, only one has a real result → keep the
+    /// real one and synthesize an error result for the missing id.
+    /// Previously the assistant + both candidates were thrown away.
     #[test]
-    fn pairing_handles_partially_paired_loop_assistant() {
-        // Two tool calls, only one has a result → drop the assistant.
+    fn pairing_synthesizes_results_for_partially_paired_loop_assistant() {
         let msgs = vec![
             loop_assistant_msg(&[
                 serde_json::json!({"id": "c1", "name": "bash", "arguments": {}}),
@@ -491,11 +536,18 @@ mod tests {
             tool_result_msg("only c1 result", "c1", "bash"),
             user_msg("next"),
         ];
-        let (out, dropped_a, dropped_t) = fix_tool_call_pairing(&msgs);
-        assert_eq!(dropped_a, 1, "should drop assistant: c2 is unpaired");
-        assert_eq!(dropped_t, 1, "should count the stray c1 toolResult");
-        // Only the user message should remain
-        assert_eq!(out.len(), 1, "only user message should survive");
-        assert_eq!(out[0]["role"], "user");
+        let (out, dropped_a, _) = fix_tool_call_pairing(&msgs);
+        assert_eq!(dropped_a, 1, "partial-pair event still recorded");
+        // assistant + real c1 result + synthetic c2 result + user = 4
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[1]["role"], "toolResult");
+        // The real c1 result uses camelCase `toolCallId`; the
+        // synthesized one writes both forms for defensiveness.
+        assert_eq!(out[1]["toolCallId"], "c1");
+        assert_eq!(out[2]["role"], "toolResult");
+        assert_eq!(out[2]["tool_call_id"], "c2");
+        assert_eq!(out[2]["is_error"], serde_json::Value::Bool(true));
+        assert_eq!(out[3]["role"], "user");
     }
 }
