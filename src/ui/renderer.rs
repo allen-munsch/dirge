@@ -104,9 +104,7 @@ fn format_terminal_title(state: crate::ui::avatar::AvatarState, tool_name: Optio
     // title display.
     let sanitize = |s: &str| -> String {
         s.chars()
-            .filter(|c| {
-                !c.is_control() && *c != '\u{0007}' && *c != '\u{001b}' && *c != '\u{009c}'
-            })
+            .filter(|c| !c.is_control() && *c != '\u{0007}' && *c != '\u{001b}' && *c != '\u{009c}')
             .take(64)
             .collect()
     };
@@ -2317,7 +2315,11 @@ mod tests {
         let bytes = super::osc_set_title("hello");
         // OSC introducer `\x1b]0;` + payload + ST terminator `\x1b\\`
         assert_eq!(bytes, b"\x1b]0;hello\x1b\\");
-        assert!(!bytes.contains(&0x07), "BEL should not be used: {:?}", bytes);
+        assert!(
+            !bytes.contains(&0x07),
+            "BEL should not be used: {:?}",
+            bytes
+        );
     }
 
     #[cfg(feature = "experimental-ui-terminal-tab")]

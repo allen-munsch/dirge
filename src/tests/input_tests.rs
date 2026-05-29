@@ -1326,7 +1326,11 @@ fn search_find_behavior() {
     // type 'a' — "bravo" contains 'a' so it stays as match (newest first)
     editor.handle_key(press(KeyCode::Char('a')));
     assert_eq!(editor.search_query(), "a");
-    assert_eq!(editor.search_match_text(), "bravo", "both contain 'a', newest is bravo");
+    assert_eq!(
+        editor.search_match_text(),
+        "bravo",
+        "both contain 'a', newest is bravo"
+    );
     assert_eq!(editor.buffer.as_str(), "bravo");
     // Ctrl+R again to cycle to older match containing 'a'
     editor.handle_key(ctrl(KeyCode::Char('r')));
@@ -1380,9 +1384,9 @@ fn load_history_populates_for_ctrl_r() {
 #[test]
 fn load_history_skips_dupes_and_empty() {
     let mut editor = InputEditor::new();
-    editor.load_history_entry("");          // skipped: empty
+    editor.load_history_entry(""); // skipped: empty
     editor.load_history_entry("msg1");
-    editor.load_history_entry("msg1");      // skipped: dupe
+    editor.load_history_entry("msg1"); // skipped: dupe
     editor.load_history_entry("msg2");
 
     // Enter search — newest is "msg2"
