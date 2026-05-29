@@ -12,7 +12,7 @@ fn home_fallback() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn dirs_path() -> PathBuf {
+pub(crate) fn dirs_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("DIRGE_DATA_DIR") {
         return PathBuf::from(dir);
     }
@@ -550,7 +550,7 @@ mod tests {
     /// Compaction records persist through save/load.
     #[test]
     fn roundtrip_compaction_persists() {
-        use crate::session::{Compaction, MessageRole, Session};
+        use crate::session::{MessageRole, Session};
         let id = unique_test_id("roundtrip-compact");
         let mut s = Session::new("p", "m", 100_000);
         s.id = compact_str::CompactString::from(id.clone());
@@ -774,7 +774,7 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") {
+        if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
         let mtime = entry
@@ -784,7 +784,7 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
         entries.push((path, mtime));
     }
     // Newest first.
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
     entries.truncate(limit);
 
     let mut sessions: Vec<Session> = Vec::with_capacity(entries.len());

@@ -105,6 +105,65 @@ impl RecoveryPolicy {
             None => computed,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_backoff(max_retries: usize, backoff_base: Duration) -> Self {
+        Self {
+            max_retries,
+            backoff_base,
+        }
+    }
+}
+
+/// Run an async operation under a [`RecoveryPolicy`], retrying transient
+/// (network / rate-limit) failures with the policy's exponential
+/// backoff. Auth / context-length / other failures bail immediately.
+///
+/// Single home for the attempt → classify → backoff → sleep loop that
+/// `AnyModel::btw_query` and the summarizer each hand-rolled (dirge-6cvc).
+/// `attempt` is invoked fresh on every try; `label` names the operation
+/// in the retry log line. The error type only needs `Display` — the
+/// message is what `classify_error` inspects.
+///
+/// NOTE: the backoff sleep here is not yet cancellation-aware; wiring an
+/// abort signal through the (signal-less) call sites is tracked
+/// separately. The streaming retry wrapper in `agent_loop::retry` is a
+/// different shape (per-event commit tracking) and keeps its own loop.
+pub async fn run_with_retry<T, E, F, Fut>(
+    policy: &RecoveryPolicy,
+    label: &str,
+    mut attempt: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut attempts = 0;
+    loop {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                let msg = err.to_string();
+                let kind = classify_error(&msg);
+                if !policy.should_retry(attempts, kind) {
+                    return Err(err);
+                }
+                let delay = policy.backoff_duration_for_msg(attempts, &msg);
+                tracing::warn!(
+                    op = label,
+                    attempt = attempts + 1,
+                    max = policy.max_retries(),
+                    delay_ms = delay.as_millis() as u64,
+                    kind = ?kind,
+                    error = %msg,
+                    "retrying after transient failure",
+                );
+                tokio::time::sleep(delay).await;
+                attempts += 1;
+            }
+        }
+    }
 }
 
 /// Parse a `Retry-After` value out of an error message. Looks for
@@ -407,6 +466,13 @@ pub fn classify_error(msg: &str) -> ErrorKind {
         || lower.contains("timed out")
         || lower.contains("request timeout")
         || lower.contains("server error")
+        // reqwest connect/send failures: the request never got a
+        // response (connection refused/dropped, DNS, TCP connect, or
+        // a mid-send drop). rig wraps these as "Http client error:
+        // error sending request for url (…)". Transient — retry.
+        || lower.contains("error sending request")
+        || lower.contains("connect error")
+        || lower.contains("tcp connect")
         // Mid-stream decode failures from reqwest/rig — the connection
         // returned bytes but they didn't deserialize into the expected
         // JSON envelope. Almost always transient (network blip,
@@ -483,6 +549,98 @@ pub fn user_facing_error(msg: &str, attempts: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // dirge-6cvc: the shared retry helper — success, immediate bail on a
+    // non-retryable error, and retry-then-succeed on a transient one.
+    #[tokio::test]
+    async fn run_with_retry_returns_first_success() {
+        let policy = RecoveryPolicy::default();
+        let calls = AtomicUsize::new(0);
+        let r: Result<u32, String> = run_with_retry(&policy, "t", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(7) }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry on success");
+    }
+
+    #[tokio::test]
+    async fn run_with_retry_bails_immediately_on_non_retryable() {
+        let policy = RecoveryPolicy::default();
+        let calls = AtomicUsize::new(0);
+        let r: Result<u32, String> = run_with_retry(&policy, "t", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err("invalid api key".to_string()) }
+        })
+        .await;
+        assert!(r.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "auth error must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_with_retry_retries_transient_then_succeeds() {
+        // Tiny backoff so the test doesn't actually wait seconds.
+        let policy = RecoveryPolicy::with_backoff(3, Duration::from_millis(1));
+        let calls = AtomicUsize::new(0);
+        let r: Result<u32, String> = run_with_retry(&policy, "t", || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err("rate limit exceeded".to_string())
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two retries then success");
+    }
+
+    #[tokio::test]
+    async fn run_with_retry_exhausts_then_returns_last_error() {
+        let policy = RecoveryPolicy::with_backoff(2, Duration::from_millis(1));
+        let calls = AtomicUsize::new(0);
+        let r: Result<u32, String> = run_with_retry(&policy, "t", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err("rate limit exceeded".to_string()) }
+        })
+        .await;
+        assert!(r.is_err());
+        // initial attempt + 2 retries = 3 calls.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    // dirge-5ul5: reqwest connect/send failures (the connection couldn't
+    // be established or dropped before a response) surface as "error
+    // sending request for url …" wrapped in rig's "Http client error".
+    // These are transient and MUST be retried, not classified Other.
+    #[test]
+    fn classify_connect_send_failures_as_network() {
+        for msg in [
+            "ProviderError: Http client error: error sending request for url (https://api.deepseek.com/v1/chat/completions)",
+            "error sending request for url (https://api.openai.com/v1/chat/completions)",
+            "reqwest::Error { kind: Connect, ... }: tcp connect error",
+            "Http client error: connect error",
+        ] {
+            assert_eq!(
+                classify_error(msg),
+                ErrorKind::Network,
+                "connect/send failure must be retryable: {msg}"
+            );
+        }
+        let policy = RecoveryPolicy::default();
+        assert!(
+            policy.should_retry(0, classify_error("error sending request for url (x)")),
+            "the DeepSeek connect failure must be retried"
+        );
+    }
 
     #[test]
     fn test_classify_context_length() {

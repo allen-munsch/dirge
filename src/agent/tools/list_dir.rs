@@ -4,6 +4,7 @@ use ignore::WalkBuilder;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
+use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
     AskSender, ListDirArgs, PermCheck, ToolError, check_perm_path, is_skip_dir,
@@ -69,7 +70,10 @@ impl Tool for ListDirTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "list_dir".to_string(),
-            description: "List files and directories in a directory. Respects .gitignore. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.".to_string(),
+            description: with_contract_hint(
+                "list_dir",
+                "List files and directories in a directory. Respects .gitignore. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -93,15 +97,12 @@ impl Tool for ListDirTool {
 
         // LOOP-3: dir stamp invalidates the cache on external mtime changes.
         let stamp = crate::agent::tools::cache::fs_stamp_or_cwd(path);
-        let cache_key = format!(
-            "list_dir:{}:hidden={}:{}",
-            path, args.include_hidden, stamp,
-        );
+        let cache_key = format!("list_dir:{}:hidden={}:{}", path, args.include_hidden, stamp,);
 
-        if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
-                return Ok(cached);
-            }
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key)
+        {
+            return Ok(cached);
         }
 
         let walker = WalkBuilder::new(path)

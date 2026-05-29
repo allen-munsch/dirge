@@ -19,6 +19,24 @@ pub const HOOK_NAMES: &[&str] = &[
     "on-error",
     "on-complete",
     "prepare-next-run",
+    // dirge-wqxj: fires once before the agent starts; receives the
+    // assembled system prompt; may call harness/append-system-prompt.
+    "before-agent-start",
+    // dirge-lsoq: fires after the assistant message finalizes; may
+    // call harness/rewrite-message to replace the response text.
+    "message-end",
+    // dirge-264x: fires before each LLM call with the current
+    // messages (JSON) in ctx :messages; may call
+    // harness/replace-context to prune/inject for that call.
+    "transform-context",
+    // dirge-jia8: observe-only notification fired before a
+    // compaction fold; receives ctx :message-count and :tokens.
+    // Cannot cancel the fold.
+    "on-before-compact",
+    // dirge-jia8: fires when summarizing the middle slice; receives
+    // ctx :messages (JSON); may call harness/set-compact-summary to
+    // supply a summary instead of the LLM summarizer.
+    "on-compact",
 ];
 
 /// Filter an input candidate list to only paths that exist as
@@ -72,7 +90,7 @@ pub fn load_plugin(
         let mut janet_files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
             .map_err(|e| format!("cannot read plugin dir {}: {}", path.display(), e))?
             .filter_map(|e| e.ok().map(|x| x.path()))
-            .filter(|p| p.is_file() && p.extension().map_or(false, |ext| ext == "janet"))
+            .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "janet"))
             .collect();
         janet_files.sort();
         if janet_files.is_empty() {

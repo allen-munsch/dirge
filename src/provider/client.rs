@@ -10,23 +10,30 @@ use std::collections::HashMap;
 
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
 
-use crate::config::CustomProviderConfig;
+use crate::config::ProviderEntry;
 
 use super::{AnyClient, ProviderKind, resolve_api_key, resolve_provider_info};
 
 pub(crate) fn create_client(
     provider_name: &str,
     api_key: Option<&str>,
-    custom_providers: &HashMap<String, CustomProviderConfig>,
+    providers: &HashMap<String, ProviderEntry>,
 ) -> anyhow::Result<AnyClient> {
-    let info = resolve_provider_info(provider_name, custom_providers).ok_or_else(|| {
+    let info = resolve_provider_info(provider_name, providers).ok_or_else(|| {
         anyhow::anyhow!(
             "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, deepseek, glm, ollama, custom",
             provider_name
         )
     })?;
 
-    let key = resolve_api_key(info.kind, info.api_key_env.as_deref(), api_key)?;
+    // Precedence: CLI `--api-key` > `entry.api_key` (literal or
+    // `${VAR}`-expanded) > `entry.api_key_env` > default env var
+    // for the kind > kind-specific fallback env vars.
+    let key = match (api_key, info.api_key_literal.as_deref()) {
+        (Some(k), _) if !k.is_empty() => k.to_string(),
+        (_, Some(k)) if !k.is_empty() => k.to_string(),
+        _ => resolve_api_key(info.kind, info.api_key_env.as_deref(), api_key)?,
+    };
 
     let base_url = match info.kind {
         ProviderKind::DeepSeek => Some(

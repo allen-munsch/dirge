@@ -5,17 +5,21 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
-use crate::extras::memory_store::MemoryToolStore;
+use crate::extras::memory_provider::MemoryProvider;
 
 pub struct MemoryTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
-    store: Arc<MemoryToolStore>,
+    // dirge-bov5: dyn-dispatched provider so alternative backends
+    // (vector store, MCP, remote sync) can plug in without churning
+    // the call sites. `Arc<MemoryToolStore>` is the default and
+    // coerces to this trait object via unsizing.
+    store: Arc<dyn MemoryProvider>,
 }
 
 impl MemoryTool {
     pub fn new(
-        store: Arc<MemoryToolStore>,
+        store: Arc<dyn MemoryProvider>,
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
     ) -> Self {
@@ -106,53 +110,73 @@ ACTIONS:
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
+            // dirge-5feg: the tool layer fires `on_memory_write`
+            // exactly once after each successful CRUD, regardless of
+            // which provider impl handled the call. Providers are
+            // forbidden from calling the hook themselves to avoid
+            // double-firing through wrappers.
+            //
+            // dirge-ix7n: the third hook arg carries action-specific
+            // semantics — `content` for add/replace, `old_text` for
+            // remove. The trait doc on `on_memory_write` calls this
+            // out as `payload` to avoid the "always a new value"
+            // misreading.
             "add" => {
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| ToolError::Msg("content is required for 'add'".to_string()))?;
-                let resp = self
-                    .store
-                    .add(target, content)
-                    .map_err(|e| ToolError::Msg(e))?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "add",
+                )?;
+                let resp = self.store.add(target, content).map_err(ToolError::Msg)?;
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "add",
+                    target,
+                    content,
+                );
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
             "replace" => {
-                let old_text = args
-                    .old_text
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("old_text is required for 'replace'".to_string())
-                    })?;
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("content is required for 'replace'".to_string())
-                    })?;
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "replace",
+                )?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "replace",
+                )?;
                 let resp = self
                     .store
                     .replace(target, old_text, content)
-                    .map_err(|e| ToolError::Msg(e))?;
+                    .map_err(ToolError::Msg)?;
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "replace",
+                    target,
+                    content,
+                );
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
             "remove" => {
-                let old_text = args
-                    .old_text
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("old_text is required for 'remove'".to_string())
-                    })?;
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "remove",
+                )?;
                 let resp = self
                     .store
                     .remove(target, old_text)
-                    .map_err(|e| ToolError::Msg(e))?;
+                    .map_err(ToolError::Msg)?;
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "remove",
+                    target,
+                    old_text,
+                );
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -178,18 +202,19 @@ fn validate_target(target: &str) -> Result<&str, ToolError> {
 mod tests {
     use super::*;
     use crate::extras::dirge_paths::ProjectPaths;
+    use crate::extras::memory_store::MemoryToolStore;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    fn temp_store() -> (Arc<MemoryToolStore>, std::path::PathBuf) {
+    fn temp_store() -> (Arc<dyn MemoryProvider>, std::path::PathBuf) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
             std::env::temp_dir().join(format!("dirge-mem-tool-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
-        let store = Arc::new(MemoryToolStore::load(&paths).unwrap());
+        let store: Arc<dyn MemoryProvider> = Arc::new(MemoryToolStore::load(&paths).unwrap());
         (store, dir)
     }
 
@@ -379,5 +404,276 @@ mod tests {
         let def = rt.block_on(tool.definition(String::new()));
         assert!(def.description.contains("memory"));
         assert!(def.description.contains("pitfalls"));
+    }
+
+    /// dirge-bov5 — `MemoryTool` routes through the `MemoryProvider`
+    /// trait so an alternative backend (vector store, MCP-backed,
+    /// etc.) receives every call. Verifies a custom recording
+    /// provider sees both writes and reads.
+    #[test]
+    fn integration_tool_routes_calls_through_custom_provider() {
+        use crate::extras::memory_provider::MemoryProvider;
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingProvider {
+            calls: Mutex<Vec<String>>,
+        }
+        impl MemoryProvider for RecordingProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+            fn view(&self, target: &str) -> serde_json::Value {
+                self.calls.lock().unwrap().push(format!("view:{}", target));
+                json!({ "entries": [], "count": 0 })
+            }
+            fn add(&self, target: &str, content: &str) -> Result<serde_json::Value, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("add:{}:{}", target, content));
+                Ok(json!({ "success": true, "entry_count": 1 }))
+            }
+            fn replace(
+                &self,
+                target: &str,
+                old: &str,
+                content: &str,
+            ) -> Result<serde_json::Value, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("replace:{}:{}:{}", target, old, content));
+                Ok(json!({ "success": true }))
+            }
+            fn remove(&self, target: &str, old: &str) -> Result<serde_json::Value, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("remove:{}:{}", target, old));
+                Ok(json!({ "success": true }))
+            }
+        }
+
+        let provider = Arc::new(RecordingProvider::default());
+        let tool = MemoryTool::new(provider.clone() as Arc<dyn MemoryProvider>, None, None);
+        let rt = make_runtime();
+
+        rt.block_on(tool.call(Args {
+            action: "add".into(),
+            target: "memory".into(),
+            content: Some("from-tool".into()),
+            old_text: None,
+        }))
+        .unwrap();
+        rt.block_on(tool.call(Args {
+            action: "view".into(),
+            target: "memory".into(),
+            content: None,
+            old_text: None,
+        }))
+        .unwrap();
+        rt.block_on(tool.call(Args {
+            action: "replace".into(),
+            target: "memory".into(),
+            content: Some("new".into()),
+            old_text: Some("from-tool".into()),
+        }))
+        .unwrap();
+        rt.block_on(tool.call(Args {
+            action: "remove".into(),
+            target: "memory".into(),
+            content: None,
+            old_text: Some("new".into()),
+        }))
+        .unwrap();
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                "add:memory:from-tool".to_string(),
+                "view:memory".to_string(),
+                "replace:memory:from-tool:new".to_string(),
+                "remove:memory:new".to_string(),
+            ],
+            "custom provider must receive every tool call verbatim"
+        );
+    }
+
+    /// dirge-5feg — the tool layer fires `on_memory_write` exactly
+    /// once per successful CRUD, regardless of whether the
+    /// provider's CRUD impl self-fired. `view` does NOT fire the
+    /// hook (it's not a write).
+    #[test]
+    fn integration_tool_layer_fires_on_memory_write_once_per_crud() {
+        use crate::extras::memory_provider::MemoryProvider;
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingHookProvider {
+            hooks: Mutex<Vec<(String, String, String)>>,
+        }
+        impl MemoryProvider for RecordingHookProvider {
+            fn name(&self) -> &str {
+                "hook-recorder"
+            }
+            // CRUD impls deliberately do NOT call on_memory_write —
+            // the tool layer is supposed to.
+            fn view(&self, _: &str) -> serde_json::Value {
+                json!({ "entries": [] })
+            }
+            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(json!({ "success": true }))
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(json!({ "success": true }))
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(json!({ "success": true }))
+            }
+            fn on_memory_write(&self, action: &str, target: &str, content: &str) {
+                self.hooks
+                    .lock()
+                    .unwrap()
+                    .push((action.into(), target.into(), content.into()));
+            }
+        }
+
+        let provider = Arc::new(RecordingHookProvider::default());
+        let tool = MemoryTool::new(provider.clone() as Arc<dyn MemoryProvider>, None, None);
+        let rt = make_runtime();
+
+        // view does NOT fire the hook.
+        rt.block_on(tool.call(Args {
+            action: "view".into(),
+            target: "memory".into(),
+            content: None,
+            old_text: None,
+        }))
+        .unwrap();
+        assert!(
+            provider.hooks.lock().unwrap().is_empty(),
+            "view must not fire on_memory_write"
+        );
+
+        // add → one fire with the content.
+        rt.block_on(tool.call(Args {
+            action: "add".into(),
+            target: "memory".into(),
+            content: Some("alpha".into()),
+            old_text: None,
+        }))
+        .unwrap();
+        // replace → one fire with the new content.
+        rt.block_on(tool.call(Args {
+            action: "replace".into(),
+            target: "memory".into(),
+            content: Some("beta".into()),
+            old_text: Some("alpha".into()),
+        }))
+        .unwrap();
+        // remove → one fire with the old_text (no new content).
+        rt.block_on(tool.call(Args {
+            action: "remove".into(),
+            target: "pitfalls".into(),
+            content: None,
+            old_text: Some("beta".into()),
+        }))
+        .unwrap();
+
+        let hooks = provider.hooks.lock().unwrap();
+        assert_eq!(
+            *hooks,
+            vec![
+                ("add".into(), "memory".into(), "alpha".into()),
+                ("replace".into(), "memory".into(), "beta".into()),
+                ("remove".into(), "pitfalls".into(), "beta".into()),
+            ],
+            "tool layer must fire on_memory_write exactly once per CRUD"
+        );
+    }
+
+    /// End-to-end: every action the SYSTEM_PROMPT names for the memory
+    /// tool must succeed against a real MemoryTool with valid args.
+    /// If this fails, the prompt is lying to the model. See dirge-yqmo.
+    #[test]
+    fn integration_prompt_actions_all_executable() {
+        use crate::agent::prompt::SYSTEM_PROMPT;
+
+        let memory_line = SYSTEM_PROMPT
+            .lines()
+            .find(|l| l.trim_start().starts_with("- memory:"))
+            .expect("SYSTEM_PROMPT should describe the memory tool");
+
+        // Extract candidate action words from the prompt.
+        let known_actions = ["view", "add", "replace", "remove"];
+        let prompt_actions: Vec<&str> = known_actions
+            .iter()
+            .copied()
+            .filter(|a| {
+                memory_line
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|w| w == *a)
+            })
+            .collect();
+        assert_eq!(
+            prompt_actions.len(),
+            known_actions.len(),
+            "prompt should list all real actions; got {:?}",
+            prompt_actions
+        );
+
+        let (store, _dir) = temp_store();
+        let tool = MemoryTool::new(store, None, None);
+        let rt = make_runtime();
+
+        // Seed an entry so replace/remove have something to match.
+        rt.block_on(tool.call(Args {
+            action: "add".into(),
+            target: "memory".into(),
+            content: Some("seed: build command cargo test".into()),
+            old_text: None,
+        }))
+        .expect("seed add should succeed");
+
+        for action in &prompt_actions {
+            let args = match *action {
+                "view" => Args {
+                    action: "view".into(),
+                    target: "memory".into(),
+                    content: None,
+                    old_text: None,
+                },
+                "add" => Args {
+                    action: "add".into(),
+                    target: "memory".into(),
+                    content: Some(format!("entry-for-{}", action)),
+                    old_text: None,
+                },
+                "replace" => Args {
+                    action: "replace".into(),
+                    target: "memory".into(),
+                    content: Some("seed: build command cargo test --release".into()),
+                    old_text: Some("seed:".into()),
+                },
+                "remove" => Args {
+                    action: "remove".into(),
+                    target: "memory".into(),
+                    content: None,
+                    old_text: Some("entry-for-add".into()),
+                },
+                _ => unreachable!(),
+            };
+            let result = rt.block_on(tool.call(args));
+            assert!(
+                result.is_ok(),
+                "prompt-advertised action '{}' failed end-to-end: {:?}",
+                action,
+                result
+            );
+        }
     }
 }

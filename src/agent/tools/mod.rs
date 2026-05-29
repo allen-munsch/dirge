@@ -11,6 +11,7 @@ mod list_dir;
 mod lsp;
 mod memory;
 pub(crate) mod modified;
+pub(crate) mod output_relay;
 pub(crate) mod plan;
 pub(crate) mod question;
 mod read;
@@ -22,6 +23,7 @@ mod skill;
 pub mod task;
 mod task_status;
 pub(crate) mod todo;
+pub mod tool_search;
 mod webfetch;
 mod websearch;
 pub(crate) mod write;
@@ -46,6 +48,8 @@ pub use skill::SkillTool;
 pub use task::TaskTool;
 pub use task_status::TaskStatusTool;
 pub use todo::WriteTodoList;
+#[allow(unused_imports)]
+pub use tool_search::{ALWAYS_ON_TOOLS, TOOL_SEARCH_NAME, ToolMeta, ToolSearchTool};
 pub use webfetch::WebFetchTool;
 pub use websearch::WebSearchTool;
 pub use write::WriteTool;
@@ -55,7 +59,7 @@ use std::io;
 use serde::Deserialize;
 
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
-use crate::permission::checker::{CheckResult, PermCheck};
+use crate::permission::checker::PermCheck;
 
 pub const MAX_GREP_RESULTS: usize = 200;
 pub const MAX_FIND_RESULTS: usize = 200;
@@ -66,6 +70,7 @@ pub const MAX_FIND_RESULTS: usize = 200;
 ///     an MCP-exported tool with a colliding name.
 ///   - `context/prompts.rs` `deny_tools` validation — warns when a
 ///     prompt's frontmatter names something not in this set.
+///
 /// Previously these two sites maintained independent lists; review-
 /// batch #7 unified them so adding a new tool only requires one edit.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
@@ -83,6 +88,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "skill",
     "task",
     "task_status",
+    "tool_search",
     "question",
     "webfetch",
     "websearch",
@@ -127,6 +133,78 @@ impl From<serde_json::Error> for ToolError {
 
 pub fn is_skip_dir(name: &str) -> bool {
     matches!(name, "node_modules" | "target")
+}
+
+/// Head-truncate `text` to at most `max_bytes` (landing on a UTF-8 char
+/// boundary), appending a uniform marker noting how much was dropped.
+/// Single source for the per-tool byte caps (dirge-06cp) so the marker
+/// is consistent and truncation is never *silent*. Takes ownership and
+/// returns the input untouched when it's within the cap (no copy).
+/// `what` names the source for the marker (e.g. "bash output").
+///
+/// NOTE: this is for the in-tool byte ceilings only. The LLM-context cap
+/// (head+tail, `compression`), the UI display cap (line-aware), grep's
+/// per-line cap, and list_dir's per-item cap are deliberately separate
+/// concerns/layers, not folded in here.
+pub fn head_cap(text: String, max_bytes: usize, what: &str) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let total = text.len();
+    let dropped = total - cut;
+    let mut out = text;
+    out.truncate(cut);
+    out.push_str(&format!(
+        "\n…[{what} truncated: dropped {dropped} of {total} bytes; narrow the command (head/grep) to keep context lean]"
+    ));
+    out
+}
+
+/// Extract a required, non-blank string argument for a multiplexer
+/// tool's action, with a uniform error message. Replaces the per-action
+/// `ok_or_else(|| Msg("X is required for 'Y'"))` checks that memory and
+/// skill each hand-rolled with slightly different wording (dirge-8k3k).
+///
+/// Kept as a call-site helper rather than a schema-driven
+/// `validate_and_repair` rule on purpose: a missing field there returns
+/// `Err` from the repair layer, which arms model escalation — overkill
+/// for a "you forgot a field for this action" error. Same reasoning as
+/// [`require_absolute_path`].
+pub fn required_nonblank<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    action: &str,
+) -> Result<&'a str, ToolError> {
+    match value {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        _ => Err(ToolError::Msg(format!(
+            "`{field}` is required for action '{action}'"
+        ))),
+    }
+}
+
+/// Enforce that a tool argument is an absolute filesystem path.
+///
+/// Single source for the check + error message shared by read, write,
+/// edit, and apply_patch (dirge-e1r9). These tools all declare
+/// `dirge-hints.semantic = "absolute_path"` in their schema and used to
+/// each re-implement `Path::is_absolute()` with a slightly different
+/// error string. `subject` names the field for the message (e.g.
+/// `"read path"`, `"apply_patch rename target"`). Returns the message
+/// as a plain `String`; callers wrap it (`.map_err(ToolError::Msg)?`).
+pub fn require_absolute_path(path: &str, subject: &str) -> Result<(), String> {
+    if std::path::Path::new(path).is_absolute() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{subject} must be an absolute path like '/home/user/project/file.txt', \
+             not a relative path or bare filename — got {path:?}"
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -288,62 +366,35 @@ pub async fn enforce(
         return Ok(raw_scope.to_string());
     };
 
-    // Inner pure-lookup helper. Reads the checker, returns
-    // (CheckResult, resolved-path). Doesn't touch the ask flow —
-    // that's separate so the F2 alias check can MERGE results
-    // before any prompting fires.
-    fn inner_check(
-        guard: &mut crate::permission::checker::PermissionChecker,
-        tool: &str,
-        scope: &Scope<'_>,
-    ) -> (CheckResult, String) {
-        match scope {
-            Scope::Raw(key) => (guard.check(tool, key), (*key).to_string()),
-            Scope::Path(path) => (guard.check_path(tool, path), (*path).to_string()),
-            Scope::PathResolve(path) => {
-                let resolved = guard.resolve_path_for_tool(path);
-                let r = guard.check_path(tool, path);
-                (r, resolved)
-            }
-        }
-    }
-
-    // F2 (dirge-jlj): write / apply_patch alias to the `edit`
-    // permission. Mirrors opencode's `EDIT_TOOLS` aliasing
-    // (`permission/index.ts:291-301`): a user writing
-    // `edit: { "**": "deny" }` blocks all three uniformly.
-    //
-    // Strategy: take the MOST RESTRICTIVE outcome between the
-    // tool's own rules and the edit rules. Deny > Ask > Allow.
-    // If the tool's specific rule allows but `edit` denies, the
-    // edit deny wins — broader deny-list semantics. If both Ask,
-    // we prompt ONCE (avoids double-prompting).
-    let (result, resolved) = {
+    // M-engine (Phase 2b): route the decision through the unified
+    // authorization engine. The old per-tool F2 write↔edit↔apply_patch
+    // aliasing is gone — those tools normalize to `Operation::Edit`,
+    // so one rule governs the trio by construction. Path-vs-raw is a
+    // property of the resource (built in `authorize_scope`), so there
+    // is no Scope-dispatched `check`/`check_path` split here.
+    let is_path = matches!(scope, Scope::Path(_) | Scope::PathResolve(_));
+    let (effect, reason, resolved) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        let primary = inner_check(&mut guard, tool, &scope);
-        if matches!(tool, "write" | "apply_patch") {
-            let alias = inner_check(&mut guard, "edit", &scope);
-            // Combine: most restrictive wins. Use primary's
-            // resolved-path (the tool's own canonicalization
-            // anchored to its rule set, not edit's).
-            let combined = match (&primary.0, &alias.0) {
-                (CheckResult::Denied(reason), _) => CheckResult::Denied(reason.clone()),
-                (_, CheckResult::Denied(reason)) => CheckResult::Denied(reason.clone()),
-                (CheckResult::Ask, _) | (_, CheckResult::Ask) => CheckResult::Ask,
-                _ => CheckResult::Allowed,
-            };
-            (combined, primary.1)
-        } else {
-            primary
-        }
+        let decision = guard.authorize_scope(tool, raw_scope, is_path);
+        // Only PathResolve callers want the canonicalized path back
+        // (to pin the file across the check→open window); Raw/Path
+        // callers echo their input, matching the legacy contract.
+        let resolved = match scope {
+            Scope::PathResolve(_) => decision
+                .resolved_paths
+                .first()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| raw_scope.to_string()),
+            _ => raw_scope.to_string(),
+        };
+        (decision.effect, decision.reason(), resolved)
     };
 
-    match result {
-        CheckResult::Allowed => Ok(resolved),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
+    use crate::permission::engine::types::Effect;
+    match effect {
+        Effect::Allow => Ok(resolved),
+        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Ask => {
             let Some(tx) = ask_tx else {
                 return Err(ToolError::Msg(
                     "Permission denied (non-interactive mode)".to_string(),
@@ -351,6 +402,46 @@ pub async fn enforce(
             };
             handle_ask_inner(tx, perm, tool, raw_scope).await?;
             Ok(resolved)
+        }
+    }
+}
+
+/// Authorize a pre-built, possibly multi-claim [`AccessRequest`]
+/// atomically: ONE decision, at most ONE prompt. This is the entry
+/// point for tools (bash) that decompose a single invocation into
+/// several claims (command segments + redirect/mutation targets) — the
+/// per-resource effects fold most-restrictive-wins, so the whole
+/// command is allowed/denied/prompted as a unit instead of gate-by-gate.
+///
+/// On `Ask`, the single prompt shows the request's `display_input` (the
+/// whole command); "allow always" allowlists that command. In-cwd write
+/// targets are builtin-allowed and don't re-prompt; external targets are
+/// (correctly) re-scrutinized on the next run.
+pub async fn enforce_request(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    req: crate::permission::engine::types::AccessRequest,
+) -> Result<(), ToolError> {
+    use crate::permission::engine::types::Effect;
+    let Some(perm) = permission else {
+        return Ok(()); // no checker (ACP / --no-tools) → pass through
+    };
+    let (effect, reason) = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let decision = guard.authorize_request(&req);
+        (decision.effect, decision.reason())
+    };
+    match effect {
+        Effect::Allow => Ok(()),
+        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".to_string(),
+                ));
+            };
+            handle_ask_inner(tx, perm, &req.tool, &req.display_input).await?;
+            Ok(())
         }
     }
 }
@@ -413,10 +504,70 @@ pub async fn check_perm_path_resolve(
 mod tests {
     use super::*;
     use crate::permission::{
-        Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+        Action, OpSpec, PermissionConfig, RuleConfig, SecurityMode, checker::PermissionChecker,
     };
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    /// Test helper: build a single op-based rule (tool-agnostic).
+    fn rule(op: OpSpec, pattern: &str, effect: Action) -> RuleConfig {
+        RuleConfig {
+            op,
+            pattern: pattern.to_string(),
+            effect,
+            tool: None,
+        }
+    }
+
+    // dirge-8k3k: required_nonblank extracts a present, non-blank value
+    // or errors with a uniform "`field` is required for action 'x'".
+    #[test]
+    fn required_nonblank_extracts_or_errors() {
+        assert_eq!(
+            required_nonblank(Some("hello"), "content", "add").unwrap(),
+            "hello"
+        );
+        for bad in [None, Some(""), Some("   \t")] {
+            let msg = required_nonblank(bad, "content", "add")
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("content"), "names the field: {msg}");
+            assert!(msg.contains("add"), "names the action: {msg}");
+        }
+    }
+
+    // dirge-06cp: head_cap returns short input untouched and marks any
+    // truncation (never silent), landing on a UTF-8 boundary.
+    #[test]
+    fn head_cap_passes_short_and_marks_truncation() {
+        assert_eq!(head_cap("short".to_string(), 100, "x"), "short");
+
+        let capped = head_cap("a".repeat(50), 10, "bash output");
+        assert!(capped.starts_with(&"a".repeat(10)), "kept head: {capped}");
+        assert!(capped.contains("truncated"), "marked: {capped}");
+        assert!(
+            capped.contains("dropped 40 of 50 bytes"),
+            "counts: {capped}"
+        );
+
+        // Multibyte: 'é' is 2 bytes; a cap of 5 must land on a boundary
+        // (4 bytes = 2 chars) without panicking or splitting a char.
+        let capped = head_cap("é".repeat(10), 5, "x");
+        assert!(capped.starts_with("éé"), "boundary-safe head: {capped}");
+        assert!(capped.contains("truncated"));
+    }
+
+    // dirge-e1r9: the shared absolute-path guard accepts absolute paths
+    // and rejects relative / bare ones with a single uniform message.
+    #[test]
+    fn require_absolute_path_accepts_absolute_rejects_relative() {
+        assert!(require_absolute_path("/home/user/x.rs", "read path").is_ok());
+        for bad in ["x.rs", "./x.rs", "../x.rs", "src/x.rs", "1"] {
+            let err = require_absolute_path(bad, "read path")
+                .expect_err("relative path must be rejected");
+            assert!(err.contains("absolute path"), "message: {err}");
+            assert!(err.contains(bad), "message names the offending path: {err}");
+        }
+    }
 
     /// F2 (dirge-jlj): `enforce(write, ...)` MUST also consult the
     /// `edit` rules. A user writing `edit: { "**": "deny" }`
@@ -424,10 +575,8 @@ mod tests {
     /// `EDIT_TOOLS` aliasing.
     #[tokio::test]
     async fn enforce_write_aliases_to_edit_deny() {
-        let mut edit_rules = HashMap::new();
-        edit_rules.insert("**".to_string(), Action::Deny);
         let config = PermissionConfig {
-            edit: Some(ToolPerm::Granular(edit_rules)),
+            rules: vec![rule(OpSpec::Edit, "**", Action::Deny)],
             ..Default::default()
         };
         let checker = PermissionChecker::new(
@@ -466,13 +615,14 @@ mod tests {
     /// but `edit` is Deny, the Deny wins.
     #[tokio::test]
     async fn enforce_write_alias_most_restrictive_wins() {
-        let mut edit_rules = HashMap::new();
-        edit_rules.insert("/etc/**".to_string(), Action::Deny);
-        let mut write_rules = HashMap::new();
-        write_rules.insert("**".to_string(), Action::Allow);
+        // write/edit/apply_patch share Operation::Edit, so both rules
+        // live in ONE ordered ruleset (last-match-wins): allow all,
+        // then deny /etc/**.
         let config = PermissionConfig {
-            edit: Some(ToolPerm::Granular(edit_rules)),
-            write: Some(ToolPerm::Granular(write_rules)),
+            rules: vec![
+                rule(OpSpec::Edit, "**", Action::Allow),
+                rule(OpSpec::Edit, "/etc/**", Action::Deny),
+            ],
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
@@ -489,14 +639,15 @@ mod tests {
         .await;
         assert!(matches!(result, Err(_)));
 
-        // `/tmp/x.rs`: write allows (`**`), edit's `/etc/**`
-        // doesn't match → edit lookup = Ask (default), write = Allow.
-        // Combined: Ask (more restrictive). No ask_tx → "non-interactive
-        // mode" deny.
+        // `/tmp/x.rs`: write/edit/apply_patch now share Operation::Edit,
+        // so both rules live in ONE ruleset, last-match-wins. The
+        // `write: { "**": allow }` rule (added before the edit deny)
+        // matches `/tmp/x.rs`; the `/etc/**` deny does not → Allow.
+        // This is the F2 dissolution: "allow all writes except /etc".
         let result = enforce(&Some(perm), &None, "write", Scope::PathResolve("/tmp/x.rs")).await;
         assert!(
-            matches!(result, Err(_)),
-            "/tmp/x.rs: write Allow + edit Ask → combined Ask → non-interactive deny; got {result:?}",
+            result.is_ok(),
+            "/tmp/x.rs: `write **: allow` governs (edit `/etc/**` deny doesn't match) → Allow; got {result:?}",
         );
     }
 
@@ -504,10 +655,8 @@ mod tests {
     /// `read` shouldn't be affected by edit rules.
     #[tokio::test]
     async fn enforce_read_does_not_alias_to_edit() {
-        let mut edit_rules = HashMap::new();
-        edit_rules.insert("**".to_string(), Action::Deny);
         let config = PermissionConfig {
-            edit: Some(ToolPerm::Granular(edit_rules)),
+            rules: vec![rule(OpSpec::Edit, "**", Action::Deny)],
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);

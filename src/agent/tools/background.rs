@@ -4,8 +4,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// Maximum chars retained per Completed/Failed payload. Prevents a single
-/// subagent answer from blowing the parent context.
+/// dirge-nmv5: legacy hard cap retained for the `Failed` error
+/// path only. Error strings are typically a single-line provider
+/// error or "subagent timed out" message — relaying them to disk
+/// would be wasteful. Capping goes through `tools::head_cap`
+/// (byte-bounded, UTF-8-safe, marker appended — no longer a silent
+/// chop; dirge-06cp). Completed payloads no longer hit this cap: they
+/// go through the disk-backed `output_relay` instead, so the full
+/// subagent answer is recoverable via the `read` tool even when the
+/// inline summary elides the middle.
 const MAX_TASK_OUTPUT_CHARS: usize = 3000;
 
 /// Maximum number of tasks retained in the store. When a new task is
@@ -279,6 +286,57 @@ impl BackgroundStore {
     }
 }
 
+/// dirge-9tfq: build a `GetFollowupMessagesFn` bound to this store.
+///
+/// At the outer-loop boundary (inner loop has no more tool calls AND no
+/// pending steering), the agent_loop polls this hook. If background
+/// subagents have completed since the last poll, the hook drains the
+/// pending notifications and returns a synthetic `LoopMessage::User`
+/// containing a `<system-reminder>` block — one per completed task,
+/// formatted exactly like `prepend_pending_notifications`.
+///
+/// The returned message tells the model to consider the result and
+/// decide whether to act on it. Because this fires at the outer-loop
+/// boundary, the loop will re-enter the inner loop with the
+/// notification as `pending_messages` and the model sees the
+/// completion on its next turn — even if the user never types again.
+///
+/// Empty store / no pending → empty `Vec`, outer loop exits naturally.
+pub fn followup_from_background_store(
+    store: BackgroundStore,
+) -> crate::agent::agent_loop::hooks::GetFollowupMessagesFn {
+    use crate::agent::agent_loop::message::{LoopMessage, UserMessage};
+    Arc::new(move || {
+        let store = store.clone();
+        Box::pin(async move {
+            let drained = store.drain_notifications();
+            if drained.is_empty() {
+                return Vec::new();
+            }
+            let mut body = String::with_capacity(256);
+            body.push_str("<system-reminder>\n");
+            body.push_str("The following background tasks finished since your last turn:\n\n");
+            for (i, n) in drained.iter().enumerate() {
+                if i > 0 {
+                    body.push('\n');
+                }
+                match &n.state {
+                    TaskState::Completed(text) => {
+                        body.push_str(&format!("[task {}] completed: {}\n", n.id, text));
+                    }
+                    TaskState::Failed(err) => {
+                        body.push_str(&format!("[task {}] failed: {}\n", n.id, err));
+                    }
+                    // notify() never queues Running, defensive no-op.
+                    TaskState::Running => {}
+                }
+            }
+            body.push_str("</system-reminder>");
+            vec![LoopMessage::User(UserMessage { content: body })]
+        })
+    })
+}
+
 /// Format pending notifications as a `<system-reminder>` block prepended to
 /// the next user prompt. Returns the prompt unchanged when there's nothing
 /// pending or no store is provided.
@@ -333,15 +391,32 @@ pub(crate) fn prepend_pending_notifications(
     out
 }
 
+/// dirge-nmv5: relay large `Completed` payloads through the
+/// disk-backed `output_relay`. Below the inline byte/line budget
+/// the payload is returned verbatim; above it the full text is
+/// written to `~/.dirge/transient/<pid>/task-<unix_ts>.txt` and a
+/// head/tail summary (with a `read`-tool hint pointing at the
+/// transient file) is stored on the task state instead. Failed
+/// error strings still hit the legacy `MAX_TASK_OUTPUT_CHARS` cap
+/// because provider error messages don't benefit from disk relay.
+///
+/// Replaces the prior behavior of silently chopping the tail of
+/// large `Completed` payloads at 3000 chars, which lost
+/// information without telling the agent it could recover it.
 fn truncate_state(state: TaskState) -> TaskState {
     match state {
         TaskState::Completed(text) => {
-            let t: String = text.chars().take(MAX_TASK_OUTPUT_CHARS).collect();
-            TaskState::Completed(t)
+            let outcome = crate::agent::tools::output_relay::relay_if_large("task", text, "");
+            TaskState::Completed(outcome.text)
         }
         TaskState::Failed(err) => {
-            let e: String = err.chars().take(MAX_TASK_OUTPUT_CHARS).collect();
-            TaskState::Failed(e)
+            // Was a silent `chars().take` chop; now caps with a marker
+            // so the agent knows the error was truncated (dirge-06cp).
+            TaskState::Failed(crate::agent::tools::head_cap(
+                err,
+                MAX_TASK_OUTPUT_CHARS,
+                "task error",
+            ))
         }
         s => s,
     }
@@ -434,19 +509,37 @@ mod tests {
         assert_eq!(store.pending_len(), 1);
     }
 
-    // Regression: subagent output was previously injected verbatim and bloated
-    // the parent context. notify() now truncates by chars (UTF-8-safe).
+    // dirge-nmv5: large Completed payloads are relayed to the
+    // disk-backed `output_relay`. The stored state now holds a
+    // head/tail summary that points the agent at the full text on
+    // disk via the `read` tool — the prior 3000-char silent
+    // truncation is gone. We verify the relayed text carries the
+    // recovery hint so the agent can fetch the missing middle.
     #[test]
-    fn regression_notify_truncates_completed_text() {
+    fn regression_notify_relays_large_completed_payload() {
         let store = BackgroundStore::new();
         store.insert("t1".into());
-        let huge = "x".repeat(MAX_TASK_OUTPUT_CHARS * 2);
+        // Multi-line payload well past the 8 KiB byte threshold AND
+        // the 200-line threshold so the relay fires AND its
+        // head/tail summary elides the middle.
+        let huge: String = (0..5_000)
+            .map(|i| format!("subagent output line {i}\n"))
+            .collect();
         store.notify("t1", TaskState::Completed(huge));
 
         let TaskState::Completed(text) = store.get("t1").unwrap().state else {
             panic!("expected Completed");
         };
-        assert_eq!(text.chars().count(), MAX_TASK_OUTPUT_CHARS);
+        // Relay summary includes the `read`-tool hint + transient
+        // path so the agent can recover the elided middle.
+        assert!(
+            text.contains("`read`"),
+            "relayed summary must mention `read` tool: {text}",
+        );
+        assert!(
+            text.contains("transient") || text.contains(".dirge"),
+            "relayed summary must reference the transient path: {text}",
+        );
     }
 
     #[test]
@@ -454,28 +547,39 @@ mod tests {
         let store = BackgroundStore::new();
         store.insert("t1".into());
         let huge = "e".repeat(MAX_TASK_OUTPUT_CHARS * 2);
+        let huge_len = huge.len();
         store.notify("t1", TaskState::Failed(huge));
 
         let TaskState::Failed(text) = store.get("t1").unwrap().state else {
             panic!("expected Failed");
         };
-        assert_eq!(text.chars().count(), MAX_TASK_OUTPUT_CHARS);
+        // dirge-06cp: capped to the byte ceiling AND marked (no longer a
+        // silent chop) — head preserved, a truncation marker appended.
+        assert!(
+            text.starts_with(&"e".repeat(MAX_TASK_OUTPUT_CHARS)),
+            "head must be preserved up to the cap"
+        );
+        assert!(
+            text.contains("truncated"),
+            "must carry a truncation marker: {text}"
+        );
+        assert!(text.len() < huge_len, "must be shorter than the original");
     }
 
-    // Regression: multibyte chars must not be split. Guards against switching
-    // to bytes-based truncation.
+    // dirge-nmv5: short Completed payloads must pass through the
+    // relay verbatim — no summary, no transient file. The agent
+    // sees exactly what the subagent produced.
     #[test]
-    fn notify_truncates_by_chars_not_bytes() {
+    fn small_completed_payload_passes_through_relay_verbatim() {
         let store = BackgroundStore::new();
         store.insert("t1".into());
-        let emojis = "🦀".repeat(MAX_TASK_OUTPUT_CHARS * 2);
-        store.notify("t1", TaskState::Completed(emojis));
+        let small = "subagent answer: 42\nplus a couple more lines.\n".to_string();
+        store.notify("t1", TaskState::Completed(small.clone()));
+
         let TaskState::Completed(text) = store.get("t1").unwrap().state else {
             panic!("expected Completed");
         };
-        assert_eq!(text.chars().count(), MAX_TASK_OUTPUT_CHARS);
-        // Re-encoding round-trips: no broken UTF-8 sequences.
-        assert_eq!(text.as_str(), &"🦀".repeat(MAX_TASK_OUTPUT_CHARS));
+        assert_eq!(text, small, "small payload must round-trip unchanged");
     }
 
     #[test]
@@ -707,22 +811,44 @@ mod tests {
         assert_eq!(notif.state, TaskState::Failed("boom".into()));
     }
 
-    // Regression: lifecycle events must carry the truncated payload, not the
-    // original — otherwise the UI could render an unbounded blob from the
-    // subagent into the user's scrollback.
+    // dirge-nmv5: lifecycle events must carry the RELAYED payload,
+    // not the original — otherwise the UI could render an unbounded
+    // blob from the subagent into the user's scrollback. The
+    // disk-backed relay replaces the prior 3000-char hard cap, so
+    // we check the event carries a head/tail summary plus the
+    // recovery hint (full payload is on disk).
     #[tokio::test]
-    async fn ui_sink_event_carries_truncated_payload() {
+    async fn ui_sink_event_carries_relayed_payload() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let store = BackgroundStore::with_ui_sink(tx);
         store.insert("t1".into());
-        let huge = "x".repeat(MAX_TASK_OUTPUT_CHARS * 2);
+        // Multi-line payload well over the 200-line threshold and
+        // 8 KiB byte threshold so the relay's head/tail summary
+        // elides the middle (single-line payloads still relay but
+        // the summary contains the whole thing because head=tail).
+        let huge: String = (0..5_000)
+            .map(|i| format!("subagent output line {i}\n"))
+            .collect();
+        let original_len = huge.len();
         store.notify("t1", TaskState::Completed(huge));
 
         let notif = unwrap_finished(rx.recv().await.unwrap());
         let TaskState::Completed(text) = notif.state else {
             panic!("expected Completed");
         };
-        assert_eq!(text.chars().count(), MAX_TASK_OUTPUT_CHARS);
+        // Summary must elide enough lines to come in well under the
+        // original — guards against the UI getting the full blob.
+        assert!(
+            text.len() < original_len / 2,
+            "relayed summary should be much smaller than the original (got {} of {} bytes)",
+            text.len(),
+            original_len,
+        );
+        // And it should carry the recovery hint.
+        assert!(
+            text.contains("`read`"),
+            "relayed summary must mention `read` tool",
+        );
     }
 
     // Regression: notify on a running state must NOT emit a lifecycle event
@@ -813,6 +939,130 @@ mod tests {
         // Drain queue still works for the LLM side.
         let drained = store.drain_notifications();
         assert_eq!(drained.len(), 1);
+    }
+
+    // ---- followup_from_background_store (dirge-9tfq) ----
+
+    use crate::agent::agent_loop::message::LoopMessage;
+
+    /// `subagent_completion_injects_followup_message`: when a background
+    /// subagent completes, the followup hook returns a synthetic user
+    /// message wrapping the result in a `<system-reminder>` block.
+    /// This is what the parent loop's outer-boundary poll will see and
+    /// inject into the next inner-loop iteration.
+    #[tokio::test]
+    async fn subagent_completion_injects_followup_message() {
+        let store = BackgroundStore::new();
+        store.insert("abc123".into());
+        store.notify("abc123", TaskState::Completed("the answer is 42".into()));
+
+        let hook = followup_from_background_store(store.clone());
+        let messages = hook().await;
+
+        assert_eq!(messages.len(), 1, "exactly one synthesized user message");
+        let LoopMessage::User(u) = &messages[0] else {
+            panic!("expected User message, got {:?}", messages[0]);
+        };
+        // System-reminder wrapper present.
+        assert!(u.content.starts_with("<system-reminder>\n"));
+        assert!(u.content.ends_with("</system-reminder>"));
+        // Task id + completion marker + result text all present.
+        assert!(u.content.contains("[task abc123] completed:"));
+        assert!(u.content.contains("the answer is 42"));
+
+        // Queue drained — second poll returns empty so the outer loop
+        // can exit naturally on a clean board.
+        assert!(hook().await.is_empty());
+    }
+
+    /// `subagent_failure_injects_followup_with_error_marker`: failed
+    /// subagents surface via the same hook but tagged `failed:` rather
+    /// than `completed:`. The model needs to distinguish so it can
+    /// recover (retry, fall back, or report the failure to the user).
+    #[tokio::test]
+    async fn subagent_failure_injects_followup_with_error_marker() {
+        let store = BackgroundStore::new();
+        store.insert("xyz789".into());
+        store.notify(
+            "xyz789",
+            TaskState::Failed("connection reset by peer".into()),
+        );
+
+        let hook = followup_from_background_store(store);
+        let messages = hook().await;
+
+        assert_eq!(messages.len(), 1);
+        let LoopMessage::User(u) = &messages[0] else {
+            panic!("expected User message");
+        };
+        assert!(u.content.contains("[task xyz789] failed:"));
+        assert!(u.content.contains("connection reset by peer"));
+        // Must NOT use the "completed" marker for failures.
+        assert!(
+            !u.content.contains("completed:"),
+            "failures must not be tagged 'completed': {}",
+            u.content,
+        );
+    }
+
+    /// Multiple completions since the last poll are batched into a
+    /// single `<system-reminder>` so the model gets all results in
+    /// one turn rather than waking once per task.
+    #[tokio::test]
+    async fn followup_batches_multiple_completions_in_one_reminder() {
+        let store = BackgroundStore::new();
+        for i in 0..3 {
+            store.insert(format!("t{i}"));
+            store.notify(
+                &format!("t{i}"),
+                TaskState::Completed(format!("result-{i}")),
+            );
+        }
+        let hook = followup_from_background_store(store);
+        let messages = hook().await;
+
+        assert_eq!(messages.len(), 1, "one reminder, not one per task");
+        let LoopMessage::User(u) = &messages[0] else {
+            panic!("expected User");
+        };
+        // All three tasks present.
+        assert!(u.content.contains("[task t0] completed: result-0"));
+        assert!(u.content.contains("[task t1] completed: result-1"));
+        assert!(u.content.contains("[task t2] completed: result-2"));
+        // FIFO ordering preserved.
+        let i0 = u.content.find("t0").unwrap();
+        let i1 = u.content.find("t1").unwrap();
+        let i2 = u.content.find("t2").unwrap();
+        assert!(i0 < i1 && i1 < i2);
+    }
+
+    /// Empty store → empty Vec. Outer loop sees no follow-up and exits.
+    /// Critical: if this returned `vec![empty_message]`, the outer loop
+    /// would spin re-entering the inner loop with a blank user turn.
+    #[tokio::test]
+    async fn followup_returns_empty_when_no_completions() {
+        let store = BackgroundStore::new();
+        store.insert("running".into()); // inserted but not notified
+        let hook = followup_from_background_store(store);
+        assert!(hook().await.is_empty());
+    }
+
+    /// Polling twice in a row only delivers each notification once.
+    /// This is the same drain-semantics as `prepend_pending_notifications`
+    /// — without it, the model would see the same completion on every
+    /// outer-loop boundary and spam tool calls reacting to a result it
+    /// already handled.
+    #[tokio::test]
+    async fn followup_drains_queue_once() {
+        let store = BackgroundStore::new();
+        store.insert("t1".into());
+        store.notify("t1", TaskState::Completed("once".into()));
+
+        let hook = followup_from_background_store(store);
+        let first = hook().await;
+        assert_eq!(first.len(), 1);
+        let second = hook().await;
+        assert!(second.is_empty(), "second poll must not redeliver");
     }
 
     // Concurrency smoke: many threads inserting + notifying must not lose

@@ -70,7 +70,7 @@ impl SharedConnection {
         // signal fires on the old transport.
         let _old = {
             let mut rs_guard = self.running_service.lock().await;
-            std::mem::replace(&mut *rs_guard, Some(new_rs))
+            (*rs_guard).replace(new_rs)
         };
         *self.peer.write().await = new_peer;
         // `_old` drops here. If it was `Some`, that `RunningService`'s
@@ -133,7 +133,12 @@ pub async fn raw_connect(
     config: &McpServerConfig,
 ) -> anyhow::Result<(Peer<RoleClient>, RunningService<RoleClient, ()>)> {
     match config {
-        McpServerConfig::Command { command, args, env } => {
+        McpServerConfig::Command {
+            command,
+            args,
+            env,
+            allow_external_paths: _,
+        } => {
             let mut cmd = Command::new(command);
             cmd.args(args);
             for (k, v) in env {
@@ -156,7 +161,11 @@ pub async fn raw_connect(
             let peer = rs.peer().clone();
             Ok((peer, rs))
         }
-        McpServerConfig::Url { url, headers } => {
+        McpServerConfig::Url {
+            url,
+            headers,
+            allow_external_paths: _,
+        } => {
             let custom_headers = parse_headers(headers)?;
             let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
                 .custom_headers(custom_headers);

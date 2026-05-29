@@ -3,8 +3,9 @@ use rig::tool::Tool;
 use tokio::process::Command;
 use tokio::time::Duration;
 
+use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, BashArgs, PermCheck, Scope, ToolError, enforce};
+use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError, enforce_request};
 
 use crate::sandbox::Sandbox;
 #[cfg(feature = "semantic-bash")]
@@ -279,7 +280,10 @@ impl Tool for BashTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_string(),
-            description: "Execute a bash command in the current working directory. Returns stdout and stderr.".to_string(),
+            description: with_contract_hint(
+                "bash",
+                "Execute a bash command in the current working directory. Returns stdout and stderr.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -322,40 +326,33 @@ impl Tool for BashTool {
         // mis-ordering interleaved output.
         let mut result = output.merged;
         // Cap raw bash output before it enters LLM context. The
-        // UI's `render_tool_output` already truncates the display,
-        // but the full string was being persisted to
-        // `ToolCallState::Completed` → fed back to the LLM on the
-        // next turn. `cat /dev/urandom | head -c 10M` would have
-        // shoved millions of tokens at the model. Apply the cap
-        // here at the source. 256 KiB ≈ 65k tokens worst-case,
-        // already well above any sensible single-command output.
+        // streaming drain-loop above already enforces an in-memory
+        // ceiling at 256 KiB (TOOL-7) so the cap below is normally
+        // a no-op — kept as belt-and-braces in case the drain loop
+        // ever races. 256 KiB ≈ 65k tokens worst-case, already well
+        // above any sensible single-command output.
         const BASH_OUTPUT_CAP_BYTES: usize = 256 * 1024;
-        if result.len() > BASH_OUTPUT_CAP_BYTES {
-            // Slice at UTF-8 char boundary.
-            let mut cut = BASH_OUTPUT_CAP_BYTES;
-            while cut > 0 && !result.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            let dropped = result.len() - cut;
-            result.truncate(cut);
-            result.push_str(&format!(
-                "\n…[bash output truncated: dropped {} bytes ({} KiB total); pipe through head/grep to keep the LLM context lean]",
-                dropped,
-                (cut + dropped) / 1024,
-            ));
-        }
-        if output.exit_code != 0 {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&format!("Exit code: {}", output.exit_code));
-        }
+        result = crate::agent::tools::head_cap(result, BASH_OUTPUT_CAP_BYTES, "bash output");
         // Bash may have mutated the filesystem; conservatively invalidate the
         // per-turn read/grep/list cache.
         if let Some(ref cache) = self.cache {
             cache.clear();
         }
-        Ok(result)
+
+        // Phase 3 / part 2: hand the (post-cap) buffer to the
+        // disk-backed-output relay. Below the inline budget the
+        // relay is a no-op and the exit-code line is appended
+        // inline; above the budget we write the full output to
+        // `~/.dirge/transient/<pid>/bash-<ts>.txt` and return a
+        // head/tail summary plus a `read`-tool hint. No envelope:
+        // bash output is local, not external content.
+        let exit_note = if output.exit_code != 0 {
+            format!("Exit code: {}", output.exit_code)
+        } else {
+            String::new()
+        };
+        let outcome = crate::agent::tools::output_relay::relay_if_large("bash", result, &exit_note);
+        Ok(outcome.text)
     }
 }
 
@@ -364,124 +361,111 @@ async fn check_bash_segments(
     ask_tx: &Option<AskSender>,
     command: &str,
 ) -> Result<(), ToolError> {
-    // M3 (dirge-6ab): every bash permission decision routes through
-    // the `enforce` chokepoint. Each compound-statement segment is
-    // checked independently so `git diff && rm -rf /` gets BOTH `git`
-    // AND `rm` checked against the user's bash rules — not just the
-    // leading command. Redirect targets (`> file`) additionally route
-    // through the `write` tool rules so write/edit path rules apply,
-    // closing the C4 audit gap where targets hit bash rules with
-    // path-string inputs and fell through to default Allow.
+    // ATOMIC bash authorization (Phase 3): one bash invocation becomes
+    // ONE multi-claim AccessRequest — an Execute claim per command
+    // segment plus an Edit claim per redirect target / mutation path —
+    // authorized as a unit so the whole command is allowed/denied/
+    // prompted ONCE, not gate-by-gate. (Replaces the old per-call
+    // `enforce` loop that could fire several sequential prompts.)
+    //
+    // Semantics preserved by the engine, not bespoke code here:
+    //   - each compound segment is checked, so `git diff && rm -rf /`
+    //     denies on the `rm` segment (Execute deny rule);
+    //   - redirect/mutation targets route through Edit (the write rules
+    //     + external-dir gate apply, closing the C4 audit gap);
+    //   - `/dev/null` targets are auto-allowed by BuiltinAllow on the
+    //     Edit claim — but the command itself still needs Execute
+    //     permission, so an UNFAMILIAR `cmd > /dev/null` still prompts
+    //     (more correct than the old blanket command soft-allow).
+    let Some(perm) = permission else {
+        return Ok(()); // no checker (ACP / --no-tools) → pass through
+    };
+    let mode = {
+        let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+        g.mode()
+    };
+    use crate::permission::engine::types::{AccessRequest, Claim, Operation, Resource};
+    let cmd_claim = |seg: &str| {
+        Claim::new(
+            Operation::Execute,
+            Resource::Command {
+                raw: seg.to_string(),
+                head: seg.split_whitespace().next().unwrap_or("").to_string(),
+            },
+        )
+    };
+    let mut claims: Vec<Claim> = Vec::new();
+
     #[cfg(feature = "semantic-bash")]
     {
+        let working_dir = {
+            let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+            g.working_dir().to_string()
+        };
+        let path_claim = |p: &str| {
+            Claim::new(
+                Operation::Edit,
+                crate::permission::engine::classify_path(p, &working_dir),
+            )
+        };
+        // /dev/null detection lives solely in `classify_path` (the Path
+        // resource's `dev_null` field, consulted by BuiltinAllow) — so
+        // we just split into plain segments here. The old
+        // `parse_bash_segments_with_dev_null` computed a parallel
+        // per-segment flag that was discarded (dirge-v0b6).
         let (segments, complex) = bash::parse_bash_segments_full(command)
             .unwrap_or_else(|_| (vec![command.to_string()], false));
-
         if complex {
-            // Subshell / command substitution / process substitution /
-            // arithmetic expansion: tree-sitter declined to split.
-            // Force a prompt on the WHOLE command so the user
-            // confirms the unfamiliar shape. Maki does the same
-            // (maki-agent/src/permissions.rs:441-455).
-            //
-            // PERM-6: even when complex, still extract redirect
-            // targets and mutation paths so that `echo "$(rm /etc/passwd)"`
-            // doesn't slip through when the outer `echo` is allowed.
-            for target in bash::extract_redirect_targets(command) {
-                enforce(permission, ask_tx, "write", Scope::PathResolve(&target)).await?;
+            // Subshell / command substitution / etc.: tree-sitter
+            // declined to split — check the whole command as one
+            // Execute claim so the user confirms the unfamiliar shape.
+            claims.push(cmd_claim(command));
+        } else {
+            for segment in &segments {
+                claims.push(cmd_claim(segment));
             }
-            for path in bash::extract_mutation_paths(command) {
-                enforce(permission, ask_tx, "write", Scope::PathResolve(&path)).await?;
-            }
-            enforce(permission, ask_tx, "bash", Scope::Raw(command)).await?;
-            return Ok(());
         }
-
-        for segment in &segments {
-            enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
-        }
-
-        // M3 fix to the C4 redirect-target gap: route targets through
-        // the `write` tool name (not `bash`), since redirection
-        // semantically writes files. Previously this was routed as
-        // `check_perm_path(tool="bash", path=&target)`, looking the
-        // target up in BASH rules — command-style globs that don't
-        // match path strings, falling through to default Allow. With
-        // `tool="write"` the user's write rules govern: deny lists
-        // (`/etc/**`, `~/.ssh/**`, `~/.aws/credentials`) now fire on
-        // bash redirects too. Falsely-prompting `< file` (read-side)
-        // is acceptable; the `extract_redirect_targets` walker
-        // intentionally skips heredoc / herestring and only emits
-        // write-side targets (`>`, `>>`, `&>`, `1>`, `2>`).
+        // PERM-6 / C4 / F1: redirect targets AND file-mutating command
+        // path args (rm/cp/mv/mkdir/touch/chmod/…) both route through
+        // Edit so write deny-lists + the external-dir gate govern them.
         for target in bash::extract_redirect_targets(command) {
-            enforce(permission, ask_tx, "write", Scope::PathResolve(&target)).await?;
+            claims.push(path_claim(&target));
         }
-        // F1 (dirge-dvy): route positional path arguments to
-        // file-mutating commands (rm / cp / mv / mkdir / rmdir /
-        // touch / chmod / chown / ln / tee / dd) through the write
-        // rules too. Without this, a permissive bash rule like
-        // `rm *: allow` silently allowed `rm /etc/passwd` because
-        // the path-side write deny never saw the argument. Ported
-        // from opencode shell.ts:30-51 (`FILES` set) + :191-221
-        // (`pathArgs` filter logic). The extractor skips flags
-        // (`-r`, `--recursive`), chmod permission specs (`+x`),
-        // and chmod/chown's first positional arg (mode / owner).
         for path in bash::extract_mutation_paths(command) {
-            enforce(permission, ask_tx, "write", Scope::PathResolve(&path)).await?;
+            claims.push(path_claim(&path));
         }
-        Ok(())
     }
     #[cfg(not(feature = "semantic-bash"))]
     {
-        // Best-effort coarse split when tree-sitter isn't compiled in.
-        // Without it, a command like `safe_cmd && rm -rf /` would be
-        // checked as a single string against the bash rules and might
-        // squeak through if `safe_cmd && rm` doesn't match any deny.
-        // Split on the unambiguous compound separators (`&&`, `;`,
-        // `||`) so each segment is checked individually.
-        //
-        // F10: the splitter now respects shell quoting. The naive
-        // `command.split(";")` split inside quoted strings, so
-        // `echo "; rm -rf /"` produced segments `echo "` and
-        // `rm -rf /"` — the second matched the bash rule for `rm`
-        // and could trigger a deny that the user thought was safe.
-        // The fixed splitter walks character-by-character and only
-        // emits a boundary when not inside `'…'`, `"…"`, or after
-        // a backslash escape.
-        let segments = quote_aware_split(command);
-
-        // Flag command substitution / subshell constructs / ANSI-C
-        // quoting that need a full parser. Surface as one
-        // whole-command check so the user sees the unfamiliar form
-        // before any segment runs.
-        //
-        // `$'...'` ANSI-C quoting was missing from the original
-        // check, leaving a small bypass: `echo $'hi\nrm -rf /; ls'`
-        // (with embedded literal newlines via `\n`) treated the body
-        // as one quoted token, so `quote_aware_split` didn't see the
-        // `;` as a separator. Adding `$'` to the substitution list
-        // makes the whole command get checked as a single string —
-        // the rules can still match the safe form, but the LLM
-        // doesn't get a free pass on obscure quoting.
+        // Coarse, quote-aware split when tree-sitter isn't compiled in;
+        // command-substitution / heredoc / ANSI-C quoting are checked as
+        // one whole-command claim.
         let has_substitution = command.contains("$(")
             || command.contains('`')
             || command.contains("<(")
             || command.contains(">(")
             || command.contains("$'")
-            // PERM-5: heredocs (`<<` / `<<-`). The heredoc body
-            // is invisible to `quote_aware_split` — the redirect
-            // operator is one token but the body starting on the
-            // next line can contain any command. Treat as complex.
             || command.contains("<<");
         if has_substitution {
-            enforce(permission, ask_tx, "bash", Scope::Raw(command)).await?;
-            return Ok(());
+            claims.push(cmd_claim(command));
+        } else {
+            for segment in quote_aware_split(command) {
+                claims.push(cmd_claim(&segment));
+            }
         }
-        for segment in &segments {
-            enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
-        }
-        Ok(())
     }
+
+    if claims.is_empty() {
+        claims.push(cmd_claim(command));
+    }
+
+    let req = AccessRequest {
+        tool: "bash".to_string(),
+        claims,
+        mode,
+        display_input: command.to_string(),
+    };
+    enforce_request(permission, ask_tx, req).await
 }
 
 /// Split a shell command on `;`, `&&`, `||` separators that appear
@@ -597,6 +581,21 @@ fn push_segment<'a>(command: &'a str, start: usize, end: usize, out: &mut Vec<&'
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    /// Test helper: build a single op-based rule (tool-agnostic).
+    #[cfg(feature = "semantic-bash")]
+    fn rule(
+        op: crate::permission::OpSpec,
+        pattern: &str,
+        effect: crate::permission::Action,
+    ) -> crate::permission::RuleConfig {
+        crate::permission::RuleConfig {
+            op,
+            pattern: pattern.to_string(),
+            effect,
+            tool: None,
+        }
+    }
 
     /// F6: a timed-out `sleep 9999` (or any long-running command)
     /// must actually be killed when the timeout fires. Before this
@@ -814,18 +813,15 @@ mod tests {
     #[tokio::test]
     async fn redirect_target_routes_through_write_rules() {
         use crate::permission::{
-            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+            Action, OpSpec, PermissionConfig, SecurityMode, checker::PermissionChecker,
         };
-        use std::collections::HashMap;
 
-        // Configure write to deny everywhere; without an explicit
+        // Configure edit to deny everywhere; without an explicit
         // rule the M2/M4-pre default is still Allow, so we set an
         // explicit deny to make the test robust against the
         // default-flip.
-        let mut write_rules = HashMap::new();
-        write_rules.insert("/etc/**".to_string(), Action::Deny);
         let config = PermissionConfig {
-            write: Some(ToolPerm::Granular(write_rules)),
+            rules: vec![rule(OpSpec::Edit, "/etc/**", Action::Deny)],
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
@@ -866,20 +862,17 @@ mod tests {
     #[tokio::test]
     async fn rm_arg_path_routes_through_write_rules() {
         use crate::permission::{
-            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+            Action, OpSpec, PermissionConfig, SecurityMode, checker::PermissionChecker,
         };
-        use std::collections::HashMap;
 
-        // Permissive bash: allow `rm *`. Restrictive write: deny
-        // `/etc/**`. Without F1, the bash allow would let
+        // Permissive execute: allow `rm *`. Restrictive edit: deny
+        // `/etc/**`. Without F1, the execute allow would let
         // `rm /etc/passwd` through.
-        let mut bash_rules = HashMap::new();
-        bash_rules.insert("rm *".to_string(), Action::Allow);
-        let mut write_rules = HashMap::new();
-        write_rules.insert("/etc/**".to_string(), Action::Deny);
         let config = PermissionConfig {
-            bash: Some(ToolPerm::Granular(bash_rules)),
-            write: Some(ToolPerm::Granular(write_rules)),
+            rules: vec![
+                rule(OpSpec::Execute, "rm *", Action::Allow),
+                rule(OpSpec::Edit, "/etc/**", Action::Deny),
+            ],
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
@@ -899,17 +892,14 @@ mod tests {
     #[tokio::test]
     async fn chmod_skips_mode_spec_routes_paths() {
         use crate::permission::{
-            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+            Action, OpSpec, PermissionConfig, SecurityMode, checker::PermissionChecker,
         };
-        use std::collections::HashMap;
 
-        let mut bash_rules = HashMap::new();
-        bash_rules.insert("chmod *".to_string(), Action::Allow);
-        let mut write_rules = HashMap::new();
-        write_rules.insert("/etc/**".to_string(), Action::Deny);
         let config = PermissionConfig {
-            bash: Some(ToolPerm::Granular(bash_rules)),
-            write: Some(ToolPerm::Granular(write_rules)),
+            rules: vec![
+                rule(OpSpec::Execute, "chmod *", Action::Allow),
+                rule(OpSpec::Edit, "/etc/**", Action::Deny),
+            ],
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
@@ -931,17 +921,14 @@ mod tests {
     #[tokio::test]
     async fn flags_skipped_when_extracting_paths() {
         use crate::permission::{
-            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+            Action, OpSpec, PermissionConfig, SecurityMode, checker::PermissionChecker,
         };
-        use std::collections::HashMap;
 
-        let mut bash_rules = HashMap::new();
-        bash_rules.insert("rm *".to_string(), Action::Allow);
-        let mut write_rules = HashMap::new();
-        write_rules.insert("/etc/**".to_string(), Action::Deny);
         let config = PermissionConfig {
-            bash: Some(ToolPerm::Granular(bash_rules)),
-            write: Some(ToolPerm::Granular(write_rules)),
+            rules: vec![
+                rule(OpSpec::Execute, "rm *", Action::Allow),
+                rule(OpSpec::Edit, "/etc/**", Action::Deny),
+            ],
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
@@ -960,23 +947,14 @@ mod tests {
     #[tokio::test]
     async fn redirect_target_allowed_when_write_permits() {
         use crate::permission::{
-            Action, PermissionConfig, SecurityMode, ToolPerm, checker::PermissionChecker,
+            Action, OpSpec, PermissionConfig, SecurityMode, checker::PermissionChecker,
         };
-        use std::collections::HashMap;
 
-        // M4 (dirge-ojn): `write` no longer defaults to Allow; it
-        // falls to the new global Ask. F2 (dirge-jlj): write
-        // additionally consults `edit` rules. Install allow rules
-        // for BOTH so the combined check passes — matches the
-        // user-facing semantic that "write to X" requires write
-        // AND edit to permit it.
-        let mut write_rules = HashMap::new();
-        write_rules.insert("**".to_string(), Action::Allow);
-        let mut edit_rules = HashMap::new();
-        edit_rules.insert("**".to_string(), Action::Allow);
+        // F2 (dirge-jlj) dissolved: write/edit/apply_patch all map to
+        // Operation::Edit, so a single Edit allow rule governs the
+        // redirect-target write.
         let config = PermissionConfig {
-            write: Some(ToolPerm::Granular(write_rules)),
-            edit: Some(ToolPerm::Granular(edit_rules)),
+            rules: vec![rule(OpSpec::Edit, "**", Action::Allow)],
             ..Default::default()
         };
         let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
@@ -986,6 +964,158 @@ mod tests {
         assert!(
             result.is_ok(),
             "redirect to an explicitly-allowed target should pass; got {result:?}",
+        );
+    }
+
+    // dirge-mzs4: /dev/null redirect whitelist. Commands whose only
+    // filesystem-touching effect is a `/dev/null` redirect are
+    // auto-allowed — writing to /dev/null discards data with no
+    // observable side effect, so prompting on that pattern is pure
+    // noise. Deny rules and the doom-loop detector still fire; the
+    // only behavioural change is `Ask → Allow` for the bash segment
+    // check.
+
+    /// The `/dev/null` redirect TARGET is auto-allowed (a harmless
+    /// bit-bucket), so it never adds a prompt of its own. Phase 3
+    /// behavior change: the COMMAND still needs its own Execute
+    /// permission — an unfamiliar command redirected to /dev/null
+    /// still prompts (more correct than the old blanket command
+    /// soft-allow). So an ALLOWED command (`git status -s`) redirected
+    /// to /dev/null passes without prompting; the /dev/null target
+    /// contributes no extra gate.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_dev_null_target_adds_no_prompt() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        // `git status` is a default-allowed bash command; redirecting
+        // it to /dev/null must not introduce a prompt.
+        let allowed_cases = [
+            "git status -s > /dev/null",
+            "git status -s 2> /dev/null",
+            "git status -s &> /dev/null",
+            "git status -s > /dev/null 2>&1",
+        ];
+        for cmd in &allowed_cases {
+            let checker =
+                PermissionChecker::new(&PermissionConfig::default(), SecurityMode::Standard, None);
+            let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+            let result = check_bash_segments(&Some(perm), &None, cmd).await;
+            assert!(
+                result.is_ok(),
+                "{cmd:?}: allowed command + /dev/null target must not prompt; got {result:?}",
+            );
+        }
+
+        // An UNFAMILIAR command redirected to /dev/null still needs
+        // command permission → prompts (Err in non-interactive test).
+        let checker =
+            PermissionChecker::new(&PermissionConfig::default(), SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+        let result = check_bash_segments(&Some(perm), &None, "unfamiliar_cmd > /dev/null").await;
+        assert!(
+            result.is_err(),
+            "unfamiliar command still needs Execute permission even redirecting to /dev/null; got {result:?}",
+        );
+    }
+
+    /// Compound redirects (one to /dev/null, one to a real file) must
+    /// NOT slip through the whitelist — the real-file destination
+    /// still routes through the write rules, and the bash segment
+    /// check still applies. Pre-fix, naively whitelisting any
+    /// /dev/null mention would let `cmd > file.txt > /dev/null`
+    /// silently write to file.txt.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_redirect_to_file_and_dev_null_still_prompts() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        // No ask_tx is wired, so any `Ask` outcome surfaces as an
+        // error from `enforce`. If the whitelist mistakenly applied,
+        // this would succeed silently.
+        let result = check_bash_segments(
+            &Some(perm),
+            &None,
+            "unfamiliar_cmd > /tmp/dirge-mzs4-real.log 2> /dev/null",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "compound redirect (real file + /dev/null) must NOT auto-allow; got {result:?}",
+        );
+    }
+
+    /// Baseline: a command with NO /dev/null redirect and no default
+    /// allow rule must still prompt. Pins that the whitelist does
+    /// not bleed into the unredirected case.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_other_destination_still_prompts() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        // `unfamiliar_cmd` doesn't match any default bash allow
+        // rule. No ask_tx is wired so the `Ask` outcome surfaces
+        // as an error. The whitelist is dormant — falls through to
+        // the standard enforce path.
+        let result =
+            check_bash_segments(&Some(perm), &None, "unfamiliar_cmd > /tmp/elsewhere.log").await;
+        assert!(
+            result.is_err(),
+            "non-/dev/null redirect must still prompt; got {result:?}",
+        );
+    }
+
+    /// Deny rules still fire even for /dev/null-redirected commands.
+    /// `rm -rf / > /dev/null` must be denied by the default
+    /// `rm -rf /**` rule — the dev/null whitelist must NOT bypass
+    /// the deny gate.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_dev_null_does_not_bypass_deny_rules() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result = check_bash_segments(&Some(perm), &None, "rm -rf / > /dev/null").await;
+        assert!(
+            result.is_err(),
+            "dev/null redirect must not bypass `rm -rf /**` deny; got {result:?}",
+        );
+    }
+
+    /// In a compound (`&&`-separated) statement, the dev/null
+    /// soft-allow applies ONLY to the segment with the /dev/null
+    /// redirect — other segments still go through the normal
+    /// gate. `unfamiliar_cmd > /dev/null && other_unfamiliar_cmd`
+    /// auto-allows the first but prompts on the second.
+    #[cfg(feature = "semantic-bash")]
+    #[tokio::test]
+    async fn bash_dev_null_per_segment_scope() {
+        use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
+
+        let config = PermissionConfig::default();
+        let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+
+        let result = check_bash_segments(
+            &Some(perm),
+            &None,
+            "unfamiliar_cmd > /dev/null && other_unfamiliar_cmd",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "second segment without /dev/null redirect must still prompt; got {result:?}",
         );
     }
 }

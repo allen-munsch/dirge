@@ -54,8 +54,31 @@ use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
 use super::types::{Context, LoopConfig};
 
+/// Phase 4 part 2: poll the configured `get_steering_messages`
+/// hook AND the file-touch tracker (when present), concatenating
+/// their outputs. The tracker reminder follows any queued steering
+/// messages so the user's explicit guidance is observed first.
+///
+/// Kept as a free fn so the inner/outer steering-poll sites stay
+/// terse. Returns an empty Vec when neither source has anything to
+/// inject — preserves the legacy fast path byte-for-byte.
+async fn poll_steering_and_reminder(config: &LoopConfig) -> Vec<LoopMessage> {
+    let mut out = match &config.get_steering_messages {
+        Some(get) => get().await,
+        None => Vec::new(),
+    };
+    if let Some(tracker) = &config.file_touch_tracker {
+        out.extend(tracker.poll_reminder());
+    }
+    out
+}
+
 /// Build a `StormBreaker` from `LoopConfig`, merging custom
 /// mutating/exempt tool name lists with the built-in defaults.
+// The two `Option<Box<dyn Fn ...>>` predicates match `StormBreaker::new`
+// exactly; aliasing once here would only force readers to jump to find
+// the same shape they'd otherwise read inline. Silence locally.
+#[allow(clippy::type_complexity)]
 fn storm_for_config(config: &LoopConfig) -> StormBreaker {
     let has_custom = config.storm_mutating_tools.is_some() || config.storm_exempt_tools.is_some();
     if !has_custom {
@@ -89,13 +112,118 @@ fn storm_for_config(config: &LoopConfig) -> StormBreaker {
 /// once the pass finishes (whether pruning-only or pruning+summary).
 /// Session.id rotation + DB persistence is delegated to the event
 /// consumer side via this event channel.
+/// dirge-h5tv: fire `on_pre_compress` on a memory provider (if
+/// attached) over the to-be-discarded message slice, and combine
+/// its returned insights with the user-supplied focus topic so the
+/// summary prompt preserves both. Returns the final string (or
+/// `None` when neither contributes).
+///
+/// Lives here rather than in compression.rs because the
+/// MemoryProvider trait lives in `extras` and shouldn't leak into
+/// the pure compression module. The slice → transcript conversion
+/// uses `build_transcript_from_value_slice` to share format with
+/// the slash-path's `build_transcript_from_slice`.
+fn build_augmented_focus(
+    focus_topic: Option<&str>,
+    provider: Option<&std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    middle: &[serde_json::Value],
+) -> Option<String> {
+    // Lazy transcript build: only walk the middle slice when a
+    // provider is attached. The common no-provider case
+    // short-circuits without paying the format cost.
+    let insights = provider.map(|p| {
+        let transcript = transcript_from_value_slice(middle);
+        crate::agent::review::fire_pre_compress(p.as_ref(), &transcript)
+    });
+    match (
+        focus_topic.map(str::trim),
+        insights.as_deref().map(str::trim),
+    ) {
+        (Some(focus), Some(ins)) if !focus.is_empty() && !ins.is_empty() => {
+            Some(format!("{focus}\n\nProvider insights:\n{ins}"))
+        }
+        (Some(focus), _) if !focus.is_empty() => Some(focus.to_string()),
+        (_, Some(ins)) if !ins.is_empty() => Some(format!("Provider insights:\n{ins}")),
+        _ => None,
+    }
+}
+
+/// Build a transcript string from a Vec<Value> slice (raw loop
+/// messages). Mirrors `build_transcript_from_slice` over
+/// `SessionMessage`. Used by `build_augmented_focus` for the
+/// on_pre_compress hook.
+fn transcript_from_value_slice(messages: &[serde_json::Value]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for m in messages {
+        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let content = m
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !content.is_empty() {
+            let _ = writeln!(out, "{}: {}", role, content);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Consecutive summarizer failures (per run) before the compaction
+/// circuit breaker opens and the LLM summarizer is skipped for the rest
+/// of the run — the cheap `prune_tool_outputs` pass still runs, so
+/// context can't grow unbounded. 3 tolerates two transient failures; a
+/// third means the summarizer is systematically broken and retrying it
+/// every fold just wastes API calls (IMPROVEMENTS_PLAN #1).
+const MAX_CONSECUTIVE_COMPACTION_FAILURES: u32 = 3;
+
+/// What the LLM-summary stage of a compaction pass did, so `run_loop`
+/// can drive the circuit-breaker counter. (The cheap prune always runs
+/// regardless of this outcome.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryOutcome {
+    /// A valid summary was produced (LLM or plugin) and applied. Carries
+    /// the index of the inserted summary message so the caller can
+    /// re-inject working-set file snapshots right after it
+    /// (IMPROVEMENTS_PLAN #2).
+    Succeeded(usize),
+    /// The summarizer ran but returned an error or an invalid summary.
+    Failed,
+    /// The summarizer was not run: none wired, breaker open, or no
+    /// foldable middle. Not a failure — doesn't trip the breaker.
+    Skipped,
+}
+
+/// Fold a compaction pass outcome into the per-run failure counter:
+/// reset on success, increment on failure, leave untouched on skip.
+fn record_compaction_outcome(failures: &mut u32, outcome: SummaryOutcome) {
+    match outcome {
+        SummaryOutcome::Succeeded(_) => *failures = 0,
+        SummaryOutcome::Failed => *failures = failures.saturating_add(1),
+        SummaryOutcome::Skipped => {}
+    }
+}
+
 async fn run_compaction_pass(
     current_context: &mut Context,
     summarize_fn: &Option<crate::agent::compression::SummarizeFn>,
     protect_tail: usize,
+    compaction_failures: u32,
+    memory_provider: &Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    compaction_hooks: Option<&crate::agent::agent_loop::types::CompactionHooks>,
     emit: &mpsc::Sender<LoopEvent>,
-) {
-    run_compaction_pass_with_focus(current_context, summarize_fn, protect_tail, None, emit).await
+) -> SummaryOutcome {
+    run_compaction_pass_with_focus(
+        current_context,
+        summarize_fn,
+        protect_tail,
+        compaction_failures,
+        None,
+        memory_provider,
+        compaction_hooks,
+        emit,
+    )
+    .await
 }
 
 /// Same as `run_compaction_pass` but accepts an optional focus
@@ -103,16 +231,32 @@ async fn run_compaction_pass(
 /// the `/compress <focus>` slash command path. The auto-triggered
 /// compaction (`PostUsageDecisionKind::Fold` / `ExitWithSummary`)
 /// continues to use the no-focus wrapper above.
+///
+/// dirge-h5tv: `memory_provider` carries the optional plugin
+/// provider so `on_pre_compress` can fire here, mirroring what
+/// `handle_compress` does for the /compress slash command. Auto-
+/// fold is the high-frequency path; without the fire, plugin
+/// providers' extracted insights are silently dropped.
 async fn run_compaction_pass_with_focus(
     current_context: &mut Context,
     summarize_fn: &Option<crate::agent::compression::SummarizeFn>,
     protect_tail: usize,
+    compaction_failures: u32,
     focus_topic: Option<String>,
+    memory_provider: &Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    compaction_hooks: Option<&crate::agent::agent_loop::types::CompactionHooks>,
     emit: &mpsc::Sender<LoopEvent>,
-) {
+) -> SummaryOutcome {
     use crate::agent::compression;
 
     let before = compression::estimate_messages_tokens(&current_context.messages);
+
+    // dirge-jia8: observe-only `on-before-compact` plugin hook. It
+    // CANNOT cancel — the fold proceeds regardless (cancelling an
+    // emergency fold would overflow the next request).
+    if let Some(hooks) = compaction_hooks {
+        (hooks.on_before)(current_context.messages.len(), before).await;
+    }
 
     // First pass: cheap tool-output pruning. No LLM call.
     let pruned = compression::prune_tool_outputs(&current_context.messages, protect_tail);
@@ -130,7 +274,24 @@ async fn run_compaction_pass_with_focus(
     // their content in place. compress_reporting handles that
     // gracefully (zero-width fold).
     let mut applied_first_kept = current_context.messages.len();
-    if let Some(sfn) = summarize_fn {
+    // Drives the per-run circuit breaker: Skipped unless the summarizer
+    // actually runs and resolves to a valid summary (Succeeded) or an
+    // error / invalid summary (Failed).
+    let mut outcome = SummaryOutcome::Skipped;
+    // Tracks the breaker-open case so the emitted CompactionKind stays a
+    // distinct failure signal (not a healthy-looking PruneOnly).
+    let mut breaker_open = false;
+    if compaction_failures >= MAX_CONSECUTIVE_COMPACTION_FAILURES {
+        // Circuit breaker open: the summarizer has failed too many times
+        // this run. Skip the LLM call entirely and keep the pruned
+        // context (IMPROVEMENTS_PLAN #1).
+        breaker_open = true;
+        tracing::warn!(
+            target: "dirge::agent_loop",
+            failures = compaction_failures,
+            "compaction summarizer failed {compaction_failures} consecutive times — circuit breaker open, skipping LLM summarization",
+        );
+    } else if let Some(sfn) = summarize_fn {
         let (start, end) = compression::compute_compress_window(
             &current_context.messages,
             compression::PROTECT_HEAD_DEFAULT,
@@ -140,27 +301,47 @@ async fn run_compaction_pass_with_focus(
             let middle: Vec<serde_json::Value> = current_context.messages[start..end].to_vec();
             // Carry forward any previous summary body for iterative
             // re-compression (Hermes _find_latest_context_summary).
-            let prev = compression::find_previous_summary(&current_context.messages)
-                .map(|(_, body)| body);
-            let budget = compression::summary_budget(
-                compression::estimate_messages_tokens(&middle),
-            );
-            let prompt = compression::build_summary_prompt(
-                &middle,
-                budget,
-                prev.as_deref(),
-                focus_topic.as_deref(),
-            );
-            match sfn(prompt).await {
-                Ok(summary) if compression::validate_summary(&summary) => {
-                    let new_msgs = compression::apply_summary(
-                        &current_context.messages,
-                        &summary,
-                        start,
-                        end,
+            let prev =
+                compression::find_previous_summary(&current_context.messages).map(|(_, body)| body);
+            let budget =
+                compression::summary_budget(compression::estimate_messages_tokens(&middle));
+            // dirge-h5tv: fire on_pre_compress on the to-be-discarded
+            // middle slice and fold the provider's insights into the
+            // focus_topic block. Empty returns / no provider → no
+            // change (focus_topic stays as supplied). This mirrors
+            // the /compress slash path's instructions augmentation.
+            let augmented_focus =
+                build_augmented_focus(focus_topic.as_deref(), memory_provider.as_ref(), &middle);
+            // dirge-jia8: give the `on-compact` plugin hook first
+            // refusal — if it supplies a valid summary, use it
+            // instead of calling the LLM summarizer. An absent hook,
+            // no summary, or an invalid one falls through to the LLM.
+            let plugin_summary: Option<String> = match compaction_hooks {
+                Some(hooks) => match (hooks.on_compact)(middle.clone()).await {
+                    Some(s) if compression::validate_summary(&s) => Some(s),
+                    _ => None,
+                },
+                None => None,
+            };
+            let summary_result: Result<String, _> = match plugin_summary {
+                Some(s) => Ok(s),
+                None => {
+                    let prompt = compression::build_summary_prompt(
+                        &middle,
+                        budget,
+                        prev.as_deref(),
+                        augmented_focus.as_deref(),
                     );
+                    sfn(prompt).await
+                }
+            };
+            match summary_result {
+                Ok(summary) if compression::validate_summary(&summary) => {
+                    let new_msgs =
+                        compression::apply_summary(&current_context.messages, &summary, start, end);
                     current_context.messages = new_msgs;
-                    after_summary = compression::estimate_messages_tokens(&current_context.messages);
+                    after_summary =
+                        compression::estimate_messages_tokens(&current_context.messages);
                     applied_summary = summary;
                     // After apply_summary, the head (0..start) is
                     // preserved, then a single summary message
@@ -169,12 +350,14 @@ async fn run_compaction_pass_with_focus(
                     // is therefore `start` — anything below was
                     // protected, anything above was folded.
                     applied_first_kept = start;
+                    outcome = SummaryOutcome::Succeeded(start);
                 }
                 Ok(_) => {
                     tracing::warn!(
                         target: "dirge::agent_loop",
                         "compaction summarizer returned an unvalidated summary — keeping pruned context",
                     );
+                    outcome = SummaryOutcome::Failed;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -182,10 +365,25 @@ async fn run_compaction_pass_with_focus(
                         error = %e,
                         "compaction summarizer failed — keeping pruned context",
                     );
+                    outcome = SummaryOutcome::Failed;
                 }
             }
         }
     }
+
+    // IMPROVEMENTS_PLAN #5: report what the pass did so consumers can
+    // tell pruning-only from a summary, and spot a failing summarizer.
+    // Breaker-open is its OWN kind so the failure signal survives after
+    // the breaker latches (it'd otherwise look like a healthy PruneOnly).
+    let compaction_kind = if breaker_open {
+        crate::event::CompactionKind::PruneSummarizerDisabled
+    } else {
+        match outcome {
+            SummaryOutcome::Succeeded(_) => crate::event::CompactionKind::PruneAndSummary,
+            SummaryOutcome::Failed => crate::event::CompactionKind::PruneAndFailedSummary,
+            SummaryOutcome::Skipped => crate::event::CompactionKind::PruneOnly,
+        }
+    };
 
     let new_id = compression::rotate_session_id();
     let _ = emit
@@ -195,8 +393,93 @@ async fn run_compaction_pass_with_focus(
             tokens_after: after_summary,
             summary: applied_summary,
             first_kept_index: applied_first_kept,
+            compaction_kind,
+            // The summarizer model name isn't threaded through the opaque
+            // SummarizeFn closure yet (follow-up).
+            summary_model: None,
         })
         .await;
+
+    outcome
+}
+
+/// Per-file read ceiling for restoration. A file larger than this is
+/// skipped entirely rather than read into memory just to truncate it to
+/// the snapshot budget — avoids an OOM if the agent touched a multi-GB
+/// artifact (review fix). Generous vs the snapshot budget so normal
+/// source files always restore.
+const POST_COMPACT_MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Don't re-inject file snapshots if the just-folded context is already
+/// above this fraction of the window: adding up to ~25k tokens of files
+/// could re-cross the fold threshold and chatter fold↔restore (review
+/// fix). Restoration is a convenience, not load-bearing — skip it when
+/// there's no headroom.
+const POST_COMPACT_RESTORE_CEILING: f64 = 0.50;
+
+/// IMPROVEMENTS_PLAN #2: after a successful summary fold, re-read the
+/// working-set files the agent was editing and splice fresh
+/// `[Post-compaction file snapshot]` system messages in right after the
+/// summary (index `summary_idx`) — so the fold doesn't strand the model
+/// without the concrete file state it had been working from.
+///
+/// No-op without a file-touch tracker or tracked files, when the
+/// post-fold context already lacks headroom, or when all candidate files
+/// are unreadable / oversized. Reads are bounded by file count
+/// (`POST_COMPACT_MAX_FILES`) AND per-file size (`POST_COMPACT_MAX_READ_BYTES`),
+/// and each snapshot is token-capped by `build_post_compact_snapshots`.
+async fn restore_working_files(
+    config: &LoopConfig,
+    ctx: &mut Context,
+    summary_idx: usize,
+    ctx_max: u64,
+) {
+    let Some(tracker) = &config.file_touch_tracker else {
+        return;
+    };
+    let files = tracker.working_files();
+    if files.is_empty() {
+        return;
+    }
+    // Headroom guard: if the freshly-folded context is already high,
+    // re-injecting files risks immediately re-crossing the fold
+    // threshold. Restoration is optional — skip rather than oscillate.
+    let post_fold = crate::agent::compression::estimate_messages_tokens(&ctx.messages);
+    if post_fold as f64 > POST_COMPACT_RESTORE_CEILING * ctx_max.max(1) as f64 {
+        tracing::debug!(
+            target: "dirge::agent_loop",
+            post_fold,
+            ctx_max,
+            "skipping post-compaction file restore — insufficient headroom",
+        );
+        return;
+    }
+    let mut contents: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for path in files
+        .into_iter()
+        .take(crate::agent::compression::POST_COMPACT_MAX_FILES)
+    {
+        // Skip files too large to read cheaply — don't materialize a
+        // huge artifact in memory just to truncate it.
+        match tokio::fs::metadata(&path).await {
+            Ok(m) if m.len() > POST_COMPACT_MAX_READ_BYTES => continue,
+            Ok(_) => {}
+            Err(_) => continue,
+        }
+        if let Ok(body) = tokio::fs::read_to_string(&path).await {
+            contents.push((path, body));
+        }
+    }
+    if contents.is_empty() {
+        return;
+    }
+    let snapshots = crate::agent::compression::build_post_compact_snapshots(&contents);
+    // Insert right after the summary message, before the protected tail.
+    let mut at = (summary_idx + 1).min(ctx.messages.len());
+    for snap in snapshots {
+        ctx.messages.insert(at, snap);
+        at += 1;
+    }
 }
 
 /// Public entry point: start a new run from one or more prompt
@@ -206,23 +489,13 @@ async fn run_compaction_pass_with_focus(
 /// `message_end` for each prompt, THEN enters `run_loop`. Returns
 /// the full list of messages produced by this run (prompts + every
 /// assistant turn + every tool result).
+///
+/// `summarize_fn` is an optional LOOP-9 context-compaction callback.
+/// When `Some`, the compaction path runs a structured summarization
+/// pass after the cheap `prune_tool_outputs` pre-pass — see
+/// `crate::agent::compression::SummarizeFn` for the contract. Pass
+/// `None` to disable LLM-summary compaction.
 pub async fn run_agent_loop(
-    prompts: Vec<LoopMessage>,
-    context: Context,
-    config: LoopConfig,
-    signal: AbortSignal,
-    emit: &mpsc::Sender<LoopEvent>,
-    stream_fn: &StreamFn,
-) -> Vec<LoopMessage> {
-    run_agent_loop_with_summarizer(prompts, context, config, signal, emit, stream_fn, None).await
-}
-
-/// Like `run_agent_loop` but accepts an optional summarizer callback
-/// for LOOP-9 context compaction. When `Some`, the loop's compaction
-/// path runs a structured summarization pass after the cheap
-/// `prune_tool_outputs` pre-pass — see
-/// `crate::agent::compression::SummarizeFn` for the contract.
-pub async fn run_agent_loop_with_summarizer(
     prompts: Vec<LoopMessage>,
     mut context: Context,
     config: LoopConfig,
@@ -230,12 +503,21 @@ pub async fn run_agent_loop_with_summarizer(
     emit: &mpsc::Sender<LoopEvent>,
     stream_fn: &StreamFn,
     summarize_fn: Option<crate::agent::compression::SummarizeFn>,
+    // dirge-h5tv: optional memory provider for the on_pre_compress
+    // hook during auto-compaction.
+    memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
 ) -> Vec<LoopMessage> {
     // Pi line 103: `newMessages = [...prompts]`.
     let new_messages = prompts.clone();
     // Pi line 105: `currentContext.messages = [...context.messages, ...prompts]`.
     for prompt in &prompts {
         context.messages.push(loop_message_to_value(prompt));
+        // Phase 4 part 2: notify the file-touch tracker about user
+        // prompts so it can decide whether the streak persists or
+        // resets to a new topic.
+        if let (Some(tracker), LoopMessage::User(u)) = (&config.file_touch_tracker, prompt) {
+            tracker.record_user_message(&u.content);
+        }
     }
 
     // Pi lines 109-114: emit agent_start + turn_start + per-prompt
@@ -255,43 +537,43 @@ pub async fn run_agent_loop_with_summarizer(
             .await;
     }
 
-    run_loop_with_summarizer(context, new_messages, config, signal, emit, stream_fn, summarize_fn).await
+    run_loop(
+        context,
+        new_messages,
+        config,
+        signal,
+        emit,
+        stream_fn,
+        summarize_fn,
+        memory_provider,
+    )
+    .await
 }
 
-/// The actual loop. Faithful port of pi `runLoop` (agent-loop.ts:155-269).
+/// The actual loop. Faithful port of pi `runLoop` (agent-loop.ts:155-269)
+/// plus the LOOP-9 `summarize_fn` callback for context-compaction's
+/// structured-summary pass. Pass `None` to disable LLM compaction.
 ///
 /// Owns `current_context`, `new_messages`, `config` — pi mutates
 /// these as the run proceeds; in Rust we own them by value and
 /// return `new_messages` at the end.
 pub async fn run_loop(
-    current_context: Context,
-    new_messages: Vec<LoopMessage>,
-    config: LoopConfig,
-    signal: AbortSignal,
-    emit: &mpsc::Sender<LoopEvent>,
-    stream_fn: &StreamFn,
-) -> Vec<LoopMessage> {
-    run_loop_with_summarizer(current_context, new_messages, config, signal, emit, stream_fn, None).await
-}
-
-/// LOOP-9 variant: identical to `run_loop` plus an optional
-/// `summarize_fn` callback for context compaction's second pass.
-pub async fn run_loop_with_summarizer(
     mut current_context: Context,
     mut new_messages: Vec<LoopMessage>,
-    // `config` is `mut` even though phase 4 only reads it. Pi
-    // mutates it at agent-loop.ts:229 (`config = { ...config,
-    // model: ..., reasoning: ... }`) for the prepareNextTurn
-    // model/thinking swap. Phase 4 lands the hook signature and
-    // the placeholder fields; phase 4.5 will actually assign
-    // through this binding. Keeping `mut` here matches pi's
-    // shape and avoids needing to retype the parameter when the
-    // assignment site activates.
-    #[allow(unused_mut)] mut config: LoopConfig,
+    // `config` is `mut`: the `prepareNextTurn` hook assigns
+    // `config.reasoning` (the thinking-level swap) through this
+    // binding, matching pi's `config = { ...config, reasoning }`
+    // at agent-loop.ts:229. (Model swap is not yet wired — see
+    // the `prepare_next_turn` handler below.)
+    mut config: LoopConfig,
     signal: AbortSignal,
     emit: &mpsc::Sender<LoopEvent>,
     stream_fn: &StreamFn,
     summarize_fn: Option<crate::agent::compression::SummarizeFn>,
+    // dirge-h5tv: optional memory provider so on_pre_compress fires
+    // when the loop auto-folds. `None` is a no-op (test paths,
+    // no plugin provider attached).
+    memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
 ) -> Vec<LoopMessage> {
     let mut first_turn = true;
 
@@ -310,11 +592,25 @@ pub async fn run_loop_with_summarizer(
     // Reset each new user turn; set true when a fold happens.
     let mut folded_this_turn: bool;
 
+    // Circuit breaker: consecutive summarizer failures this run. After
+    // MAX_CONSECUTIVE_COMPACTION_FAILURES, compaction skips the LLM
+    // summarizer (cheap pruning still runs). Per-run — a fresh run_loop
+    // starts at 0 (IMPROVEMENTS_PLAN #1).
+    let mut compaction_failures: u32 = 0;
+
+    // Tokens the pre-send snip freed this iteration. If it freed enough
+    // headroom, the post-response NORMAL fold is skipped
+    // (IMPROVEMENTS_PLAN #4). Reset after each post-usage decision.
+    let mut snip_tokens_freed: u64 = 0;
+
     // Pi line 167: initial steering poll.
-    let mut pending_messages: Vec<LoopMessage> = match &config.get_steering_messages {
-        Some(get) => get().await,
-        None => Vec::new(),
-    };
+    // Phase 4 part 2: composes with the file-touch tracker's
+    // reminder poll when configured.
+    let mut pending_messages: Vec<LoopMessage> = poll_steering_and_reminder(&config).await;
+
+    // dirge-nqr: count assistant turns so a hard cap can stop a
+    // runaway run. `max_turns = None` means unlimited (legacy).
+    let mut turns_taken: usize = 0;
 
     'outer: loop {
         // Storm: fresh intent on each new user turn.
@@ -330,6 +626,24 @@ pub async fn run_loop_with_summarizer(
 
         // Pi line 174: INNER LOOP.
         while has_more_tool_calls || !pending_messages.is_empty() {
+            // Circuit-breaker bookkeeping is at-most-once per iteration:
+            // a single iteration can run BOTH the turn-start fold and the
+            // (ungated) post-usage ExitWithSummary pass, and counting two
+            // failures from one iteration would open the breaker before
+            // the intended 3-round budget (review fix). First record wins.
+            let mut compaction_recorded_this_iter = false;
+
+            // The model's context window is constant within one inner-loop
+            // iteration — the model can only change at a turn boundary
+            // (prepareNextTurn), after the post-usage decision. Look it up
+            // once and reuse at all three sites that need it: the turn-start
+            // fold, the per-result snip cap, and the post-usage decision.
+            let ctx_max = config
+                .model_name
+                .as_deref()
+                .and_then(crate::config::context_window_for_model)
+                .unwrap_or(128_000);
+
             // Pi lines 175-179: turn_start (skipped on very first
             // iteration — the outer wrapper already emitted it).
             if !first_turn {
@@ -338,41 +652,55 @@ pub async fn run_loop_with_summarizer(
                 first_turn = false;
             }
 
-            // Reasonix loop.ts:656-684 — turn-start fold estimate.
-            // Covers cases the post-response fold can't see:
-            // terminal prior turn, session restore, huge paste.
-            // Estimate is approximate (no tokenizer); defaults to
-            // no-fold when data is unavailable.
-            {
-                let ctx_max = config
-                    .model_name
-                    .as_deref()
-                    .and_then(crate::config::context_window_for_model)
-                    .unwrap_or(128_000);
-                // Rough estimate from message count × avg content length.
-                let rough_estimate: u64 = current_context
-                    .messages
-                    .iter()
-                    .map(|m| {
-                        let content = m
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .len() as u64;
-                        // ~4 chars per token heuristic
-                        content / 4
-                    })
-                    .sum();
+            // dirge-el3n: turn-start (proactive) fold. Reasonix
+            // parity at `loop.ts:656-684`. Covers cases the
+            // post-response fold can't see — terminal prior turn,
+            // session restore, huge paste, long multi-iter turn
+            // that crossed the threshold inside one assistant
+            // response. Fires when the rough token estimate
+            // exceeds `TURN_START_FOLD_THRESHOLD` AND we haven't
+            // already folded this turn (the post-response site
+            // owns the same flag and is idempotent w.r.t. it).
+            //
+            // Before-fix: this block only LOGGED — no actual
+            // compaction. Long turns ran past the 75/80/90%
+            // thresholds without the fold ever firing.
+            //
+            // Uses the widened `estimate_messages_tokens` so
+            // production block-shaped tool results actually
+            // count (otherwise array content was 0 and the
+            // estimate stayed at 0% forever).
+            if !folded_this_turn {
+                let rough_estimate =
+                    crate::agent::compression::estimate_messages_tokens(&current_context.messages);
                 let estimate = context_manager::estimate_turn_start(rough_estimate, ctx_max);
                 if estimate.ratio > context_manager::TURN_START_FOLD_THRESHOLD {
-                    tracing::warn!(
+                    tracing::info!(
                         target: "dirge::agent_loop",
                         estimate_tokens = %estimate.estimate_tokens,
                         ctx_max = %estimate.ctx_max,
                         ratio = %estimate.ratio,
-                        "context-manager: turn-start fold recommended ({}% of context)",
+                        "context-manager: turn-start fold firing ({}% of context)",
                         (estimate.ratio * 100.0) as u32,
                     );
+                    let outcome = run_compaction_pass(
+                        &mut current_context,
+                        &summarize_fn,
+                        5, // protect last 5 messages
+                        compaction_failures,
+                        &memory_provider,
+                        config.compaction_hooks.as_ref(),
+                        emit,
+                    )
+                    .await;
+                    if let SummaryOutcome::Succeeded(idx) = outcome {
+                        restore_working_files(&config, &mut current_context, idx, ctx_max).await;
+                    }
+                    if !compaction_recorded_this_iter {
+                        record_compaction_outcome(&mut compaction_failures, outcome);
+                        compaction_recorded_this_iter = true;
+                    }
+                    folded_this_turn = true;
                 }
             }
 
@@ -392,9 +720,47 @@ pub async fn run_loop_with_summarizer(
                         .await;
                     current_context.messages.push(loop_message_to_value(msg));
                     new_messages.push(msg.clone());
+                    // Phase 4 part 2: record user-originated steering
+                    // messages so the file-touch tracker can decide
+                    // whether the streak survives the new prompt.
+                    // The tracker's OWN reminder message contains
+                    // "[Context-depth reminder]" — skip recording
+                    // those so they don't reset the streak they just
+                    // diagnosed.
+                    if let (Some(tracker), LoopMessage::User(u)) = (&config.file_touch_tracker, msg)
+                        && !u.content.contains("[Context-depth reminder]")
+                    {
+                        tracker.record_user_message(&u.content);
+                    }
                 }
                 pending_messages.clear();
             }
+
+            // dirge-k6be: cap oversized tool results in the
+            // transcript before every model send. Reasonix
+            // parity at `loop.ts:486-503` (`healActiveLogBeforeSend`).
+            // Idempotent; cheap walk when nothing's over the cap.
+            // The fold pass (75% trigger) still does aggressive
+            // 1-line summarization — this cap is the per-result
+            // safety net so a single 50KB tool output doesn't
+            // dominate the prompt until fold fires.
+            //
+            // Tiered (IMPROVEMENTS_PLAN #3): above 60% estimated context
+            // the cap tightens (3000 → 1000 tokens) so a single oversized
+            // result can't push the NEXT request over the limit before
+            // the (reactive) post-response fold fires.
+            let cap_estimate =
+                crate::agent::compression::estimate_messages_tokens(&current_context.messages);
+            let result_cap = crate::agent::compression::tiered_result_cap(cap_estimate, ctx_max);
+            // Counted variant (IMPROVEMENTS_PLAN #4): track how much the
+            // snip freed so the post-response fold can be skipped if it
+            // bought enough headroom.
+            let (capped, freed) = crate::agent::compression::cap_oversized_tool_results_counted(
+                &current_context.messages,
+                result_cap,
+            );
+            current_context.messages = capped;
+            snip_tokens_freed = snip_tokens_freed.saturating_add(freed);
 
             // Pi lines 192-194: LLM call.
             let (assistant_msg, token_usage) = stream_assistant_response(
@@ -429,9 +795,18 @@ pub async fn run_loop_with_summarizer(
             // Pi lines 202-216: tool calls + results.
             let mut tool_calls = extract_tool_calls_from(&assistant_msg);
 
-            // Scavenge: scan reasoning content for tool calls the
-            // model forgot to emit in `tool_calls`. Port of Reasonix
-            // repair/index.ts:65-85.
+            // Scavenge: scan reasoning AND regular text content for
+            // tool calls the model forgot to emit in `tool_calls`.
+            // Port of Reasonix repair/index.ts:71 (`[reasoningContent
+            // ?? "", content ?? ""].filter(Boolean).join("\n")`).
+            //
+            // dirge-ngic: previously only Thinking blocks were
+            // scanned. A model emitting <|DSML|invoke …/> in regular
+            // content (the common R1-in-content case) was silently
+            // missed. Joining Text + Thinking matches Reasonix's
+            // dual-channel scan exactly; the scavenger's internal
+            // `strip_dsml_blocks` keeps inner-JSON in DSML params
+            // from being double-counted.
             //
             // Only tools in the current context's tool set are
             // accepted. Deduplication by (name, args) signature
@@ -442,18 +817,10 @@ pub async fn run_loop_with_summarizer(
                 .iter()
                 .map(|t| t.name().to_string())
                 .collect();
-            let reasoning_text: String = assistant_msg
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Thinking { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !reasoning_text.is_empty() {
+            let scavenge_source = build_scavenge_source(&assistant_msg.content);
+            if !scavenge_source.is_empty() {
                 let scavenge_result =
-                    super::scavenge::scavenge_tool_calls(Some(&reasoning_text), &allowed_names, 4);
+                    super::scavenge::scavenge_tool_calls(Some(&scavenge_source), &allowed_names, 4);
                 if !scavenge_result.calls.is_empty() {
                     // LOOP-12: canonicalize the JSON so different
                     // key orders or numeric reprs (1 vs 1.0) for the
@@ -521,6 +888,30 @@ pub async fn run_loop_with_summarizer(
                     }
                 }
             }
+
+            // dirge-7bwx: truncation repair runs BEFORE storm
+            // filter. Port of Reasonix's pipeline order at
+            // `repair/index.ts:88-109` (truncation) then
+            // `:113-121` (storm). Previously dirge ran the
+            // closer inside `validate_and_repair` at dispatch
+            // time — after storm. That meant two calls whose
+            // args strings both truncate to the same repaired
+            // form survived storm (different pre-repair
+            // signatures), then dispatched identically. Doing
+            // the repair here lets storm see the canonical
+            // post-repair signature and dedupe correctly.
+            //
+            // Hard-fallback (closer can't rebalance the stack)
+            // leaves `arguments` as the original Value::String;
+            // validate_and_repair downstream will surface that
+            // as a real validation error rather than silently
+            // dispatching a fabricated `{}` — same invariant
+            // Reasonix maintains at `repair/index.ts:93-102`.
+            apply_truncation_repair(
+                &mut tool_calls,
+                &config.repair_stats,
+                &config.truncation_notes,
+            );
 
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
             has_more_tool_calls = false;
@@ -606,11 +997,6 @@ pub async fn run_loop_with_summarizer(
             // into the stream pipeline (future phase). With None,
             // decision defaults to None (carry on).
             {
-                let ctx_max = config
-                    .model_name
-                    .as_deref()
-                    .and_then(crate::config::context_window_for_model)
-                    .unwrap_or(128_000);
                 let decision = context_manager::decide_after_usage(
                     token_usage.map(|u| u.input_tokens),
                     ctx_max,
@@ -619,27 +1005,66 @@ pub async fn run_loop_with_summarizer(
                 match decision.kind {
                     PostUsageDecisionKind::Fold if !folded_this_turn => {
                         folded_this_turn = true;
-                        tracing::info!(
-                            target: "dirge::agent_loop",
-                            ratio = %decision.ratio,
-                            aggressive = decision.aggressive,
-                            tail_budget = ?decision.tail_budget,
-                            "context-manager: fold recommended ({})",
-                            if decision.aggressive { "aggressive" } else { "normal" },
-                        );
+                        // IMPROVEMENTS_PLAN #4: if the pre-send snip
+                        // already freed enough headroom, skip a NORMAL
+                        // fold this turn (aggressive folds still fire).
+                        if crate::agent::compression::snip_bought_enough(
+                            snip_tokens_freed,
+                            ctx_max,
+                            decision.aggressive,
+                        ) {
+                            tracing::info!(
+                                target: "dirge::agent_loop",
+                                freed = snip_tokens_freed,
+                                ratio = %decision.ratio,
+                                "snip freed {snip_tokens_freed} tokens — sufficient, skipping fold",
+                            );
+                        } else {
+                            tracing::info!(
+                                target: "dirge::agent_loop",
+                                ratio = %decision.ratio,
+                                aggressive = decision.aggressive,
+                                tail_budget = ?decision.tail_budget,
+                                "context-manager: fold recommended ({})",
+                                if decision.aggressive { "aggressive" } else { "normal" },
+                            );
 
-                        // Context compaction: prune old tool results and
-                        // compress the middle section of the conversation.
-                        // Port of Hermes's compression pass.
-                        if let Some(prompt_tokens) = token_usage.map(|u| u.input_tokens) {
-                            if crate::agent::compression::should_compress(prompt_tokens, ctx_max) {
-                                run_compaction_pass(
+                            // Context compaction: prune old tool results and
+                            // compress the middle section of the conversation.
+                            // Port of Hermes's compression pass.
+                            if let Some(prompt_tokens) = token_usage.map(|u| u.input_tokens)
+                                && crate::agent::compression::should_compress(
+                                    prompt_tokens,
+                                    ctx_max,
+                                )
+                            {
+                                let outcome = run_compaction_pass(
                                     &mut current_context,
                                     &summarize_fn,
                                     5, // protect last 5 messages
+                                    compaction_failures,
+                                    &memory_provider,
+                                    config.compaction_hooks.as_ref(),
                                     emit,
                                 )
                                 .await;
+                                if let SummaryOutcome::Succeeded(idx) = outcome {
+                                    restore_working_files(
+                                        &config,
+                                        &mut current_context,
+                                        idx,
+                                        ctx_max,
+                                    )
+                                    .await;
+                                }
+                                // Guard against double-counting if a
+                                // turn-start fold already recorded this
+                                // iteration. No write-back needed — only one
+                                // post-usage arm runs and the iteration ends
+                                // right after.
+                                if !compaction_recorded_this_iter {
+                                    record_compaction_outcome(&mut compaction_failures, outcome);
+                                }
                             }
                         }
                     }
@@ -652,16 +1077,30 @@ pub async fn run_loop_with_summarizer(
                         // When context is critically over the threshold,
                         // prune aggressively then run the structured-summary
                         // pass if a summarizer is wired.
-                        run_compaction_pass(
+                        let outcome = run_compaction_pass(
                             &mut current_context,
                             &summarize_fn,
                             3, // protect only last 3
+                            compaction_failures,
+                            &memory_provider,
+                            config.compaction_hooks.as_ref(),
                             emit,
                         )
                         .await;
+                        if let SummaryOutcome::Succeeded(idx) = outcome {
+                            restore_working_files(&config, &mut current_context, idx, ctx_max)
+                                .await;
+                        }
+                        if !compaction_recorded_this_iter {
+                            record_compaction_outcome(&mut compaction_failures, outcome);
+                        }
                     }
                     _ => {}
                 }
+                // Snip credit is per-iteration: it informed THIS post-usage
+                // decision; clear it so a later iteration's fold isn't
+                // suppressed by a stale snip (IMPROVEMENTS_PLAN #4).
+                snip_tokens_freed = 0;
             }
 
             // Pi lines 220-239: prepareNextTurn.
@@ -678,34 +1117,36 @@ pub async fn run_loop_with_summarizer(
                     if let Some(new_ctx) = update.context {
                         current_context = new_ctx;
                     }
-                    // Pi lines 229-238 rebuild config with the
-                    // new model / reasoning. Doing that in Rust
-                    // requires re-building the `StreamFn` closure
-                    // (which has the CompletionModel baked in at
-                    // construction by `rig_stream_fn_from_model`).
-                    // The StreamFn isn't part of LoopConfig — it's
-                    // passed to `run_loop` separately — so we
-                    // can't swap it mid-run without restructuring
-                    // the loop's surface.
-                    //
-                    // Surface a warning so users wiring this hook
-                    // know their swap was ignored. Code-review
-                    // gap #3: lift this when a real consumer
-                    // needs mid-run model swap; the fix is to
-                    // accept a `Fn(Context) -> StreamFn` factory
-                    // instead of a single StreamFn.
+                    // dirge-6js7 plugin review: apply the requested
+                    // thinking level to subsequent turns.
+                    // `config.reasoning` is read per-turn when
+                    // building `StreamOptions` (stream.rs:173) and
+                    // mapped into the provider request, so reassigning
+                    // it here takes effect on the NEXT stream call —
+                    // pi's `prepareNextTurn` thinking-swap semantics
+                    // (agent-loop.ts:229). Previously this value was
+                    // dropped with a "not yet wired" warning, making
+                    // the plugin `harness/set-next-thinking-level`
+                    // slot a silent no-op in the pi-style loop.
+                    if let Some(level) = update.thinking_level {
+                        config.reasoning = Some(level);
+                        tracing::debug!(
+                            target: "dirge::agent_loop",
+                            thinking = ?level,
+                            "prepareNextTurn applied a new thinking_level for the next turn",
+                        );
+                    }
+                    // Mid-run MODEL swap still requires restructuring
+                    // the loop to accept a `Fn(Context) -> StreamFn`
+                    // factory (the StreamFn bakes the CompletionModel
+                    // at construction and isn't part of LoopConfig).
+                    // Tracked separately; warn so a plugin author
+                    // knows the model swap was ignored.
                     if let Some(model) = &update.model {
                         tracing::warn!(
                             target: "dirge::agent_loop",
                             requested_model = %model,
-                            "prepareNextTurn returned a new model but mid-run swap is not yet wired — ignoring",
-                        );
-                    }
-                    if let Some(level) = &update.thinking_level {
-                        tracing::warn!(
-                            target: "dirge::agent_loop",
-                            requested_thinking = ?level,
-                            "prepareNextTurn returned a new thinking_level but mid-run swap is not yet wired — ignoring",
+                            "prepareNextTurn returned a new model but mid-run model swap is not yet wired — ignoring",
                         );
                     }
                 }
@@ -730,10 +1171,44 @@ pub async fn run_loop_with_summarizer(
             }
 
             // Pi line 253: refresh steering for next iteration.
-            pending_messages = match &config.get_steering_messages {
-                Some(get) => get().await,
-                None => Vec::new(),
-            };
+            // Phase 4 part 2: also polls the file-touch tracker.
+            pending_messages = poll_steering_and_reminder(&config).await;
+
+            // dirge-nqr: cap reached → emit a system-visible note,
+            // append a user-facing message into the transcript so the
+            // model's history reflects the truncation, and bail.
+            turns_taken += 1;
+            if let Some(cap) = config.max_turns
+                && turns_taken >= cap
+            {
+                tracing::warn!(
+                    target: "dirge::agent_loop",
+                    turns = turns_taken,
+                    cap = cap,
+                    "max_turns reached — terminating run"
+                );
+                let notice = format!(
+                    "[dirge] Max agent turns ({cap}) reached. Stopping the run. Increase --max-agent-turns or `max_agent_turns` in config.json to allow more."
+                );
+                let _ = emit
+                    .send(LoopEvent::MessageStart {
+                        message: LoopMessage::User(super::message::UserMessage {
+                            content: notice.clone(),
+                        }),
+                    })
+                    .await;
+                let _ = emit
+                    .send(LoopEvent::MessageEnd {
+                        message: LoopMessage::User(super::message::UserMessage {
+                            content: notice.clone(),
+                        }),
+                    })
+                    .await;
+                new_messages.push(LoopMessage::User(super::message::UserMessage {
+                    content: notice,
+                }));
+                break 'outer;
+            }
         }
         // INNER END
 
@@ -755,6 +1230,18 @@ pub async fn run_loop_with_summarizer(
             continue 'outer;
         }
         break;
+    }
+
+    // Phase-1 telemetry (docs/AGENTIC_LOOP_PLAN.md): emit the
+    // per-run repair counter snapshot just before AgentEnd, but
+    // only when at least one repair fired or one input was
+    // invalid. Empty snapshots are skipped so the UI doesn't
+    // print "repaired 0 inputs" on every clean session.
+    {
+        let snapshot = config.repair_stats.snapshot();
+        if !snapshot.is_empty() {
+            let _ = emit.send(LoopEvent::RepairStats { snapshot }).await;
+        }
     }
 
     // Pi line 268: final agent_end.
@@ -806,994 +1293,103 @@ fn tool_result_to_value(t: &ToolResultMessage) -> Value {
     })
 }
 
+/// dirge-ngic: build the merged source the scavenger inspects from
+/// the assistant message's content blocks. Reasonix combines both
+/// reasoning and visible content (`loop.ts:910-913` →
+/// `repair/index.ts:71`); dirge previously merged only Thinking,
+/// losing any DSML invoke that arrived as plain Text (Anthropic
+/// often streams DSML in Text rather than Thinking on cache hit).
+/// Returns the concatenated text with `\n` between blocks.
+pub(crate) fn build_scavenge_source(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Thinking { text } => Some(text.as_str()),
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// dirge-7bwx: walk the tool-call list and apply the truncation
+/// closer to any call whose arguments arrived as a `Value::String`
+/// that fails to parse as JSON. Successful repairs replace the
+/// arguments in-place and record `RepairKind::TruncationFixed` in
+/// stats; hard fallback leaves the original string untouched so
+/// validation downstream surfaces the failure (Reasonix
+/// invariant at `repair/index.ts:93-102`).
+///
+/// Called BEFORE `storm.filter_calls` so two streams whose raw
+/// args differ but repair identically dedupe under storm.
+pub(crate) fn apply_truncation_repair(
+    tool_calls: &mut [crate::agent::agent_loop::ToolCall],
+    repair_stats: &crate::agent::agent_loop::tool_input_repair::RepairStats,
+    truncation_notes: &std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    >,
+) {
+    use crate::agent::agent_loop::tool_input_repair::{RepairKind, repair_truncated_json};
+    for tc in tool_calls.iter_mut() {
+        if let serde_json::Value::String(raw) = &tc.arguments {
+            // Already-valid JSON-as-string: promote to its parsed
+            // form so the storm filter's canonical signature matches
+            // any peer that arrived as a real Object/Array. No
+            // repair stat — nothing was healed. (Dirge-only
+            // compensation; Reasonix args are always strings so it
+            // has no equivalent.)
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                tc.arguments = parsed;
+                continue;
+            }
+            // Truncated / malformed: run the brace-closer.
+            let r = repair_truncated_json(raw);
+            if !r.changed {
+                continue;
+            }
+            // dirge-7bwx review-fix #1: Reasonix bumps
+            // `truncationsFixed` on BOTH success
+            // (`repair/index.ts:105`) AND hard-fallback (`:99`).
+            // Operators care most about the unrecoverable rate —
+            // dropping it from telemetry would hide the cases that
+            // most need attention.
+            repair_stats.record(RepairKind::TruncationFixed);
+            // dirge-7bwx review-fix #2: forward the closer's notes
+            // (Reasonix `repair/index.ts:100-101, :106`). Stored
+            // per call-id; `prepare_tool_call` plucks them and
+            // prepends to the tool result so the model sees what
+            // was repaired.
+            let prefix = if r.fallback {
+                format!("[{}] ⚠️ TRUNCATION UNRECOVERABLE", tc.name)
+            } else {
+                format!("[{}]", tc.name)
+            };
+            let mut sink = truncation_notes.lock().expect("truncation_notes poisoned");
+            let entry = sink.entry(tc.id.clone()).or_default();
+            for n in &r.notes {
+                entry.push(format!("{prefix} {n}"));
+            }
+            drop(sink);
+            // On success only, replace args with the parsed form.
+            // Hard-fallback leaves the raw string so
+            // validate_and_repair surfaces a real validation
+            // error (Reasonix invariant `repair/index.ts:93-102`).
+            if !r.fallback {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&r.repaired) {
+                    tc.arguments = parsed;
+                }
+            }
+        }
+    }
+}
+
 // =====================================================================
 // Tests — ported from pi/test/agent-loop.test.ts
+// Inlined tests were extracted to the sibling `run_tests.rs` file;
+// `#[path = "..."]` pulls it in as the `tests` child module so the
+// `use super::*` references inside continue to resolve.
 // =====================================================================
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent::agent_loop::hooks::{
-        AfterToolCallContext, AfterToolCallFn, GetSteeringMessagesFn, PrepareNextTurnFn,
-        ShouldStopAfterTurnFn,
-    };
-    use crate::agent::agent_loop::message::{StreamEvent, UserMessage};
-    use crate::agent::agent_loop::result::AfterToolCallResult;
-    use crate::agent::agent_loop::stream::StreamFn;
-    use crate::agent::agent_loop::tool::{AbortSignal, LoopTool, LoopToolUpdate};
-    use crate::agent::agent_loop::types::{
-        ConvertToLlmFn, LoopConfig, ToolExecutionMode, TurnUpdate,
-    };
-    use std::pin::Pin;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Build a stream factory that returns canned assistant
-    /// messages in sequence. Mirrors pi's typical test mock —
-    /// `callIndex` increments per invocation; each call returns
-    /// the next canned response.
-    ///
-    /// `responses` is a Vec; index N is returned on the (N+1)th
-    /// call. Past the end → final fallback message with
-    /// stopReason=Stop.
-    fn canned_factory(responses: Vec<AssistantMessage>) -> StreamFn {
-        let counter = std::sync::Arc::new(AtomicUsize::new(0));
-        let responses = std::sync::Arc::new(responses);
-        std::sync::Arc::new(move |_ctx, _opts| {
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let msg = responses.get(n).cloned().unwrap_or_else(|| {
-                AssistantMessage::new(
-                    vec![ContentBlock::Text {
-                        text: "end".to_string(),
-                    }],
-                    StopReason::Stop,
-                )
-            });
-            let reason = msg.stop_reason;
-            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
-                reason,
-                message: msg,
-                usage: None,
-            }]))
-        })
-    }
-
-    fn identity_converter() -> ConvertToLlmFn {
-        std::sync::Arc::new(|messages: &[Value]| {
-            messages
-                .iter()
-                .filter(|m| {
-                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                    matches!(role, "user" | "assistant" | "tool" | "toolResult")
-                })
-                .cloned()
-                .collect()
-        })
-    }
-
-    fn build_config() -> LoopConfig {
-        LoopConfig {
-            convert_to_llm: identity_converter(),
-            transform_context: None,
-            get_api_key: None,
-            api_key: None,
-            tool_execution: ToolExecutionMode::Sequential,
-            before_tool_call: None,
-            after_tool_call: None,
-            prepare_next_turn: None,
-            should_stop_after_turn: None,
-            get_steering_messages: None,
-            get_followup_messages: None,
-            reasoning: None,
-            thinking_budgets: None,
-            headers: std::collections::HashMap::new(),
-            metadata: std::collections::HashMap::new(),
-            request_timeout: None,
-            provider_name: None,
-            model_name: None,
-            compact_model: None,
-            storm_mutating_tools: None,
-            storm_exempt_tools: None,
-        }
-    }
-
-    fn empty_context() -> Context {
-        Context {
-            system_prompt: String::new(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-        }
-    }
-
-    /// LOOP-9 integration: `run_compaction_pass` end-to-end. Feed
-    /// a long conversation, a mock summarizer, and assert that
-    /// (a) the older messages were dropped, (b) a SUMMARY_PREFIX
-    /// system message was inserted at the head, (c) the latest
-    /// user message is still in the tail, and (d) a
-    /// `ContextCompacted` event was emitted with a rotated session id.
-    #[tokio::test]
-    async fn run_compaction_pass_inserts_summary_and_rotates_session() {
-        let mut ctx = empty_context();
-        ctx.system_prompt = "you are an agent".into();
-        // Pad with 25 turns so the compaction window has material.
-        ctx.messages.push(serde_json::json!({
-            "role": "system", "content": "you are an agent"
-        }));
-        ctx.messages.push(serde_json::json!({
-            "role": "user", "content": "initial task: fix the bug"
-        }));
-        for i in 0..20 {
-            let role = if i % 2 == 0 { "assistant" } else { "user" };
-            ctx.messages.push(serde_json::json!({
-                "role": role,
-                "content": format!("turn {i} with some content to fill bytes"),
-            }));
-        }
-        ctx.messages.push(serde_json::json!({
-            "role": "user", "content": "latest user request"
-        }));
-        let n_before = ctx.messages.len();
-
-        // Mock summarizer: returns a valid Hermes-style summary
-        // structure. We assert the prompt was built (non-empty).
-        let prompt_seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let prompt_seen_inner = prompt_seen.clone();
-        let summarize_fn: Option<crate::agent::compression::SummarizeFn> =
-            Some(std::sync::Arc::new(move |prompt: String| {
-                let store = prompt_seen_inner.clone();
-                Box::pin(async move {
-                    *store.lock().unwrap() = prompt;
-                    Ok("## Active Task\nfix the bug\n\n\
-                        ## Goal\nresolve the issue\n\n\
-                        ## Completed Actions\n1. read the file\n\n\
-                        ## Remaining Work\nrun tests"
-                        .to_string())
-                })
-            }));
-
-        let (tx, mut rx) = mpsc::channel::<LoopEvent>(8);
-        super::run_compaction_pass(&mut ctx, &summarize_fn, 5, &tx).await;
-        drop(tx);
-
-        // (a) older messages dropped.
-        assert!(
-            ctx.messages.len() < n_before,
-            "expected compaction to shrink the message list: before={n_before} after={}",
-            ctx.messages.len()
-        );
-
-        // (b) summary system message with SUMMARY_PREFIX is present.
-        let summary_msg = ctx
-            .messages
-            .iter()
-            .find(|m| {
-                m.get("role").and_then(|v| v.as_str()) == Some("system")
-                    && m.get("content")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.contains("CONTEXT COMPACTION"))
-                        .unwrap_or(false)
-            })
-            .expect("compaction summary message should be present");
-        let body = summary_msg["content"].as_str().unwrap();
-        assert!(body.contains("## Active Task"));
-        assert!(body.contains("fix the bug"));
-
-        // (c) latest user message preserved.
-        let last = ctx.messages.last().unwrap();
-        assert_eq!(last["content"].as_str().unwrap(), "latest user request");
-
-        // (d) ContextCompacted event emitted with rotated session id.
-        let mut compacted_event_seen = false;
-        while let Some(ev) = rx.recv().await {
-            if let LoopEvent::ContextCompacted { new_session_id, .. } = ev {
-                assert!(
-                    new_session_id.starts_with("compacted-"),
-                    "session id should rotate via compacted- prefix; got {new_session_id}"
-                );
-                compacted_event_seen = true;
-            }
-        }
-        assert!(compacted_event_seen, "expected ContextCompacted event");
-
-        // Sanity: the summarizer received a Hermes structured prompt
-        // (built via build_summary_prompt).
-        let received = prompt_seen.lock().unwrap().clone();
-        assert!(received.contains("TURNS TO SUMMARIZE"));
-        assert!(received.contains("## Active Task"));
-    }
-
-    /// LOOP-9: when no summarizer is wired, the compaction pass
-    /// still runs the cheap pruning and emits ContextCompacted, but
-    /// does NOT insert a structured summary system message.
-    #[tokio::test]
-    async fn run_compaction_pass_without_summarizer_prunes_only() {
-        let mut ctx = empty_context();
-        // One large tool result that should be pruned.
-        ctx.messages.push(serde_json::json!({
-            "role": "user", "content": "first"
-        }));
-        ctx.messages.push(serde_json::json!({
-            "role": "toolResult", "content": "x".repeat(2000), "toolName": "bash"
-        }));
-        ctx.messages.push(serde_json::json!({
-            "role": "user", "content": "tail"
-        }));
-        ctx.messages.push(serde_json::json!({
-            "role": "assistant", "content": "tail asst"
-        }));
-
-        let (tx, mut rx) = mpsc::channel::<LoopEvent>(4);
-        // Use protect_tail = 2 so the large tool result is eligible
-        // for pruning (it's at index 1, end = 4 - 2 = 2, so index
-        // 1 is in-range).
-        super::run_compaction_pass(&mut ctx, &None, 2, &tx).await;
-        drop(tx);
-
-        // No SUMMARY_PREFIX message inserted.
-        let has_summary = ctx.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.contains("CONTEXT COMPACTION"))
-                .unwrap_or(false)
-        });
-        assert!(!has_summary, "no summary should be inserted without summarize_fn");
-
-        // The large tool result was pruned (replaced with a [bash] marker).
-        let tool_msg = &ctx.messages[1];
-        assert!(tool_msg["content"].as_str().unwrap().contains("[bash]"));
-
-        // ContextCompacted still emitted.
-        let mut compacted_event_seen = false;
-        while let Some(ev) = rx.recv().await {
-            if matches!(ev, LoopEvent::ContextCompacted { .. }) {
-                compacted_event_seen = true;
-            }
-        }
-        assert!(compacted_event_seen);
-    }
-
-    /// Mock echo tool for run-loop tests. Records executed args
-    /// per call so test setups can detect terminate-flag flow.
-    #[derive(Debug)]
-    struct EchoTool {
-        terminate: bool,
-        executed: std::sync::Arc<Mutex<Vec<Value>>>,
-    }
-    impl EchoTool {
-        fn new() -> Self {
-            Self {
-                terminate: false,
-                executed: std::sync::Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-        fn with_terminate(mut self) -> Self {
-            self.terminate = true;
-            self
-        }
-    }
-    impl LoopTool for EchoTool {
-        fn name(&self) -> &str {
-            "echo"
-        }
-        fn description(&self) -> &str {
-            "Echo tool"
-        }
-        fn label(&self) -> &str {
-            "Echo"
-        }
-        fn parameters(&self) -> &Value {
-            static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-            EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
-        }
-        fn execute<'a>(
-            &'a self,
-            _id: &'a str,
-            args: Value,
-            _signal: AbortSignal,
-            _on_update: LoopToolUpdate,
-        ) -> Pin<Box<dyn Future<Output = Result<super::super::LoopToolResult, String>> + Send + 'a>>
-        {
-            let executed = self.executed.clone();
-            let terminate = self.terminate;
-            Box::pin(async move {
-                executed.lock().unwrap().push(args.clone());
-                Ok(super::super::LoopToolResult {
-                    content: vec![serde_json::json!({"type": "text", "text": "ok"})],
-                    details: args,
-                    terminate: if terminate { Some(true) } else { None },
-                })
-            })
-        }
-    }
-
-    fn user(text: &str) -> LoopMessage {
-        LoopMessage::User(UserMessage {
-            content: text.to_string(),
-        })
-    }
-
-    fn text_response(text: &str) -> AssistantMessage {
-        AssistantMessage::new(
-            vec![ContentBlock::Text {
-                text: text.to_string(),
-            }],
-            StopReason::Stop,
-        )
-    }
-
-    fn tool_use_response(id: &str, name: &str, args: Value) -> AssistantMessage {
-        AssistantMessage::new(
-            vec![ContentBlock::ToolCall {
-                id: id.to_string(),
-                name: name.to_string(),
-                arguments: args,
-            }],
-            StopReason::ToolUse,
-        )
-    }
-
-    /// Drain channel into a Vec.
-    async fn drain(rx: &mut mpsc::Receiver<LoopEvent>) -> Vec<LoopEvent> {
-        let mut out = Vec::new();
-        while let Some(e) = rx.recv().await {
-            out.push(e);
-        }
-        out
-    }
-
-    /// Port of pi test "should emit events with AgentMessage types"
-    /// (agent-loop.test.ts:84). Full agent loop run — assistant
-    /// response, no tools.
-    #[tokio::test]
-    async fn test_emits_full_agent_loop_event_sequence() {
-        let factory = canned_factory(vec![text_response("Hi there!")]);
-        let (tx, mut rx) = mpsc::channel::<LoopEvent>(64);
-        let messages = run_agent_loop(
-            vec![user("Hello")],
-            empty_context(),
-            build_config(),
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-        drop(tx);
-
-        let kinds: Vec<_> = drain(&mut rx).await.iter().map(|e| e.kind()).collect();
-        // Must contain all pi-required events.
-        for required in [
-            "agent_start",
-            "turn_start",
-            "message_start",
-            "message_end",
-            "turn_end",
-            "agent_end",
-        ] {
-            assert!(kinds.contains(&required), "missing {required}: {kinds:?}");
-        }
-        // Return value: user + assistant message.
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role(), "user");
-        assert_eq!(messages[1].role(), "assistant");
-    }
-
-    /// Port of pi test "should handle tool calls and results"
-    /// (agent-loop.test.ts:239). Full-loop scope: assistant emits
-    /// tool call → loop dispatches → next assistant emits final
-    /// text.
-    #[tokio::test]
-    async fn test_full_loop_with_tool_then_final_text() {
-        let echo = std::sync::Arc::new(EchoTool::new());
-        let mut ctx = empty_context();
-        ctx.tools.push(echo.clone());
-
-        let factory = canned_factory(vec![
-            tool_use_response("call-1", "echo", serde_json::json!({"v": 1})),
-            text_response("done"),
-        ]);
-
-        let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
-        let messages = run_agent_loop(
-            vec![user("echo")],
-            ctx,
-            build_config(),
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-        drop(tx);
-
-        // Tool actually executed.
-        assert_eq!(echo.executed.lock().unwrap().len(), 1);
-
-        // Roles: user, assistant (tool use), toolResult, assistant (text).
-        let roles: Vec<_> = messages.iter().map(|m| m.role()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "toolResult", "assistant"]);
-
-        // Stream of events should contain tool_execution_start +
-        // tool_execution_end.
-        let kinds: Vec<_> = drain(&mut rx).await.iter().map(|e| e.kind()).collect();
-        assert!(kinds.contains(&"tool_execution_start"));
-        assert!(kinds.contains(&"tool_execution_end"));
-    }
-
-    /// Port of pi test "should use prepareNextTurn snapshot before
-    /// continuing" (agent-loop.test.ts:897). The hook returns a
-    /// snapshot mutating `context`; subsequent turn observes the
-    /// mutation.
-    #[tokio::test]
-    async fn test_prepare_next_turn_snapshot_applied() {
-        let echo = std::sync::Arc::new(EchoTool::new());
-        let mut ctx = empty_context();
-        ctx.system_prompt = "first prompt".to_string();
-        ctx.tools.push(echo.clone());
-
-        // Track the system_prompt seen at each LLM call.
-        let observed_prompts = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
-        let observed_clone = observed_prompts.clone();
-        let counter = std::sync::Arc::new(AtomicUsize::new(0));
-        let factory: StreamFn = std::sync::Arc::new(move |llm_ctx, _opts| {
-            observed_clone.lock().unwrap().push(llm_ctx.system_prompt);
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let msg = if n == 0 {
-                tool_use_response("call-1", "echo", serde_json::json!({"v": 1}))
-            } else {
-                text_response("done")
-            };
-            let reason = msg.stop_reason;
-            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
-                reason,
-                message: msg,
-                usage: None,
-            }]))
-        });
-
-        // Hook fires once: returns a new context with a different
-        // system prompt.
-        let fired = std::sync::Arc::new(AtomicUsize::new(0));
-        let fired_clone = fired.clone();
-        let hook: PrepareNextTurnFn = std::sync::Arc::new(move |ctx| {
-            let fired = fired_clone.clone();
-            Box::pin(async move {
-                if fired.fetch_add(1, Ordering::SeqCst) > 0 {
-                    return None; // only on the first invocation
-                }
-                Some(TurnUpdate {
-                    context: Some(Context {
-                        system_prompt: "second prompt".to_string(),
-                        messages: ctx.context.messages.clone(),
-                        tools: ctx.context.tools.clone(),
-                    }),
-                    ..Default::default()
-                })
-            })
-        });
-
-        let mut config = build_config();
-        config.prepare_next_turn = Some(hook);
-
-        let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
-        let _ = run_agent_loop(
-            vec![user("echo something")],
-            ctx,
-            config,
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-
-        let observed = observed_prompts.lock().unwrap().clone();
-        assert_eq!(observed.len(), 2, "expected 2 LLM calls");
-        assert_eq!(observed[0], "first prompt");
-        assert_eq!(
-            observed[1], "second prompt",
-            "second LLM call should see the mutated context"
-        );
-    }
-
-    /// Port of pi test "should stop after the current turn when
-    /// shouldStopAfterTurn returns true" (agent-loop.test.ts:970).
-    #[tokio::test]
-    async fn test_should_stop_after_turn_stops_loop() {
-        let factory = canned_factory(vec![
-            text_response("turn one"),
-            // Second response should NEVER be requested — hook
-            // stops the loop after turn one.
-            text_response("should not appear"),
-        ]);
-
-        let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let llm_calls_clone = llm_calls.clone();
-        // Wrap factory to count invocations.
-        let factory_counted: StreamFn = std::sync::Arc::new(move |ctx, opts| {
-            llm_calls_clone.fetch_add(1, Ordering::SeqCst);
-            factory(ctx, opts)
-        });
-
-        let hook: ShouldStopAfterTurnFn = std::sync::Arc::new(|_ctx| Box::pin(async move { true }));
-
-        let mut config = build_config();
-        config.should_stop_after_turn = Some(hook);
-
-        let (tx, mut rx) = mpsc::channel::<LoopEvent>(64);
-        let messages = run_agent_loop(
-            vec![user("hi")],
-            empty_context(),
-            config,
-            AbortSignal::new(),
-            &tx,
-            &factory_counted,
-        )
-        .await;
-        drop(tx);
-
-        // Only one LLM call.
-        assert_eq!(llm_calls.load(Ordering::SeqCst), 1);
-        // Messages: user + one assistant.
-        assert_eq!(messages.len(), 2);
-        // Loop emitted agent_end.
-        let kinds: Vec<_> = drain(&mut rx).await.iter().map(|e| e.kind()).collect();
-        assert!(kinds.contains(&"agent_end"));
-    }
-
-    /// Port of pi test "should stop after a tool batch when every
-    /// tool result sets terminate=true" (agent-loop.test.ts:1067).
-    /// LOOP-LEVEL: only one LLM call (the tool dispatch terminates).
-    #[tokio::test]
-    async fn test_terminate_stops_loop_after_tool_batch() {
-        let echo = std::sync::Arc::new(EchoTool::new().with_terminate());
-        let mut ctx = empty_context();
-        ctx.tools.push(echo);
-
-        let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let llm_calls_clone = llm_calls.clone();
-        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
-            llm_calls_clone.fetch_add(1, Ordering::SeqCst);
-            let msg = tool_use_response("call-1", "echo", serde_json::json!({"v": 1}));
-            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
-                reason: StopReason::ToolUse,
-                message: msg,
-                usage: None,
-            }]))
-        });
-
-        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
-        let messages = run_agent_loop(
-            vec![user("echo")],
-            ctx,
-            build_config(),
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-
-        assert_eq!(llm_calls.load(Ordering::SeqCst), 1, "no second LLM call");
-        // user + assistant(tool use) + toolResult — no second
-        // assistant text turn.
-        let roles: Vec<_> = messages.iter().map(|m| m.role()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "toolResult"]);
-    }
-
-    /// Port of pi test "should allow afterToolCall to mark a tool
-    /// batch as terminating" (agent-loop.test.ts:1184). LOOP-LEVEL.
-    #[tokio::test]
-    async fn test_after_tool_call_terminate_stops_loop() {
-        let echo = std::sync::Arc::new(EchoTool::new());
-        let mut ctx = empty_context();
-        ctx.tools.push(echo);
-
-        let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let llm_calls_clone = llm_calls.clone();
-        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
-            llm_calls_clone.fetch_add(1, Ordering::SeqCst);
-            let msg = tool_use_response("call-1", "echo", serde_json::json!({"v": 1}));
-            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
-                reason: StopReason::ToolUse,
-                message: msg,
-                usage: None,
-            }]))
-        });
-
-        let after: AfterToolCallFn = std::sync::Arc::new(|_ctx: AfterToolCallContext| {
-            Box::pin(async move {
-                Some(AfterToolCallResult {
-                    content: None,
-                    details: None,
-                    is_error: None,
-                    terminate: Some(true),
-                })
-            })
-        });
-        let mut config = build_config();
-        config.after_tool_call = Some(after);
-
-        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
-        let _ = run_agent_loop(
-            vec![user("echo")],
-            ctx,
-            config,
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-
-        assert_eq!(llm_calls.load(Ordering::SeqCst), 1, "no second LLM call");
-    }
-
-    /// Port of pi test "should continue after parallel tool calls
-    /// when not all tool results terminate" (agent-loop.test.ts:1119).
-    /// LOOP-LEVEL: two LLM calls.
-    #[tokio::test]
-    async fn test_continue_when_not_all_terminate() {
-        let echo = std::sync::Arc::new(EchoTool::new());
-        let mut ctx = empty_context();
-        ctx.tools.push(echo);
-
-        let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let llm_calls_clone = llm_calls.clone();
-        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
-            let n = llm_calls_clone.fetch_add(1, Ordering::SeqCst);
-            let msg = if n == 0 {
-                tool_use_response("call-1", "echo", serde_json::json!({"v": 1}))
-            } else {
-                text_response("done")
-            };
-            let reason = msg.stop_reason;
-            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
-                reason,
-                message: msg,
-                usage: None,
-            }]))
-        });
-
-        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
-        let _ = run_agent_loop(
-            vec![user("echo")],
-            ctx,
-            build_config(),
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-
-        assert_eq!(
-            llm_calls.load(Ordering::SeqCst),
-            2,
-            "two LLM calls expected"
-        );
-    }
-
-    /// Port of pi test "should inject queued messages after all
-    /// tool calls complete" (agent-loop.test.ts:547).
-    ///
-    /// Setup: assistant emits a tool call. After tool dispatch
-    /// the loop polls `getSteeringMessages` which returns a user
-    /// message ONCE. That message is injected before the next
-    /// assistant call; the second LLM call sees it in its context.
-    #[tokio::test]
-    async fn test_steering_messages_injected_after_tool_calls() {
-        let echo = std::sync::Arc::new(EchoTool::new());
-        let mut ctx = empty_context();
-        ctx.tools.push(echo);
-
-        // Steering hook delivers once on the SECOND call (so
-        // not on initial poll).
-        let poll_count = std::sync::Arc::new(AtomicUsize::new(0));
-        let poll_clone = poll_count.clone();
-        let steering: GetSteeringMessagesFn = std::sync::Arc::new(move || {
-            let poll = poll_clone.clone();
-            Box::pin(async move {
-                let n = poll.fetch_add(1, Ordering::SeqCst);
-                if n == 1 {
-                    vec![user("interrupt")]
-                } else {
-                    Vec::new()
-                }
-            })
-        });
-
-        // Inspector: record what each LLM call sees in its
-        // converted message list.
-        let saw_interrupt_on_second = std::sync::Arc::new(std::sync::Mutex::new(false));
-        let saw_clone = saw_interrupt_on_second.clone();
-        let call_counter = std::sync::Arc::new(AtomicUsize::new(0));
-
-        let factory: StreamFn = std::sync::Arc::new(move |llm_ctx, _opts| {
-            let n = call_counter.fetch_add(1, Ordering::SeqCst);
-            if n == 1 {
-                // Second call: check for "interrupt" in messages.
-                let found = llm_ctx.messages.iter().any(|m| {
-                    m.get("role").and_then(|r| r.as_str()) == Some("user")
-                        && m.get("content")
-                            .and_then(|c| c.as_str())
-                            .map(|s| s.contains("interrupt"))
-                            == Some(true)
-                });
-                *saw_clone.lock().unwrap() = found;
-            }
-            let msg = if n == 0 {
-                tool_use_response("call-1", "echo", serde_json::json!({"v": 1}))
-            } else {
-                text_response("done")
-            };
-            let reason = msg.stop_reason;
-            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
-                reason,
-                message: msg,
-                usage: None,
-            }]))
-        });
-
-        let mut config = build_config();
-        config.get_steering_messages = Some(steering);
-
-        let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
-        let messages = run_agent_loop(
-            vec![user("start")],
-            ctx,
-            config,
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-        drop(tx);
-
-        assert!(
-            *saw_interrupt_on_second.lock().unwrap(),
-            "second LLM call should see the injected interrupt"
-        );
-
-        // Returned messages include the injected interrupt.
-        let user_contents: Vec<String> = messages
-            .iter()
-            .filter_map(|m| match m {
-                LoopMessage::User(u) => Some(u.content.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(user_contents, vec!["start", "interrupt"]);
-
-        // The interrupt's message_start fires AFTER the tool
-        // result's message_end. We verify by event ordering.
-        let events = drain(&mut rx).await;
-        let interrupt_idx = events.iter().position(|e| match e {
-            LoopEvent::MessageStart {
-                message: LoopMessage::User(u),
-            } => u.content == "interrupt",
-            _ => false,
-        });
-        let last_tool_result_end_idx = events.iter().rposition(|e| {
-            matches!(
-                e,
-                LoopEvent::MessageEnd {
-                    message: LoopMessage::ToolResult(_)
-                }
-            )
-        });
-        assert!(
-            interrupt_idx.unwrap() > last_tool_result_end_idx.unwrap(),
-            "interrupt should appear AFTER the tool result message_end"
-        );
-    }
-
-    // ============================================================
-    // Phase 6 — regression tests for hardening paths
-    // ============================================================
-
-    use crate::agent::agent_loop::result::LoopToolResult as PhaseSixToolResult;
-    use std::sync::Arc as PhaseSixArc;
-
-    /// Phase 6: a multi-turn run with a network error in turn 2
-    /// preserves the FULL history (user prompt, turn 1's
-    /// assistant + tool-result) across the retry. The retry
-    /// wrapper isn't directly invoked here (we use mock
-    /// StreamFn), but the LOOP's context.messages survival
-    /// across turn errors is the invariant.
-    ///
-    /// We verify by counting context.messages entries the
-    /// second LLM call observes. The mock StreamFn captures
-    /// what each call sees.
-    #[tokio::test]
-    async fn loop_preserves_history_across_turns() {
-        use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let observed_lens: PhaseSixArc<Mutex<Vec<usize>>> =
-            PhaseSixArc::new(Mutex::new(Vec::new()));
-        let observed_clone = observed_lens.clone();
-        let counter = std::sync::Arc::new(AtomicUsize::new(0));
-
-        // Inline echo tool — needed for the tool-result turn
-        // that grows the history.
-        #[derive(Debug)]
-        struct LocalEcho;
-        impl LoopTool for LocalEcho {
-            fn name(&self) -> &str {
-                "echo"
-            }
-            fn description(&self) -> &str {
-                "Echo"
-            }
-            fn label(&self) -> &str {
-                "Echo"
-            }
-            fn parameters(&self) -> &Value {
-                static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-                EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
-            }
-            fn execute<'a>(
-                &'a self,
-                _id: &'a str,
-                _args: Value,
-                _signal: AbortSignal,
-                _on_update: super::super::tool::LoopToolUpdate,
-            ) -> Pin<Box<dyn Future<Output = Result<PhaseSixToolResult, String>> + Send + 'a>>
-            {
-                Box::pin(async move {
-                    Ok(PhaseSixToolResult {
-                        content: vec![serde_json::json!({
-                            "type": "text",
-                            "text": "ok",
-                        })],
-                        details: Value::Null,
-                        terminate: None,
-                    })
-                })
-            }
-        }
-
-        let factory: StreamFn = std::sync::Arc::new(move |ctx: LlmContext, _opts| {
-            observed_clone.lock().unwrap().push(ctx.messages.len());
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let msg = if n == 0 {
-                tool_use_response("call-1", "echo", serde_json::json!({}))
-            } else {
-                text_response("done")
-            };
-            let reason = msg.stop_reason;
-            Box::pin(futures::stream::iter(vec![
-                crate::agent::agent_loop::message::StreamEvent::Done {
-                    reason,
-                    message: msg,
-                    usage: None,
-                },
-            ]))
-        });
-
-        let mut ctx = empty_context();
-        ctx.tools.push(PhaseSixArc::new(LocalEcho));
-        let mut cfg = build_config();
-        cfg.tool_execution = ToolExecutionMode::Sequential;
-
-        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
-        let _ = run_agent_loop(
-            vec![user("start")],
-            ctx,
-            cfg,
-            AbortSignal::new(),
-            &tx,
-            &factory,
-        )
-        .await;
-
-        let lens = observed_lens.lock().unwrap().clone();
-        assert_eq!(lens.len(), 2, "expected two LLM calls");
-        // First call sees: just user prompt → 1 message.
-        assert_eq!(lens[0], 1);
-        // Second call sees: user prompt + assistant (tool_use) +
-        // tool result → 3 messages. History preserved.
-        assert_eq!(
-            lens[1], 3,
-            "second LLM call should see prior turn's history; got {} messages",
-            lens[1],
-        );
-    }
-
-    /// Phase 6: full signal-chain regression. Cancel the signal
-    /// mid-tool; tool aborts; loop's next LLM call's stream
-    /// observes the same signal and exits via Error path; loop
-    /// exits cleanly with no infinite-loop or hung tools.
-    #[tokio::test]
-    async fn full_signal_chain_exits_cleanly() {
-        use crate::agent::agent_loop::stream::{LlmContext, StreamFn};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        // Mock tool that observes the signal during execution
-        // (immediate cancel since the test cancels signal right
-        // after spawn).
-        #[derive(Debug)]
-        struct CancellableTool;
-        impl LoopTool for CancellableTool {
-            fn name(&self) -> &str {
-                "noop"
-            }
-            fn description(&self) -> &str {
-                "Cancellable"
-            }
-            fn label(&self) -> &str {
-                "Noop"
-            }
-            fn parameters(&self) -> &Value {
-                static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-                EMPTY.get_or_init(|| serde_json::json!({"type": "object"}))
-            }
-            fn execute<'a>(
-                &'a self,
-                _id: &'a str,
-                _args: Value,
-                _signal: AbortSignal,
-                _on_update: super::super::tool::LoopToolUpdate,
-            ) -> Pin<Box<dyn Future<Output = Result<PhaseSixToolResult, String>> + Send + 'a>>
-            {
-                Box::pin(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    Ok(PhaseSixToolResult {
-                        content: Vec::new(),
-                        details: Value::Null,
-                        terminate: None,
-                    })
-                })
-            }
-        }
-
-        // Factory that returns a tool_use response first,
-        // then would return a text response on retry (but
-        // shouldn't get there because signal is cancelled
-        // before turn 2).
-        let counter = std::sync::Arc::new(AtomicUsize::new(0));
-        let factory: StreamFn = std::sync::Arc::new(move |_ctx: LlmContext, _opts| {
-            let n = counter.fetch_add(1, Ordering::SeqCst);
-            let msg = if n == 0 {
-                tool_use_response("call-1", "noop", serde_json::json!({}))
-            } else {
-                text_response("should-not-reach")
-            };
-            let reason = msg.stop_reason;
-            Box::pin(futures::stream::iter(vec![
-                crate::agent::agent_loop::message::StreamEvent::Done {
-                    reason,
-                    message: msg,
-                    usage: None,
-                },
-            ]))
-        });
-
-        let mut ctx = empty_context();
-        ctx.tools.push(PhaseSixArc::new(CancellableTool));
-        let mut cfg = build_config();
-        cfg.tool_execution = ToolExecutionMode::Sequential;
-
-        let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
-        let signal = AbortSignal::new();
-        let signal_clone = signal.clone();
-
-        // Spawn the loop in a task; cancel signal after a small
-        // yield so the tool has started.
-        let task = tokio::spawn(async move {
-            run_agent_loop(vec![user("start")], ctx, cfg, signal_clone, &tx, &factory).await
-        });
-        // Yield twice so the loop reaches the tool dispatch
-        // before we cancel.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        signal.cancel();
-
-        // Bound the test: loop must complete in <2s. Without
-        // the tool-abort wrap, the 30s blocking tool would
-        // exceed this. R3 ensures the next LLM call (if any)
-        // also exits promptly via its pre-poll signal check.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-        assert!(
-            result.is_ok(),
-            "loop should exit within 2s after signal cancel"
-        );
-    }
-}
+#[path = "run_tests.rs"]
+mod tests;

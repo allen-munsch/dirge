@@ -22,6 +22,7 @@
 #![allow(unused_imports)]
 
 pub mod bridge;
+pub mod context_depth;
 pub mod context_manager;
 #[cfg(test)]
 mod h7_smoke;
@@ -29,9 +30,13 @@ pub mod heal;
 pub mod hooks;
 pub mod inflight;
 pub mod integration;
+#[cfg(test)]
+mod integration_tests;
 pub mod message;
 #[cfg(feature = "plugin")]
 pub mod plugin_hooks;
+#[cfg(all(test, feature = "plugin"))]
+mod plugin_hooks_tests;
 pub mod result;
 pub mod retry;
 pub mod rig_stream;
@@ -59,8 +64,8 @@ pub use integration::{
     rig_history_to_loop_messages, rig_message_to_loop_messages, spawn_loop_runner,
 };
 pub use message::{
-    AssistantMessage, ContentBlock, DeltaPhase, LoopEvent, LoopMessage, StopReason, StreamEvent,
-    TokenUsage, ToolResultMessage, UserMessage,
+    AssistantMessage, ContentBlock, DeltaPhase, EscalationReason, LoopEvent, LoopMessage,
+    StopReason, StreamEvent, TokenUsage, ToolResultMessage, UserMessage,
 };
 #[cfg(feature = "plugin")]
 pub use plugin_hooks::{after_hook_from_plugin_manager, before_hook_from_plugin_manager};
@@ -71,7 +76,8 @@ pub use rig_stream::{wrap_rig_stream, wrap_streamed_assistant};
 pub use rig_stream_factory::rig_stream_fn_from_model;
 pub use rig_stream_factory::{
     build_provider_additional_params, loop_tool_to_rig_definition,
-    rig_stream_fn_from_model_with_provider, value_to_rig_message,
+    rig_stream_fn_from_model_with_filter, rig_stream_fn_from_model_with_provider,
+    value_to_rig_message,
 };
 pub use rig_tool::RigToolAdapter;
 pub use run::{run_agent_loop, run_loop};

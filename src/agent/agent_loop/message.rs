@@ -374,6 +374,13 @@ pub enum LoopEvent {
         /// `Session::compress_reporting` so it knows which middle
         /// turns were folded.
         first_kept_index: usize,
+        /// Pruning-only vs prune+summary vs prune+failed-summary
+        /// (IMPROVEMENTS_PLAN #5). Bridged to the AgentEvent so the UI
+        /// / telemetry can distinguish — and flag a failing summarizer.
+        compaction_kind: crate::event::CompactionKind,
+        /// Summary model name, if known (`None` today — the summarizer
+        /// closure doesn't expose it; threading it is a follow-up).
+        summary_model: Option<String>,
     },
 
     /// PROV-2: the retry layer is about to re-attempt the stream.
@@ -385,6 +392,63 @@ pub enum LoopEvent {
         delay_ms: u64,
         error: String,
     },
+
+    /// Phase-1 telemetry (docs/AGENTIC_LOOP_PLAN.md): per-run
+    /// aggregate of the input-repair counters, emitted just
+    /// before `AgentEnd`. The UI prints a one-line summary when
+    /// `!snapshot.is_empty()` so users see at session close
+    /// "repaired 3 inputs (1 md-link, 2 null-strip), 0 invalid".
+    /// Empty snapshots are not emitted — the run-finish path
+    /// only sends this when at least one repair fired.
+    RepairStats {
+        snapshot: super::tool_input_repair::RepairStatsSnapshot,
+    },
+
+    /// Phase 4 part 1: dual-client escalation has been activated for
+    /// the next LLM call. Emitted just before the swap fires, so the
+    /// UI can surface the change-of-model to the user (avoids
+    /// surprise token spend per `docs/AGENTIC_LOOP_PLAN.md` §"Risk").
+    EscalationActivated {
+        /// Provider alias the escalation routes to (e.g.
+        /// `"anthropic"`, `"deepseek-pro"`). Empty string is
+        /// permitted but the UI will surface a generic label.
+        provider: String,
+        /// What triggered the escalation. Carried so the UI / log
+        /// can show the cause inline with the activation.
+        reason: EscalationReason,
+    },
+}
+
+/// Phase 4 part 1: cause of an escalation. Surfaced in the
+/// `LoopEvent::EscalationActivated` event and forwarded into the UI
+/// so the user sees WHY the escalation fired without having to
+/// cross-reference tracing logs.
+#[derive(Debug, Clone)]
+pub enum EscalationReason {
+    /// Tool-input repair attempted every available kind and the
+    /// final args still failed schema validation. Carries the
+    /// tool name for the UI / log.
+    RepairExhausted { tool: String },
+    /// Tree-sitter syntactic validation rejected the model's
+    /// generated code in a `write` / `edit` / `apply_patch` tool
+    /// call. Carries the tool name and the path the failure
+    /// targeted.
+    SyntacticFailure { tool: String, path: String },
+}
+
+impl EscalationReason {
+    /// One-line human-readable summary for the UI. Kept compact so
+    /// it fits on a status line.
+    pub fn summary(&self) -> String {
+        match self {
+            EscalationReason::RepairExhausted { tool } => {
+                format!("repair exhausted for {tool}")
+            }
+            EscalationReason::SyntacticFailure { tool, path } => {
+                format!("syntax check failed in {tool} ({path})")
+            }
+        }
+    }
 }
 
 impl LoopEvent {
@@ -406,6 +470,8 @@ impl LoopEvent {
             LoopEvent::TurnEnd { .. } => "turn_end",
             LoopEvent::ContextCompacted { .. } => "context_compacted",
             LoopEvent::RetryNotice { .. } => "retry_notice",
+            LoopEvent::RepairStats { .. } => "repair_stats",
+            LoopEvent::EscalationActivated { .. } => "escalation_activated",
         }
     }
 }

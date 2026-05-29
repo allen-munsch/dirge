@@ -72,8 +72,8 @@ impl SymbolIndex {
         {
             let cache = self.cache_lock();
             if let Some(entry) = cache.get(&canonical) {
-                let mtime_unchanged = mtime.map_or(false, |mt| mt == entry.mtime);
-                let size_unchanged = size.map_or(false, |sz| sz == entry.size);
+                let mtime_unchanged = mtime == Some(entry.mtime);
+                let size_unchanged = size == Some(entry.size);
                 let head_unchanged = head_hash == entry.head_hash;
                 if mtime_unchanged && size_unchanged && head_unchanged {
                     return Ok(entry.clone());
@@ -163,10 +163,10 @@ impl SymbolIndex {
 
             if let Some(pattern) = include {
                 let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if let Ok(re) = regex::Regex::new(pattern) {
-                    if !re.is_match(fname) {
-                        continue;
-                    }
+                if let Ok(re) = regex::Regex::new(pattern)
+                    && !re.is_match(fname)
+                {
+                    continue;
                 }
             }
 
@@ -231,11 +231,8 @@ impl SymbolIndex {
         // a method or function-shape callable, prepare a call-site
         // refinement regex that looks like `(.|::)?name\s*\(` —
         // common across all supported languages.
-        let call_site_re = regex::Regex::new(&format!(
-            r"(?:[.:]|::)?\b{}\b\s*\(",
-            regex::escape(name)
-        ))
-        .ok();
+        let call_site_re =
+            regex::Regex::new(&format!(r"(?:[.:]|::)?\b{}\b\s*\(", regex::escape(name))).ok();
         let target_is_callable = {
             let cache = self.cache_lock();
             let mut callable_count = 0usize;
@@ -331,7 +328,7 @@ impl SymbolIndex {
                     let is_definition = entry.symbols.iter().any(|s| {
                         s.name == name
                             && s.range.start_line <= line_num + 1
-                            && s.range.end_line >= line_num + 1
+                            && s.range.end_line > line_num
                     });
                     if is_definition {
                         continue;
@@ -448,7 +445,7 @@ impl SymbolIndex {
             let symbols: Vec<Symbol> = entry
                 .symbols
                 .iter()
-                .filter(|s| kind_filter.map_or(true, |k| s.kind == k))
+                .filter(|s| kind_filter.is_none_or(|k| s.kind == k))
                 .cloned()
                 .collect();
             result.push((entry.file_path.clone(), symbols));
@@ -468,7 +465,7 @@ impl SymbolIndex {
                 let symbols: Vec<Symbol> = entry
                     .symbols
                     .iter()
-                    .filter(|s| kind_filter.map_or(true, |k| s.kind == k))
+                    .filter(|s| kind_filter.is_none_or(|k| s.kind == k))
                     .cloned()
                     .collect();
                 if !symbols.is_empty() {

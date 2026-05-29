@@ -1,5 +1,15 @@
 use crate::permission::checker::{CheckResult, PermissionChecker};
-use crate::permission::{Action, PermissionConfig, SecurityMode, ToolPerm};
+use crate::permission::{Action, OpSpec, PermissionConfig, RuleConfig, SecurityMode};
+
+/// Concise config-rule constructor for tests.
+fn rule(op: OpSpec, m: &str, effect: Action) -> RuleConfig {
+    RuleConfig {
+        op,
+        pattern: m.to_string(),
+        effect,
+        tool: None,
+    }
+}
 
 fn make_checker(mode: SecurityMode) -> PermissionChecker {
     PermissionChecker::new(
@@ -39,7 +49,7 @@ fn standard_asks_unknown_tool_with_default() {
 #[test]
 fn accept_auto_allows_inside_working_dir() {
     let config = PermissionConfig {
-        write: Some(ToolPerm::Simple(Action::Ask)),
+        rules: vec![rule(OpSpec::Edit, "**", Action::Ask)],
         ..PermissionConfig::default()
     };
     let mut checker = PermissionChecker::new(
@@ -119,19 +129,33 @@ fn doom_loop_deny_names_the_call() {
         SecurityMode::Standard,
         Some(std::path::PathBuf::from("/tmp")),
     );
-    // Three identical calls fires the doom-loop deny.
-    checker.check("bash", "echo hi");
-    checker.check("bash", "echo hi");
-    let result = checker.check("bash", "echo hi");
+    // Loop guard: an Ask op (echo hi isn't a default-allowed bash
+    // command) retried past the threshold (3) is hard-denied on the
+    // 4th identical prompted call. (The new guard never gates an
+    // ALLOWED op and always hard-denies a true retry loop, regardless
+    // of the legacy `doom_loop` action.)
+    assert!(matches!(
+        checker.check("bash", "frobnicate xyz"),
+        CheckResult::Ask
+    ));
+    assert!(matches!(
+        checker.check("bash", "frobnicate xyz"),
+        CheckResult::Ask
+    ));
+    assert!(matches!(
+        checker.check("bash", "frobnicate xyz"),
+        CheckResult::Ask
+    ));
+    let result = checker.check("bash", "frobnicate xyz");
     match result {
         CheckResult::Denied(msg) => {
             assert!(msg.contains("Doom loop"), "must say Doom loop: {msg}");
             assert!(
-                msg.contains("bash") && msg.contains("echo hi"),
+                msg.contains("bash") && msg.contains("frobnicate"),
                 "must name tool + call preview: {msg}",
             );
         }
-        other => panic!("expected Denied; got {other:?}"),
+        other => panic!("expected Denied on the 4th identical Ask; got {other:?}"),
     }
 }
 
@@ -241,7 +265,7 @@ fn relative_path_escaping_cwd_is_external() {
     // semantics apply: in-tree write is Ask→Allow under Accept,
     // external write is Ask (no ext_dir rule installed).
     let config = PermissionConfig {
-        write: Some(ToolPerm::Simple(Action::Ask)),
+        rules: vec![rule(OpSpec::Edit, "**", Action::Ask)],
         ..PermissionConfig::default()
     };
     let mut checker = PermissionChecker::new(&config, SecurityMode::Accept, Some(cwd.clone()));
@@ -353,18 +377,76 @@ fn session_allowlist_takes_effect_for_path_tool_on_next_check() {
     );
 }
 
+/// Re-prompt bug: when the user "allow always"es a path tool while the
+/// LLM sent a RELATIVE path, `suggest_pattern` stores a relative glob
+/// (e.g. `sub/**`). The next check_path always matches against the
+/// canonical ABSOLUTE form (via resolve_absolute), so the relative
+/// pattern never matched and the user got re-prompted. The fix anchors
+/// the canonical-variant twin at the checker's working_dir.
+#[test]
+fn session_allowlist_relative_pattern_matches_absolute_check_inside_cwd() {
+    // Real on-disk working dir so resolve_absolute / canonicalize work.
+    let proj = std::env::temp_dir().join(format!(
+        "dirge-relpat-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let sub = proj.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        // Restrictive so the in-cwd write isn't auto-allowed by the
+        // CWD-scoped builtin rule — forces the test through the
+        // session-allowlist path we actually care about.
+        SecurityMode::Restrictive,
+        Some(proj.clone()),
+    );
+    checker.set_working_dir(proj.to_str().unwrap());
+
+    // Simulate "allow always" with the RELATIVE pattern that
+    // suggest_pattern("write", "sub/file.rs") would produce.
+    checker.add_session_allowlist("write".to_string(), "sub/**");
+
+    // Subsequent call arrives as an ABSOLUTE path to a DIFFERENT file
+    // in the same subtree (the realistic LLM behavior). Must be allowed
+    // without re-prompting.
+    let abs = sub.join("other.rs");
+    let result = checker.check_path("write", abs.to_str().unwrap());
+    assert!(
+        matches!(result, CheckResult::Allowed),
+        "absolute write to {abs:?} must be Allowed after relative `sub/**` allow-always; got {result:?}",
+    );
+
+    // Security boundary: a path OUTSIDE the working directory entirely
+    // must still prompt — anchoring the relative `sub/**` pattern at
+    // working_dir must not over-allow arbitrary absolute paths.
+    let outside = if cfg!(windows) {
+        "C:\\Windows\\Temp\\sub\\evil.txt".to_string()
+    } else {
+        "/tmp/sub/evil.txt".to_string()
+    };
+    let outside_result = checker.check_path("write", &outside);
+    assert!(
+        matches!(outside_result, CheckResult::Ask),
+        "write outside the working dir must still Ask; the relative `sub/**` allow must anchor at cwd, not match any `/.../sub/*`; got {outside_result:?}",
+    );
+
+    let _ = std::fs::remove_dir_all(&proj);
+}
+
 // --- Config-driven rules ---
 
 #[test]
 fn explicit_granular_rules_take_effect() {
     let config = PermissionConfig {
-        read: Some(ToolPerm::Granular(
-            [
-                ("*.md".to_string(), Action::Allow),
-                ("*.rs".to_string(), Action::Ask),
-            ]
-            .into(),
-        )),
+        rules: vec![
+            rule(OpSpec::Read, "*.md", Action::Allow),
+            rule(OpSpec::Read, "*.rs", Action::Ask),
+        ],
         ..PermissionConfig::default()
     };
     let mut checker = PermissionChecker::new(&config, SecurityMode::Standard, None);

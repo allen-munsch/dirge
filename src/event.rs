@@ -26,6 +26,28 @@ pub enum ToolContent {
     File,
 }
 
+/// What a compaction pass actually did, so consumers (UI / telemetry)
+/// can distinguish a cheap pruning-only pass from a real summary — and,
+/// crucially, surface when the LLM summarizer is *failing*
+/// (IMPROVEMENTS_PLAN #5). A spike in `PruneAndFailedSummary` is an
+/// early warning that the summarizer is broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionKind {
+    /// Pruning only — no LLM summarizer ran (none wired, circuit breaker
+    /// open, or the middle was empty).
+    PruneOnly,
+    /// Pruning + a successful LLM/plugin summary.
+    PruneAndSummary,
+    /// Pruning + a failed summary (error or invalid) — fell back to the
+    /// pruned context.
+    PruneAndFailedSummary,
+    /// Pruning only because the summarizer circuit breaker is OPEN (it
+    /// failed too many times this run). Distinct from `PruneOnly` so the
+    /// ongoing-failure signal stays visible after the breaker latches
+    /// rather than masquerading as a healthy no-summarizer deployment.
+    PruneSummarizerDisabled,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Token(CompactString),
@@ -100,6 +122,14 @@ pub enum AgentEvent {
         tokens_after: u64,
         summary: CompactString,
         first_kept_index: usize,
+        /// Whether this pass was pruning-only, prune+summary, or
+        /// prune+failed-summary (IMPROVEMENTS_PLAN #5).
+        compaction_kind: CompactionKind,
+        /// Model that produced the summary, if known. `None` for
+        /// pruning-only passes (and currently for summary passes — the
+        /// summarizer closure is opaque; threading the model name is a
+        /// follow-up).
+        summary_model: Option<CompactString>,
     },
     Done {
         response: CompactString,
@@ -163,6 +193,23 @@ pub enum AgentEvent {
         delay_ms: u64,
         error: CompactString,
     },
+    /// Per-run input-repair telemetry, emitted just before
+    /// `AgentEvent::Done`. The UI prints a one-line summary
+    /// ("repaired 3 inputs: 1 md-link, 2 null-strip; 0 invalid")
+    /// when at least one repair fired. Empty snapshots aren't
+    /// emitted at all. Phase-1 of docs/AGENTIC_LOOP_PLAN.md.
+    RepairStats {
+        snapshot: crate::agent::agent_loop::tool_input_repair::RepairStatsSnapshot,
+    },
+    /// Phase 4 part 1 — dual-client tiering: the NEXT LLM call has
+    /// been swapped to the configured escalation provider after a
+    /// repair-exhaustion or tree-sitter syntactic failure. One-shot;
+    /// subsequent calls revert to the default model. The UI surfaces
+    /// this so the user knows about the unexpected provider change.
+    EscalationActivated {
+        provider: CompactString,
+        reason: crate::agent::agent_loop::message::EscalationReason,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -177,9 +224,16 @@ pub enum UserEvent {
     /// Mouse capture is on (see `TerminalGuard::new`) so the wheel reaches
     /// the app instead of being absorbed by the terminal, which under the
     /// alt screen would push the TUI off-view.
-    ScrollUp,
+    ScrollUp {
+        row: u16,
+        col: u16,
+    },
     /// Mouse wheel scrolled down — scroll the output pane down by one line.
-    ScrollDown,
+    /// See `ScrollUp` for the `(row, col)` semantics.
+    ScrollDown {
+        row: u16,
+        col: u16,
+    },
     /// Left mouse button pressed at terminal cell `(row, col)` — starts
     /// an app-level drag selection. Consumed by `ui::selection::handle`
     /// before any UI-state-specific consumer sees it.

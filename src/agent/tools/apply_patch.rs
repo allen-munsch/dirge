@@ -90,6 +90,12 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
             MAX_APPLY_PATCH_BYTES,
         ));
     }
+    // Phase-2 tree-sitter validation: refuse to create
+    // syntactically-broken files. See docs/AGENTIC_LOOP_PLAN.md §2.
+    #[cfg(feature = "semantic")]
+    if let Err(errors) = crate::semantic::syntax_validator::check_syntax(p, content) {
+        return Err(crate::semantic::syntax_validator::format_errors(p, &errors));
+    }
     crate::fs_atomic::atomic_write(p, content.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
@@ -152,6 +158,17 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     } else {
         updated_normalized
     };
+    // Phase-2 tree-sitter validation on the updated content
+    // before write. See docs/AGENTIC_LOOP_PLAN.md §2.
+    #[cfg(feature = "semantic")]
+    if let Err(errors) =
+        crate::semantic::syntax_validator::check_syntax(std::path::Path::new(path), &to_write)
+    {
+        return Err(crate::semantic::syntax_validator::format_errors(
+            std::path::Path::new(path),
+            &errors,
+        ));
+    }
     crate::fs_atomic::atomic_write(std::path::Path::new(path), to_write.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
@@ -182,8 +199,10 @@ impl Tool for ApplyPatchTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "apply_patch".to_string(),
-            description: "Apply multiple file operations in a single call. Supports create, update (by exact text match), delete, and rename. Operations execute in order and stop on first failure — prior operations that succeeded remain applied."
-                .to_string(),
+            description: crate::agent::agent_loop::tool_input_repair::with_contract_hint(
+                "apply_patch",
+                "Apply multiple file operations in a single call. Supports create, update (by exact text match), delete, and rename. Operations execute in order and stop on first failure — prior operations that succeeded remain applied.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -254,19 +273,16 @@ impl Tool for ApplyPatchTool {
                 | PatchOp::Delete { path }
                 | PatchOp::Rename { path, .. } => path,
             };
-            if !std::path::Path::new(op_path).is_absolute() {
-                return Err(ToolError::Msg(format!(
-                    "apply_patch requires an absolute path, got: {}",
-                    op_path
-                )));
-            }
-            if let PatchOp::Rename { new_path, .. } = op
-                && !std::path::Path::new(new_path).is_absolute()
-            {
-                return Err(ToolError::Msg(format!(
-                    "apply_patch rename requires an absolute new_path, got: {}",
-                    new_path
-                )));
+            // Shared absolute-path guard (the schema requires absolute
+            // paths for both fields).
+            crate::agent::tools::require_absolute_path(op_path, "the apply_patch path")
+                .map_err(ToolError::Msg)?;
+            if let PatchOp::Rename { new_path, .. } = op {
+                crate::agent::tools::require_absolute_path(
+                    new_path,
+                    "the apply_patch rename target",
+                )
+                .map_err(ToolError::Msg)?;
             }
 
             // C1 (audit fix): resolve the path THROUGH the permission
@@ -301,15 +317,15 @@ impl Tool for ApplyPatchTool {
                 None
             };
             // Validate create content size
-            if let PatchOp::Create { content, .. } = op {
-                if content.len() > MAX_CREATE_SIZE {
-                    results.push(format!(
-                        "FAILED: create content exceeds {} bytes ({} bytes provided)",
-                        MAX_CREATE_SIZE,
-                        content.len()
-                    ));
-                    break;
-                }
+            if let PatchOp::Create { content, .. } = op
+                && content.len() > MAX_CREATE_SIZE
+            {
+                results.push(format!(
+                    "FAILED: create content exceeds {} bytes ({} bytes provided)",
+                    MAX_CREATE_SIZE,
+                    content.len()
+                ));
+                break;
             }
 
             let result = match op {

@@ -177,6 +177,15 @@ pub struct LoopConfig {
     /// `convertToLlm`.
     pub transform_context: Option<TransformContextFn>,
 
+    /// dirge-jia8: optional plugin compaction hooks fired around the
+    /// auto-fold / `/compress` compaction pass. `on_before` is an
+    /// observe-only notification (cannot cancel — cancelling an
+    /// emergency fold would overflow the context); `on_compact` lets
+    /// a plugin supply a custom summary instead of the LLM
+    /// summarizer. `None` (default) = no plugin compaction
+    /// involvement.
+    pub compaction_hooks: Option<CompactionHooks>,
+
     /// Optional. Port of pi `getApiKey?` (types.ts:196).
     /// Resolves an API key dynamically per request — useful for
     /// short-lived OAuth tokens. `None` means "use `api_key`
@@ -297,6 +306,95 @@ pub struct LoopConfig {
     /// suppressed regardless of repetition). Built-in defaults
     /// (`read`, `list_dir`, `grep`, etc.) are always included.
     pub storm_exempt_tools: Option<Vec<String>>,
+
+    /// Phase-1 telemetry (docs/AGENTIC_LOOP_PLAN.md): per-run
+    /// aggregate counters for the input-repair layer. Increment
+    /// happens inside `prepare_tool_call` after a successful repair
+    /// (or `record_invalid` when the repair pass exhausts); the
+    /// snapshot lands in `LoopEvent::RepairStats` at `AgentEnd` so
+    /// the UI can print "repaired 3 inputs (1 md-link unwrap, 2
+    /// null-strip), 0 invalid" at session close.
+    pub repair_stats: std::sync::Arc<super::tool_input_repair::RepairStats>,
+
+    /// dirge-7bwx review-fix #2: per-call notes from the
+    /// loop-level truncation closer (`apply_truncation_repair` in
+    /// `run.rs`). Keyed by tool_call_id. `prepare_tool_call`
+    /// drains the entry for its call and prepends each note to
+    /// the tool result content so the model sees the repair
+    /// ("[read_file] closed unterminated string" or
+    /// "[read_file] ⚠️ TRUNCATION UNRECOVERABLE: …").
+    /// Mirrors Reasonix `repair/index.ts:100-101, :106` which
+    /// forwards `r.notes` into `report.notes` → next-turn assistant
+    /// context.
+    pub truncation_notes:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+
+    /// Phase-3 dynamic-tool-search: per-session "loaded" tool set.
+    /// When `Some`, the request builder filters tool defs sent to
+    /// the model to (a) the always-on set
+    /// (`tools::tool_search::ALWAYS_ON_TOOLS`), (b) tools whose
+    /// names are in this set, and (c) `tool_search` itself.
+    ///
+    /// `None` (the default) preserves legacy behavior — every
+    /// registered tool definition ships every turn. The `tool_search`
+    /// meta-tool inserts names into this set when the model
+    /// discovers a needed tool; the SAME Arc is shared between
+    /// the tool's executor and the filter inside the request
+    /// builder, so a tool the model just discovered shows up on
+    /// the next turn's request.
+    pub tool_def_filter:
+        Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+
+    /// Phase-3 dynamic-tool-search opt-in. Mirrors the
+    /// config.json `dynamic_tool_search` key. When `true` the
+    /// session allocates a `tool_def_filter` and includes the
+    /// `tool_search` tool in the registry; when `false` (default)
+    /// the loop runs in legacy "ship every tool every turn"
+    /// mode. Carried on `LoopConfig` so non-loop callers can
+    /// inspect the setting without rebuilding the request-side
+    /// filter independently.
+    pub dynamic_tool_search: bool,
+
+    /// Phase 4 part 1: alternate stream function used for ONE call
+    /// after a repair-exhaustion or tree-sitter failure. None when
+    /// escalation isn't configured.
+    pub escalation_stream_fn: Option<super::stream::StreamFn>,
+
+    /// Phase 4 part 1: name of the escalation provider (for tracing /
+    /// UI surfacing). `None` when no escalation configured.
+    pub escalation_provider_name: Option<String>,
+
+    /// Phase 4 part 1: shared state — when `Some(reason)`, the NEXT
+    /// call to `stream_assistant_response` swaps to `escalation_stream_fn`
+    /// and clears the flag. `reason` propagates to the LoopEvent and
+    /// to the tool-result Note.
+    pub escalation_pending:
+        std::sync::Arc<std::sync::Mutex<Option<super::message::EscalationReason>>>,
+
+    /// Phase 4 part 1: per-session cap to prevent ping-ponging. Default 3.
+    /// `try_arm_escalation` decrements a per-session counter and refuses
+    /// to arm once it hits zero.
+    pub escalation_max_per_session: usize,
+
+    /// Phase 4 part 1: remaining escalation budget for this session.
+    /// Initialised to `escalation_max_per_session`; decremented by
+    /// `try_arm_escalation`. Shared Arc<AtomicUsize> so the
+    /// counter survives `LoopConfig::clone()` (the loop re-clones
+    /// across retry boundaries).
+    pub escalation_remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+
+    /// Phase 4 part 2: per-session file-touch tracker for context-depth
+    /// reminders. None when the feature isn't configured.
+    pub file_touch_tracker: Option<std::sync::Arc<super::context_depth::FileTouchTracker>>,
+
+    /// dirge-nqr: hard cap on assistant turns within a single run.
+    /// `None` = unlimited (matches the legacy behaviour). When set,
+    /// the run loop terminates after `max_turns` assistant turns
+    /// have completed and emits a system message stating the cap
+    /// was hit. Honored by both the interactive and `--print`
+    /// paths; the CLI's `--max-agent-turns` / config's
+    /// `max_agent_turns` set it via `AnyAgent::with_max_turns`.
+    pub max_turns: Option<usize>,
 }
 
 /// `convertToLlm` signature. Synchronous in pi (returns
@@ -321,6 +419,37 @@ pub type TransformContextFn = std::sync::Arc<
         + Send
         + Sync,
 >;
+
+/// dirge-jia8: observe-only "compaction is about to run" callback.
+/// Receives `(message_count, estimated_tokens)`. Cannot cancel — the
+/// fold proceeds regardless (cancelling an emergency fold would
+/// overflow the context window on the next call).
+pub type OnBeforeCompactFn = std::sync::Arc<
+    dyn Fn(usize, u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// dirge-jia8: custom-summary callback. Receives the to-be-summarized
+/// middle message slice; returns `Some(summary)` to use instead of
+/// the LLM summarizer, or `None` to fall through to the LLM. The
+/// returned summary is still validated by `validate_summary`; an
+/// invalid one falls through.
+pub type OnCompactFn = std::sync::Arc<
+    dyn Fn(
+            Vec<serde_json::Value>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// dirge-jia8: bundle of plugin compaction hooks. Bundled into one
+/// `LoopConfig` field to keep the constructor surface small.
+#[derive(Clone)]
+pub struct CompactionHooks {
+    pub on_before: OnBeforeCompactFn,
+    pub on_compact: OnCompactFn,
+}
 
 /// `getApiKey` signature. Pi: `(provider: string) =>
 /// Promise<string | undefined> | string | undefined`.
@@ -373,6 +502,35 @@ impl std::fmt::Debug for LoopConfig {
             .field("provider_name", &self.provider_name)
             .field("model_name", &self.model_name)
             .field("compact_model", &self.compact_model)
+            .field(
+                "tool_def_filter",
+                &self.tool_def_filter.as_ref().map(|_| "<set>"),
+            )
+            .field("dynamic_tool_search", &self.dynamic_tool_search)
+            .field(
+                "escalation_stream_fn",
+                &self.escalation_stream_fn.as_ref().map(|_| "<fn>"),
+            )
+            .field("escalation_provider_name", &self.escalation_provider_name)
+            .field(
+                "escalation_pending",
+                &self.escalation_pending.lock().ok().and_then(|g| g.clone()),
+            )
+            .field(
+                "escalation_max_per_session",
+                &self.escalation_max_per_session,
+            )
+            .field(
+                "escalation_remaining",
+                &self
+                    .escalation_remaining
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "file_touch_tracker",
+                &self.file_touch_tracker.as_ref().map(|_| "<tracker>"),
+            )
+            .field("max_turns", &self.max_turns)
             .finish()
     }
 }
@@ -382,6 +540,7 @@ impl Clone for LoopConfig {
         Self {
             convert_to_llm: self.convert_to_llm.clone(),
             transform_context: self.transform_context.clone(),
+            compaction_hooks: self.compaction_hooks.clone(),
             get_api_key: self.get_api_key.clone(),
             api_key: self.api_key.clone(),
             tool_execution: self.tool_execution,
@@ -401,6 +560,17 @@ impl Clone for LoopConfig {
             compact_model: self.compact_model.clone(),
             storm_mutating_tools: self.storm_mutating_tools.clone(),
             storm_exempt_tools: self.storm_exempt_tools.clone(),
+            repair_stats: self.repair_stats.clone(),
+            truncation_notes: self.truncation_notes.clone(),
+            tool_def_filter: self.tool_def_filter.clone(),
+            dynamic_tool_search: self.dynamic_tool_search,
+            escalation_stream_fn: self.escalation_stream_fn.clone(),
+            escalation_provider_name: self.escalation_provider_name.clone(),
+            escalation_pending: self.escalation_pending.clone(),
+            escalation_max_per_session: self.escalation_max_per_session,
+            escalation_remaining: self.escalation_remaining.clone(),
+            file_touch_tracker: self.file_touch_tracker.clone(),
+            max_turns: self.max_turns,
         }
     }
 }

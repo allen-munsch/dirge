@@ -125,10 +125,8 @@ impl Tool for SkillTool {
 
         match args.action.as_str() {
             "load" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'load'".to_string()))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "load")?;
                 let Some(skill) = skill::find_skill(name, &self.skills) else {
                     return Err(ToolError::Msg(format!(
                         "Skill '{}' not found. Available: {}",
@@ -154,7 +152,7 @@ impl Tool for SkillTool {
             }
 
             "list" => {
-                let names = self.manager.list().map_err(|e| ToolError::Msg(e))?;
+                let names = self.manager.list().map_err(ToolError::Msg)?;
                 if names.is_empty() {
                     Ok("No skills found in .dirge/skills/.".to_string())
                 } else {
@@ -171,20 +169,16 @@ impl Tool for SkillTool {
             }
 
             "create" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'create'".to_string()))?;
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("content is required for 'create'".to_string())
-                    })?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "create")?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "create",
+                )?;
                 self.manager
                     .create_from_content(name, content)
-                    .map_err(|e| ToolError::Msg(e))?;
+                    .map_err(ToolError::Msg)?;
                 // Bump create counter (best-effort).
                 if let Some(mut u) = self.usage.clone() {
                     u.record_create(name, "agent");
@@ -193,18 +187,16 @@ impl Tool for SkillTool {
             }
 
             "edit" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'edit'".to_string()))?;
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| ToolError::Msg("content is required for 'edit'".to_string()))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "edit")?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "edit",
+                )?;
                 self.manager
                     .edit_from_content(name, content)
-                    .map_err(|e| ToolError::Msg(e))?;
+                    .map_err(ToolError::Msg)?;
                 // Bump patch counter (best-effort).
                 if let Some(mut u) = self.usage.clone() {
                     u.record_patch(name);
@@ -213,10 +205,8 @@ impl Tool for SkillTool {
             }
 
             "patch" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'patch'".to_string()))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "patch")?;
                 let old_string = args
                     .old_string
                     .as_deref()
@@ -227,7 +217,7 @@ impl Tool for SkillTool {
                 let new_string = args.new_string.as_deref().unwrap_or("");
                 self.manager
                     .patch(name, old_string, new_string)
-                    .map_err(|e| ToolError::Msg(e))?;
+                    .map_err(ToolError::Msg)?;
                 // Bump patch counter (best-effort).
                 if let Some(mut u) = self.usage.clone() {
                     u.record_patch(name);
@@ -236,11 +226,9 @@ impl Tool for SkillTool {
             }
 
             "delete" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'delete'".to_string()))?;
-                self.manager.delete(name).map_err(|e| ToolError::Msg(e))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "delete")?;
+                self.manager.delete(name).map_err(ToolError::Msg)?;
                 Ok(format!("Skill '{}' deleted.", name))
             }
 
@@ -370,10 +358,13 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
+        // After the dirge-1ia name-validation loosening, spaces /
+        // mixed case are accepted. A path separator is still
+        // forbidden — that's what we test here now.
         let result = rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
-            name: Some("Bad Name".into()),
-            content: Some("---\nname: Bad Name\n---\n\nbody\n".into()),
+            name: Some("bad/name".into()),
+            content: Some("---\nname: bad/name\n---\n\nbody\n".into()),
             old_string: None,
             new_string: None,
         }));
@@ -561,5 +552,48 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Security scan"));
+    }
+
+    /// End-to-end: the action name the project-skills preamble tells
+    /// the model to use must actually load a real skill. Parses the
+    /// action out of `PROJECT_SKILLS_PREAMBLE` and drives `SkillTool`
+    /// with it. See dirge-rq65.
+    #[test]
+    fn integration_preamble_action_loads_skill() {
+        use crate::agent::prompt::PROJECT_SKILLS_PREAMBLE;
+
+        // Extract the action name from the literal `action='X'` token.
+        let marker = "action='";
+        let start = PROJECT_SKILLS_PREAMBLE
+            .find(marker)
+            .expect("PROJECT_SKILLS_PREAMBLE must mention action='...'")
+            + marker.len();
+        let rest = &PROJECT_SKILLS_PREAMBLE[start..];
+        let end = rest
+            .find('\'')
+            .expect("PROJECT_SKILLS_PREAMBLE action token must close with '");
+        let action_from_preamble = &rest[..end];
+
+        let skills = make_skills();
+        let (mgr, _dir) = temp_skills_dir();
+        let tool = SkillTool::new(skills, mgr, None, None, None);
+        let rt = make_runtime();
+
+        let result = rt.block_on(tool.call(SkillArgs {
+            action: action_from_preamble.into(),
+            name: Some("test-skill".into()),
+            content: None,
+            old_string: None,
+            new_string: None,
+        }));
+        assert!(
+            result.is_ok(),
+            "preamble-advertised action '{}' failed end-to-end: {:?}",
+            action_from_preamble,
+            result
+        );
+        let output = result.unwrap();
+        assert!(output.contains("test-skill"));
+        assert!(output.contains("Do the thing."));
     }
 }

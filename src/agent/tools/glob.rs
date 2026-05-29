@@ -97,8 +97,10 @@ impl Tool for GlobTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "glob".to_string(),
-            description: "Find files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.tsx'). Respects .gitignore via ignore crate. Returns matching relative file paths sorted by modification time (newest first). Returns empty string when no files match. Use this for natural path pattern matching instead of regex-based find_files."
-                .to_string(),
+            description: crate::agent::agent_loop::tool_input_repair::with_contract_hint(
+                "glob",
+                "Find files matching a glob pattern (e.g., '**/*.rs', 'src/**/*.tsx'). Respects .gitignore via ignore crate. Returns matching relative file paths sorted by modification time (newest first). Returns empty string when no files match. Use this for natural path pattern matching instead of regex-based find_files.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -135,9 +137,8 @@ impl Tool for GlobTool {
         check_perm_path(&self.permission, &self.ask_tx, "glob", perm_path).await?;
 
         // LOOP-3: dir stamp catches file add/remove/rename.
-        let stamp = crate::agent::tools::cache::fs_stamp_or_cwd(
-            args.path.as_deref().unwrap_or("."),
-        );
+        let stamp =
+            crate::agent::tools::cache::fs_stamp_or_cwd(args.path.as_deref().unwrap_or("."));
         let cache_key = format!(
             "glob:{}:{}:hidden={}:{}",
             args.pattern,
@@ -151,7 +152,7 @@ impl Tool for GlobTool {
             return Ok(cached);
         }
 
-        let re = glob_to_regex(&args.pattern).map_err(|e| ToolError::Msg(e))?;
+        let re = glob_to_regex(&args.pattern).map_err(ToolError::Msg)?;
 
         let root = args
             .path
@@ -176,7 +177,7 @@ impl Tool for GlobTool {
 
         for entry in walker {
             let entry = entry.map_err(|e| ToolError::Msg(e.to_string()))?;
-            if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
 

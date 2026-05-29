@@ -108,8 +108,10 @@ impl Tool for WebSearchTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "websearch".to_string(),
-            description: "Search the web. Returns titles, URLs, and snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff. Works out of the box without any API key — rotates between Exa and Parallel.ai hosted MCP endpoints (50/50 per process, pin with `DIRGE_WEBSEARCH_PROVIDER=exa|parallel`). Optional `EXA_API_KEY` / `PARALLEL_API_KEY` raise the respective rate limits. DuckDuckGo HTML scrape is the last-resort fallback if both upstream MCP endpoints fail."
-                .to_string(),
+            description: crate::agent::agent_loop::tool_input_repair::with_contract_hint(
+                "websearch",
+                "Search the web. Returns titles, URLs, and snippets. Use for looking up current documentation, API references, or up-to-date information beyond your training cutoff. Works out of the box without any API key — rotates between Exa and Parallel.ai hosted MCP endpoints (50/50 per process, pin with `DIRGE_WEBSEARCH_PROVIDER=exa|parallel`). Optional `EXA_API_KEY` / `PARALLEL_API_KEY` raise the respective rate limits. DuckDuckGo HTML scrape is the last-resort fallback if both upstream MCP endpoints fail.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -444,6 +446,7 @@ fn percent_encode(s: &str) -> String {
 /// regexes:
 ///   - `result__a` anchor → title + URL
 ///   - `result__snippet` anchor → snippet text
+///
 /// HTML entities (`&amp;`, `&#x27;` etc.) are decoded inline. URLs
 /// are unwrapped from DDG's `/l/?uddg=…` redirector when present.
 ///
@@ -601,12 +604,13 @@ fn urlencoding_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
-                out.push((h << 4) | l);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+        {
+            out.push((h << 4) | l);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;

@@ -57,6 +57,21 @@ struct Channels {
     lsp_manager: Option<std::sync::Arc<LspManager>>,
 }
 
+/// Resolve the session id passed to `build_agent` for the
+/// session-search tool's current-session exclusion. dirge-sk3e:
+/// `--no-session` (one-shot prompts that aren't persisted) yields
+/// `None` so the tool doesn't try to exclude a row that will never
+/// land in the session DB. Otherwise the live session id is
+/// returned so the model can't recall its own in-progress
+/// prompt-response pair.
+fn session_id_for_agent(cli: &cli::Cli, session: &session::Session) -> Option<String> {
+    if cli.no_session {
+        None
+    } else {
+        Some(session.id.to_string())
+    }
+}
+
 fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
     // Warn on conflicting CLI flags. Previously `--yolo --restrictive`
     // silently picked yolo (the first-match in the if-else chain)
@@ -116,11 +131,21 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
         return Channels::default();
     }
 
-    let perm_config: PermissionConfig = cfg
-        .permission
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let perm_config: PermissionConfig = match cfg.permission.as_ref() {
+        Some(v) => match serde_json::from_value(v.clone()) {
+            Ok(c) => c,
+            // Surface the error loudly: falling back to defaults silently
+            // would drop the user's intended rules (and harden nothing).
+            Err(e) => {
+                eprintln!(
+                    "warning: invalid `permission` config ({e}); falling back to \
+                     defaults (all actions Ask). Fix the config to restore your rules."
+                );
+                PermissionConfig::default()
+            }
+        },
+        None => PermissionConfig::default(),
+    };
 
     let mode = resolve_mode(cli, cfg);
     let checker = PermissionChecker::new(&perm_config, mode, None);
@@ -372,7 +397,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let provider = cli.resolve_provider(&cfg);
-    let model = if cli.model.is_none() && cfg.model.is_none() {
+    let config_model = cfg
+        .resolve_role(config::ConfigRole::Default)
+        .and_then(|(_, e)| e.model);
+    let model = if cli.model.is_none() && config_model.is_none() {
         CompactString::new(provider::default_model_for(&provider))
     } else {
         cli.resolve_model(&cfg)
@@ -543,12 +571,11 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;
+        // Honor DIRGE_CONFIG_DIR via the shared base, like config.json
+        // (dirge-f8oe) — previously this hard-coded ~/.config/dirge, so
+        // an override moved config but left plugins behind.
         let candidate_dirs: Vec<PathBuf> = vec![
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".config")
-                .join("dirge")
-                .join("plugins"),
+            crate::session::storage::config_path().join("plugins"),
             PathBuf::from(".dirge").join("plugins"),
         ];
         // Silently drop missing default dirs; only surface real errors below.
@@ -571,7 +598,7 @@ async fn main() -> anyhow::Result<()> {
                 //     `*.janet` contents are concatenated into one Janet
                 //     env (multi-file plugins)
                 let is_janet_file =
-                    path.is_file() && path.extension().map_or(false, |e| e == "janet");
+                    path.is_file() && path.extension().is_some_and(|e| e == "janet");
                 let is_plugin_dir = path.is_dir();
                 if !is_janet_file && !is_plugin_dir {
                     continue;
@@ -609,16 +636,17 @@ async fn main() -> anyhow::Result<()> {
         // registered via `harness/register-provider` and install them
         // into the global provider resolver. Config-declared
         // custom_providers still take precedence on name collision.
-        let plugin_providers: std::collections::HashMap<String, config::CustomProviderConfig> = {
+        let plugin_providers: std::collections::HashMap<String, config::ProviderEntry> = {
             let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
             mgr.list_providers()
                 .into_iter()
                 .map(|(name, ptype, base_url, api_key_env)| {
                     (
                         name,
-                        config::CustomProviderConfig {
-                            provider_type: ptype,
-                            base_url,
+                        config::ProviderEntry {
+                            provider_type: Some(ptype),
+                            base_url: Some(base_url),
+                            model: None,
                             api_key_env,
                             // Plugin-registered providers don't expose
                             // a chunk-timeout knob via the
@@ -632,6 +660,12 @@ async fn main() -> anyhow::Result<()> {
                             // validator in `install_plugin_providers`
                             // will reject it.
                             allow_insecure: false,
+                            // `harness/register-provider` doesn't expose
+                            // a literal api_key or options map — plugins
+                            // declare the env var name and the request
+                            // builder reads options from cfg/CLI.
+                            api_key: None,
+                            options: None,
                         },
                     )
                 })
@@ -679,11 +713,7 @@ async fn main() -> anyhow::Result<()> {
         cli.api_key.clone()
     };
 
-    let client = provider::create_client(
-        &provider,
-        resolved_key.as_deref(),
-        &cfg.custom_providers_map(),
-    )?;
+    let client = provider::create_client(&provider, resolved_key.as_deref(), &cfg.providers_map())?;
 
     #[cfg(feature = "mcp")]
     let mcp_manager = if let Some(servers) = &cfg.mcp_servers {
@@ -743,6 +773,7 @@ async fn main() -> anyhow::Result<()> {
     let completion_model = client.completion_model(model.to_string());
 
     if cli.print {
+        let session_id_for_print = session_id_for_agent(&cli, &session);
         let agent = provider::build_agent(
             completion_model,
             &cli,
@@ -760,6 +791,7 @@ async fn main() -> anyhow::Result<()> {
             mcp_manager.as_ref(),
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
+            session_id_for_print,
         )
         .await;
         let msg = cli.message.join(" ");
@@ -771,27 +803,38 @@ async fn main() -> anyhow::Result<()> {
         // honor it — surface a warning to stderr so the plugin
         // author can see why their model swap didn't take effect.
         #[cfg(feature = "plugin")]
-        if let Some(pm_arc) = plugin_manager.as_ref() {
-            if let Some(m) = pm_arc
+        if let Some(pm_arc) = plugin_manager.as_ref()
+            && let Some(m) = pm_arc
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take_pending_next_model()
-            {
-                let t = m.trim();
-                if !t.is_empty() {
-                    eprintln!(
-                        "[plugin] prepare-next-run requested model={} — \
+        {
+            let t = m.trim();
+            if !t.is_empty() {
+                eprintln!(
+                    "[plugin] prepare-next-run requested model={} — \
                         --print is single-shot; ignored. Use --loop or \
                         interactive mode for model swap.",
-                        t
-                    );
-                }
+                    t
+                );
             }
         }
+        // dirge-bx4g + dirge-4tuq: --print is a one-shot. Fire
+        // on_session_end on the persisted-or-not transcript so
+        // plugin providers always see the boundary, then attempt
+        // the save. Pre-fix the order was reversed and `?` on
+        // save_session short-circuited past the hook — exactly
+        // the scenario (disk failure / permission error) where
+        // the provider's own backend may be the only durable
+        // record. The hook itself is fire-and-forget; saves can
+        // fail without losing the lifecycle signal.
         if !cli.no_session {
             session.add_message(MessageRole::User, &msg);
             session.add_message(MessageRole::Assistant, &response);
-            session::storage::save_session(&session)?;
+            crate::agent::review::maybe_fire_session_end(&agent, &session);
+            if let Err(e) = session::storage::save_session(&session) {
+                eprintln!("warning: failed to save session: {}", e);
+            }
         }
     } else {
         #[cfg(feature = "loop")]
@@ -851,6 +894,7 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager.as_ref(),
                     #[cfg(feature = "semantic")]
                     semantic_manager.as_ref(),
+                    Some(session.id.to_string()),
                 )
                 .await
             };
@@ -867,7 +911,16 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
                 match exit {
-                    HeadlessLoopExit::MaxIterations => return Ok(()),
+                    HeadlessLoopExit::MaxIterations => {
+                        // dirge-jmc9: fire on_session_end before
+                        // returning from --loop mode. session.messages
+                        // is typically empty here (run_print doesn't
+                        // populate it) but the hook still serves as a
+                        // "flush buffered state" signal for plugin
+                        // providers.
+                        crate::agent::review::maybe_fire_session_end(&current_agent, &session);
+                        return Ok(());
+                    }
                     #[cfg(feature = "plugin")]
                     HeadlessLoopExit::ModelSwap(new_model) => {
                         let m = client.completion_model(new_model);
@@ -888,6 +941,7 @@ async fn main() -> anyhow::Result<()> {
                             mcp_manager.as_ref(),
                             #[cfg(feature = "semantic")]
                             semantic_manager.as_ref(),
+                            Some(session.id.to_string()),
                         )
                         .await;
                     }
@@ -912,6 +966,7 @@ async fn main() -> anyhow::Result<()> {
             mcp_manager.as_ref(),
             #[cfg(feature = "semantic")]
             semantic_manager.as_ref(),
+            Some(session.id.to_string()),
         )
         .await;
 
@@ -1152,5 +1207,52 @@ async fn run_headless_loop(
         }
 
         eprintln!("--- iteration {} complete, looping ---\n", state.iteration);
+    }
+}
+
+#[cfg(test)]
+mod session_id_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn fresh_session() -> session::Session {
+        session::Session::new("openrouter", "anthropic/claude-sonnet-4.5", 200_000)
+    }
+
+    /// dirge-sk3e — `--no-session` yields `None` so the
+    /// session-search tool doesn't try to exclude an id that will
+    /// never land in the DB.
+    #[test]
+    fn no_session_yields_none() {
+        let cli = cli::Cli::parse_from(["dirge", "--no-session", "--print"]);
+        let session = fresh_session();
+        assert_eq!(
+            session_id_for_agent(&cli, &session),
+            None,
+            "--no-session must yield None"
+        );
+    }
+
+    /// Sessioned runs still exclude the live session so the model
+    /// can't see its own in-progress turn in `session_search`.
+    #[test]
+    fn sessioned_print_yields_some() {
+        let cli = cli::Cli::parse_from(["dirge", "--print"]);
+        let session = fresh_session();
+        let got = session_id_for_agent(&cli, &session);
+        assert_eq!(
+            got.as_deref(),
+            Some(session.id.as_str()),
+            "sessioned --print must propagate the live session id"
+        );
+    }
+
+    /// Interactive (no --print, no --no-session) also gets Some.
+    #[test]
+    fn interactive_yields_some() {
+        let cli = cli::Cli::parse_from(["dirge"]);
+        let session = fresh_session();
+        let got = session_id_for_agent(&cli, &session);
+        assert_eq!(got.as_deref(), Some(session.id.as_str()));
     }
 }

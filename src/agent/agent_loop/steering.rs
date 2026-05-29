@@ -353,6 +353,7 @@ mod tests {
                     .collect()
             }),
             transform_context: None,
+            compaction_hooks: None,
             get_api_key: None,
             api_key: None,
             tool_execution: ToolExecutionMode::Sequential,
@@ -372,6 +373,21 @@ mod tests {
             compact_model: None,
             storm_mutating_tools: None,
             storm_exempt_tools: None,
+            repair_stats: std::sync::Arc::new(
+                crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
+            ),
+            truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            tool_def_filter: None,
+            dynamic_tool_search: false,
+            escalation_stream_fn: None,
+            escalation_provider_name: None,
+            escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            escalation_max_per_session: 3,
+            escalation_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(3)),
+            file_touch_tracker: None,
+            max_turns: None,
         };
         config.get_steering_messages = Some(steering_from_queue(queue.clone(), QueueMode::All));
 
@@ -388,6 +404,8 @@ mod tests {
             AbortSignal::new(),
             &tx,
             &factory,
+            None,
+            None, // memory_provider — test default
         )
         .await;
 

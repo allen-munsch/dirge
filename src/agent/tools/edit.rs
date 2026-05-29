@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
-use std::path::Path;
 
+use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path_resolve};
 #[cfg(feature = "lsp")]
@@ -108,7 +108,10 @@ impl Tool for EditTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "edit".to_string(),
-            description: "Edit a file by replacing exact text. If old_text appears once, replaces it. If it appears multiple times and replace_all is false, returns all match locations with line numbers. Use replaceAll: true to replace every occurrence. Handles both LF and CRLF line endings.".to_string(),
+            description: with_contract_hint(
+                "edit",
+                "Edit a file by replacing exact text. If old_text appears once, replaces it. If it appears multiple times and replace_all is false, returns all match locations with line numbers. Use replaceAll: true to replace every occurrence. Handles both LF and CRLF line endings.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -129,13 +132,10 @@ impl Tool for EditTool {
             ));
         }
 
-        // Reject non-absolute paths immediately with a clear error.
-        if !Path::new(&args.path).is_absolute() {
-            return Err(ToolError::Msg(format!(
-                "Path '{}' is not absolute. Edit takes an absolute path like '/home/user/project/file.txt', not a relative path or bare filename.",
-                args.path,
-            )));
-        }
+        // Reject non-absolute paths immediately with a clear error
+        // (shared guard; the schema requires an absolute path).
+        crate::agent::tools::require_absolute_path(&args.path, "the edit path")
+            .map_err(ToolError::Msg)?;
         // Audit H12: pin file operations to the canonical path the
         // permission check resolved.
         let resolved_path =
@@ -275,7 +275,7 @@ impl Tool for EditTool {
             // order so earlier offsets stay valid.
             let mut out = content.clone();
             let mut ranges = match_ranges.clone();
-            ranges.sort_by(|a, b| b.0.cmp(&a.0));
+            ranges.sort_by_key(|r| std::cmp::Reverse(r.0));
             for (start, end) in ranges {
                 out.replace_range(start..end, &args.new_text);
             }
@@ -303,6 +303,21 @@ impl Tool for EditTool {
             new_content
         };
 
+        // Phase-2 tree-sitter validation: refuse to write
+        // syntactically-broken edits so the model sees the error
+        // in the same turn. See docs/AGENTIC_LOOP_PLAN.md §2.
+        #[cfg(feature = "semantic")]
+        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(
+            std::path::Path::new(&resolved_path),
+            &output,
+        ) {
+            return Err(ToolError::Msg(
+                crate::semantic::syntax_validator::format_errors(
+                    std::path::Path::new(&resolved_path),
+                    &errors,
+                ),
+            ));
+        }
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         // Atomic write so a mid-write crash leaves the previous

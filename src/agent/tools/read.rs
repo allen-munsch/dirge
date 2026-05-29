@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
-use std::path::Path;
 
+use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path_resolve};
 #[cfg(feature = "lsp")]
@@ -141,28 +141,47 @@ impl Tool for ReadTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_string(),
-            description: "Read the contents of a file. Supports text files. Defaults to first 2000 lines. Use offset/limit for large files.".to_string(),
+            description: with_contract_hint(
+                "read",
+                "Read the contents of a file. Supports text files. Defaults to first 2000 lines. Use offset/limit for large files.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "The absolute path to the file to read (must be absolute, not relative)" },
+                    "path": {
+                        "type": "string",
+                        "description": "The absolute path to the file to read (must be absolute, not relative)",
+                        "dirge-hints": {"semantic": "absolute_path"}
+                    },
                     "offset": { "type": "integer", "description": "Line number to start from (1-indexed)" },
                     "limit": { "type": "integer", "description": "Maximum number of lines to read" }
                 },
-                "required": ["path"]
+                "required": ["path"],
+                // Phase-2: when `limit` is given but `offset` is
+                // not (or vice versa), the harness auto-fills the
+                // missing one with `offset = 0` and prepends a
+                // Note: to the tool result so the model knows the
+                // default was applied. Replaces the hardcoded note
+                // in `read::call`'s body — that path can be
+                // removed once every relational pairing migrates
+                // here.
+                "dirge-hints": {
+                    "relational": [
+                        {
+                            "requires": ["offset", "limit"],
+                            "defaults": {"offset": 0}
+                        }
+                    ]
+                }
             }),
         }
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
-        // Reject non-absolute paths immediately with a clear error.
-        // Same guard as `write` — the schema says "must be absolute."
-        if !Path::new(&args.path).is_absolute() {
-            return Err(ToolError::Msg(format!(
-                "Path '{}' is not absolute. Read takes an absolute path like '/home/user/project/file.txt', not a relative path or bare filename.",
-                args.path,
-            )));
-        }
+        // Reject non-absolute paths immediately with a clear error
+        // (shared guard; the schema declares `semantic: absolute_path`).
+        crate::agent::tools::require_absolute_path(&args.path, "the read path")
+            .map_err(ToolError::Msg)?;
         // Audit H12: pin the path we'll actually open to the same
         // canonical form the permission check ran against, so a
         // symlink swap between check and open can't land us on a
@@ -206,10 +225,10 @@ impl Tool for ReadTool {
             stamp,
         );
 
-        if let Some(ref cache) = self.cache {
-            if let Some(cached) = cache.get(&cache_key) {
-                return Ok(cached);
-            }
+        if let Some(ref cache) = self.cache
+            && let Some(cached) = cache.get(&cache_key)
+        {
+            return Ok(cached);
         }
 
         // F4: stream the file line-by-line via BufReader instead of

@@ -1,22 +1,13 @@
-//! Path resolution helpers for the permission checker.
+//! Path resolution helpers for the permission engine.
 //!
-//! Provides canonicalisation, symlink resolution, and
-//! builtin-allow rule installation (CWD-scoped write/edit/apply_patch
-//! and /dev/null exemption). Extracted from `checker.rs`.
-//!
-//! `resolve_absolute` is the public entry point — resolves a
-//! possibly-relative path through the working directory, follows
-//! symlinks, and normalises `..` / `.` components. Used by
-//! `PermissionChecker` and by external callers that need the same
-//! canonical path the permission check ran against (closing the
-//! symlink-swap TOCTOU between check and open).
+//! Provides canonicalisation and symlink resolution. `resolve_absolute`
+//! is the entry point — resolves a possibly-relative path through the
+//! working directory, follows symlinks, and normalises `..` / `.`
+//! components. Used by the engine's path classifier and by external
+//! callers that need the same canonical path the permission check ran
+//! against (closing the symlink-swap TOCTOU between check and open).
 
-use std::collections::HashMap;
 use std::path::Path;
-
-use crate::permission::Action;
-use crate::permission::engine;
-use crate::permission::pattern::Pattern;
 
 /// One-shot canonicalize for the working-directory cache. Best
 /// effort: if canonicalize fails (cwd doesn't exist on disk, e.g.
@@ -30,81 +21,13 @@ pub(crate) fn canonicalize_for_cache(working_dir: &str) -> String {
         .unwrap_or_else(|| working_dir.to_string())
 }
 
-/// Install the CWD-scoped builtin-allow rule on `rules` for the
-/// mutating filesystem tools (write/edit/apply_patch). Returns the
-/// pattern string installed (`Some`) so `set_working_dir` can find
-/// and remove it on cd; `None` when the working_dir is too
-/// degenerate to install safely.
-///
-/// Refuses to install when:
-///   - `working_dir` is empty (config-only init w/o cwd resolution).
-///   - The canonical form is `/` or shorter than 2 chars — the
-///     resulting pattern (`/**`) would silently allow writes anywhere
-///     on the filesystem, defeating the "permissive only inside the
-///     project" intent.
-///   - `working_dir` contains glob metacharacters (`*`, `?`, `[`,
-///     `{`). Such characters would be re-interpreted by the glob
-///     compiler rather than matched literally; a user starting dirge
-///     from `/tmp/[odd]` would get a character-class pattern matching
-///     unintended paths.
-///
-/// Uses `canonicalize_for_cache` so the pattern matches the canonical
-/// form `resolve_absolute` produces. Without this, macOS users whose
-/// `/var` / `/tmp` resolve to `/private/var` / `/private/tmp` would
-/// see the rule silently fail to match for any abs_path the checker
-/// computed.
-pub(crate) fn install_cwd_allow_rules(
-    rules: &mut HashMap<String, Vec<(Pattern, Action)>>,
-    working_dir: &str,
-) -> Option<String> {
-    if working_dir.is_empty() {
-        return None;
-    }
-    let canonical = canonicalize_for_cache(working_dir);
-    let trimmed = canonical.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed == "/" || canonical.len() < 2 {
-        return None;
-    }
-    if trimmed.chars().any(|c| matches!(c, '*' | '?' | '[' | '{')) {
-        return None;
-    }
-    let cwd_glob = format!("{}/**", trimmed);
-    for tool in ["write", "edit", "apply_patch"] {
-        rules
-            .entry(tool.to_string())
-            .or_default()
-            .push((engine::pattern_for_tool(tool, &cwd_glob), Action::Allow));
-    }
-    Some(cwd_glob)
-}
-
-/// Install a builtin-allow for `/dev/null` on every tool so the
-/// harmless bit-bucket never triggers a permission prompt. Writes
-/// to `/dev/null` discard data; reads return immediate EOF — no
-/// side effects, no security risk, no reason to ask.
-pub(crate) fn install_dev_null_allow(rules: &mut HashMap<String, Vec<(Pattern, Action)>>) {
-    for tool in [
-        "read",
-        "write",
-        "edit",
-        "apply_patch",
-        "glob",
-        "grep",
-        "find_files",
-        "list_dir",
-        "list_symbols",
-        "find_definition",
-        "find_callers",
-        "find_callees",
-        "get_symbol_body",
-        "repo_overview",
-        "lsp",
-    ] {
-        rules
-            .entry(tool.to_string())
-            .or_default()
-            .push((engine::pattern_for_tool(tool, "/dev/null"), Action::Allow));
-    }
+/// Best-effort canonicalize a `Path`, falling back to the path itself
+/// when it can't be resolved (doesn't exist on disk, permission error).
+/// The `PathBuf` analogue of [`canonicalize_for_cache`] and the single
+/// home for the `path.canonicalize().unwrap_or_else(|_| path.into())`
+/// idiom that was copy-pasted with varied fallbacks (dirge-b2g7).
+pub fn canonical_or_self(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
@@ -117,12 +40,53 @@ pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
     match std::fs::canonicalize(&joined) {
         Ok(canonical) => canonical.to_string_lossy().to_string(),
         Err(_) => {
-            if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name())
-                && let Ok(canonical_parent) = std::fs::canonicalize(parent)
-            {
-                return canonical_parent.join(name).to_string_lossy().to_string();
+            // The full path doesn't exist on disk (e.g. a write to a
+            // brand-new file, possibly in a brand-new nested dir).
+            // Canonicalize the DEEPEST existing ancestor so any
+            // symlink in the existing prefix is resolved to its
+            // realpath, then re-attach the still-nonexistent tail.
+            //
+            // Why the deepest ancestor and not just the immediate
+            // parent: when the agent writes to `new_a/new_b/file.rs`
+            // inside a symlinked cwd, neither `file.rs`'s parent
+            // (`new_b`) nor its grandparent (`new_a`) exist, so the
+            // old single-level parent canonicalize failed and we fell
+            // through to a purely lexical result that kept the SYMLINK
+            // form of the cwd. That form never matches the CWD-allow
+            // rule (built from the canonical cwd), so in-project writes
+            // re-prompted. Walking to the nearest existing ancestor
+            // fixes that while staying inside the project subtree.
+            //
+            // The tail is lexically normalized FIRST (resolving `.` /
+            // `..` without touching disk) so an attacker can't smuggle
+            // an escape through `existing_dir/../../etc/passwd`: the
+            // `..` are collapsed against the lexical components, and
+            // any that climb above the existing ancestor are preserved
+            // as `..` (see `lexical_normalize`), so the result escapes
+            // the cwd subtree and is correctly classified external.
+            let normalized = lexical_normalize(&joined);
+            let mut ancestor = normalized.as_path();
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            loop {
+                if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
+                    let mut out = canonical_ancestor;
+                    for seg in tail.iter().rev() {
+                        out.push(seg);
+                    }
+                    return out.to_string_lossy().to_string();
+                }
+                match (ancestor.parent(), ancestor.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        tail.push(name.to_os_string());
+                        ancestor = parent;
+                    }
+                    // Reached the root with nothing canonicalizable
+                    // (e.g. a fully bogus working_dir). Fall back to
+                    // the lexical form so the literal-prefix checks in
+                    // `is_external_path` still have something to match.
+                    _ => return normalized.to_string_lossy().to_string(),
+                }
             }
-            lexical_normalize(&joined).to_string_lossy().to_string()
         }
     }
 }
@@ -168,6 +132,7 @@ fn lexical_normalize(p: &Path) -> std::path::PathBuf {
 ///
 /// Returns `Ok(())` for plausible paths, `Err(reason)` for
 /// paths that should be hard-rejected.
+#[allow(dead_code)] // Phase 4: only reached via the legacy check_path facade
 pub fn validate_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);
     if p.is_absolute() {
@@ -228,6 +193,72 @@ mod tests {
         assert_eq!(resolved, expected, "symlink should resolve to its target",);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: a write to a brand-new file in a brand-new
+    /// NESTED directory inside a symlinked cwd must resolve through
+    /// the symlink to the real path. The immediate parent doesn't
+    /// exist (so single-level parent canonicalize fails); the fix
+    /// walks up to the deepest existing ancestor, canonicalizes
+    /// that (resolving the symlinked cwd), and re-attaches the
+    /// nonexistent tail. Without this the result kept the symlink
+    /// form, the CWD-allow rule (built from the canonical cwd) never
+    /// matched, and in-project writes re-prompted.
+    #[test]
+    fn resolve_absolute_walks_to_deepest_existing_ancestor_through_symlink() {
+        let base = std::env::temp_dir().join(format!("dirge-deepancestor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real_proj");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link_proj");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // newdir/sub do NOT exist yet; only `link_proj` (→ real_proj) does.
+        let target = link.join("newdir/sub/file.rs");
+        let resolved = resolve_absolute(target.to_str().unwrap(), link.to_str().unwrap());
+
+        let expected = std::fs::canonicalize(&real)
+            .unwrap()
+            .join("newdir/sub/file.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            resolved, expected,
+            "deep new path under symlinked cwd must resolve to realpath form",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Security: the deepest-ancestor walk must NOT let a `..`
+    /// traversal disguise an escape as internal. `..` is lexically
+    /// collapsed BEFORE the ancestor canonicalize, so a path that
+    /// climbs out of the (symlinked) cwd resolves outside the
+    /// subtree and is classified external (→ prompt), not allowed.
+    #[test]
+    fn resolve_absolute_dotdot_escape_through_symlinked_cwd_still_escapes() {
+        let base = std::env::temp_dir().join(format!("dirge-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real_proj");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link_proj");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let cwd = link.to_string_lossy().into_owned();
+        // newdir doesn't exist; the `..` chain climbs above the project.
+        let traversal = "newdir/../../../../../../etc/passwd";
+        let resolved = resolve_absolute(traversal, &cwd);
+
+        let cwd_canonical = std::fs::canonicalize(&real).unwrap();
+        let resolved_path = std::path::PathBuf::from(&resolved);
+        assert!(
+            !resolved_path.starts_with(&cwd_canonical),
+            "escape via .. must resolve outside the cwd subtree; got {resolved:?}",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// F7: nonexistent paths (writes to new files) must still

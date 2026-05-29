@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
+use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path_resolve};
 #[cfg(feature = "lsp")]
@@ -69,7 +70,10 @@ impl Tool for WriteTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "write".to_string(),
-            description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".to_string(),
+            description: with_contract_hint(
+                "write",
+                "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+            ),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -82,17 +86,13 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        // Reject non-absolute paths immediately with a clear error.
-        // The schema says "must be absolute, not relative" — without
-        // this guard the tool silently resolves "1" to "{cwd}/1" and
+        // Reject non-absolute paths immediately with a clear error
+        // (shared guard; the schema requires an absolute path).
+        // Without it the tool silently resolves "1" to "{cwd}/1" and
         // creates the file, confusing the model into thinking it wrote
         // to a real project path.
-        if !Path::new(&args.path).is_absolute() {
-            return Err(ToolError::Msg(format!(
-                "Path '{}' is not absolute. Write takes an absolute path like '/home/user/project/file.txt', not a relative path or bare filename.",
-                args.path,
-            )));
-        }
+        crate::agent::tools::require_absolute_path(&args.path, "the write path")
+            .map_err(ToolError::Msg)?;
         // Audit H12: pin file operations to the canonical path the
         // permission check ran against, so a symlink swap can't
         // redirect the write to an unauthorized target.
@@ -100,6 +100,17 @@ impl Tool for WriteTool {
             check_perm_path_resolve(&self.permission, &self.ask_tx, "write", &args.path).await?;
 
         let path = Path::new(&resolved_path);
+        // Phase-2 tree-sitter validation: refuse to write
+        // syntactically-broken code so the model sees the error
+        // in the SAME turn and self-corrects. No-op for unknown
+        // file types or when no `semantic-<lang>` feature is
+        // built. See docs/AGENTIC_LOOP_PLAN.md §2.
+        #[cfg(feature = "semantic")]
+        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(path, &args.content) {
+            return Err(ToolError::Msg(
+                crate::semantic::syntax_validator::format_errors(path, &errors),
+            ));
+        }
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -265,7 +276,7 @@ mod tests {
                 .unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("not absolute"),
+                msg.contains("absolute path"),
                 "path {path:?}: expected absolute-path rejection; got: {msg}",
             );
         }

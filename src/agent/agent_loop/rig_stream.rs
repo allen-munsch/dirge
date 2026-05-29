@@ -107,6 +107,30 @@ where
         // `internal_call_id`.
         let mut tool_indices: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // Phase-1 item #4 (docs/AGENTIC_LOOP_PLAN.md): set of tool
+        // calls whose `ToolCallEnd` hasn't fired yet. While any
+        // entry is open we cap the WAIT FOR THE NEXT CHUNK at
+        // `TOOL_CALL_GAP_TIMEOUT` — but the cap is reset every
+        // time the provider sends ANY chunk (text, reasoning,
+        // another tool-call delta). A model that legitimately
+        // interleaves text + tool-call deltas keeps making
+        // forward progress and never trips the gap timeout; only
+        // a true mid-assembly stall (no chunks of ANY kind for
+        // 30s while a tool call is open) fires.
+        //
+        // This addresses the review finding that the prior
+        // "any chunk subject to the 30s timeout while a tool
+        // call is open" semantic spuriously killed providers
+        // that interleave reasoning between tool-call deltas.
+        let mut open_tool_calls: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        const TOOL_CALL_GAP_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(30);
+        // Wall-clock instant when the last forward-progress chunk
+        // arrived. Used to compute the remaining gap budget while
+        // a tool call is mid-assembly. Initialized to "now" so
+        // the first wait starts with the full budget.
+        let mut last_chunk_at = std::time::Instant::now();
 
         // Token usage captured from the Final(R) provider response.
         let mut token_usage: Option<super::message::TokenUsage> = None;
@@ -129,10 +153,30 @@ where
                 };
                 return;
             }
-            // Apply per-chunk timeout if configured. The yield
-            // pattern below mirrors `while let Some(...)` exactly
-            // for the non-timeout path.
-            let next = match chunk_timeout {
+            // Apply per-chunk timeout. When a tool call is
+            // mid-assembly we narrow to the remaining gap budget
+            // (TOOL_CALL_GAP_TIMEOUT minus elapsed since the last
+            // chunk of any kind). Otherwise the configured
+            // `chunk_timeout` is used as-is.
+            let effective_timeout = if !open_tool_calls.is_empty() {
+                let remaining = TOOL_CALL_GAP_TIMEOUT.saturating_sub(last_chunk_at.elapsed());
+                let gap_budget = if remaining.is_zero() {
+                    // The forward-progress window already
+                    // expired between iterations. Fire the
+                    // timeout immediately rather than racing
+                    // an effectively-zero `tokio::time::timeout`.
+                    std::time::Duration::from_millis(1)
+                } else {
+                    remaining
+                };
+                match chunk_timeout {
+                    Some(t) => Some(t.min(gap_budget)),
+                    None => Some(gap_budget),
+                }
+            } else {
+                chunk_timeout
+            };
+            let next = match effective_timeout {
                 Some(t) => match tokio::time::timeout(t, raw.next()).await {
                     Ok(item) => item,
                     Err(_) => {
@@ -140,12 +184,19 @@ where
                         // recovery::classify_error matches on
                         // it and routes to ErrorKind::Network for
                         // retry. Matches runner.rs:301-304.
-                        yield StreamEvent::Error {
-                            error: format!(
+                        let detail = if !open_tool_calls.is_empty() {
+                            format!(
+                                "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls)",
+                                t.as_secs(),
+                                TOOL_CALL_GAP_TIMEOUT.as_secs(),
+                            )
+                        } else {
+                            format!(
                                 "stream chunk timed out after {}s (provider stalled or connection silently dropped) — bump `stream_chunk_timeout_secs` in config.json if your model has long reasoning gaps",
                                 t.as_secs(),
-                            ),
+                            )
                         };
+                        yield StreamEvent::Error { error: detail };
                         return;
                     }
                 },
@@ -155,6 +206,13 @@ where
                 Some(item) => item,
                 None => break,
             };
+            // Forward-progress signal — refresh the gap window
+            // so the next iteration's tool-call-gap budget
+            // starts fresh. Applied to every chunk regardless
+            // of kind (text, reasoning, tool-call-delta, final
+            // ToolCall): any forward motion from the provider
+            // is enough to reset the stall detector.
+            last_chunk_at = std::time::Instant::now();
             match item {
                 Ok(StreamedAssistantContent::Text(t)) => {
                     match current_text_idx {
@@ -275,7 +333,7 @@ where
                     } else {
                         let idx = partial.content.len();
                         partial.content.push(new_block);
-                        tool_indices.insert(internal_call_id, idx);
+                        tool_indices.insert(internal_call_id.clone(), idx);
                     }
                     current_text_idx = None;
                     current_thinking_idx = None;
@@ -291,6 +349,11 @@ where
                         partial: partial.clone(),
                         phase: DeltaPhase::ToolCallEnd,
                     };
+                    // Phase-1 #4: clear the open-call marker now
+                    // that the call is finalized. `was_existing`
+                    // means deltas arrived first; either way the
+                    // ToolCallEnd above closes it.
+                    open_tool_calls.remove(&internal_call_id);
                 }
                 Ok(StreamedAssistantContent::ToolCallDelta {
                     id,
@@ -314,6 +377,10 @@ where
                             arguments: serde_json::Value::String(String::new()),
                         });
                         tool_indices.insert(internal_call_id.clone(), i);
+                        // Phase-1 #4: mark this call open so the
+                        // chunk-timeout narrows until ToolCallEnd
+                        // fires.
+                        open_tool_calls.insert(internal_call_id.clone());
                         current_text_idx = None;
                         current_thinking_idx = None;
                         i
@@ -790,6 +857,421 @@ mod tests {
         assert_eq!(dones, 0);
     }
 
+    // ── dirge-ets0: Scavenge provider-coverage matrix ────────────
+    //
+    // Pillar 2 audit found that scavenge only reads
+    // ContentBlock::Thinking. The end-to-end claim is that ALL
+    // three reasoning surfaces (DeepSeek reasoning_content, OpenAI
+    // o1 summary, Anthropic extended thinking) route through rig
+    // into Thinking, so tool-call JSON the model forgot to put in
+    // the structured tool_calls field gets recovered.
+    //
+    // These tests drive the full pipeline:
+    // 1. Construct the rig-level streaming events for each
+    //    provider shape.
+    // 2. Run them through `wrap_streamed_assistant`.
+    // 3. Extract the final AssistantMessage's Thinking content
+    //    (the same surface run.rs:558-566 reads).
+    // 4. Feed it to `scavenge_tool_calls`.
+    // 5. Assert the orphan tool call was recovered.
+
+    use crate::agent::agent_loop::scavenge::scavenge_tool_calls;
+    use std::collections::HashSet;
+
+    /// Extract the same `reasoning_text` string `run.rs:558-566`
+    /// constructs from an AssistantMessage. Centralized helper
+    /// so the test matrix mirrors the production reasoning-text
+    /// shape verbatim — if run.rs ever changes how it joins
+    /// Thinking blocks, these tests must change with it.
+    fn reasoning_text_of(message: &AssistantMessage) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn allowed_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// DeepSeek pattern: provider streams the `reasoning_content`
+    /// field as chunked `ReasoningDelta` events. The chunks may
+    /// straddle JSON tokens. End-to-end: a model that forgot to
+    /// emit the call in `tool_calls` but described it in
+    /// reasoning must be recovered by scavenge.
+    #[tokio::test]
+    async fn provider_coverage_deepseek_reasoning_delta_chunks() {
+        // Three chunks with the orphan tool-call JSON straddling
+        // chunk boundaries — the worst case for naive joiners.
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: "I should call ".to_string(),
+            }),
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: r#"{"name": "get_weather", "arguments""#.to_string(),
+            }),
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: r#": {"city": "SF"}}"#.to_string(),
+            }),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let message = match events.last() {
+            Some(StreamEvent::Done { message, .. }) => message.clone(),
+            _ => panic!("expected Done"),
+        };
+        // Verify the Thinking block was assembled correctly from
+        // the chunks before scavenge runs against it.
+        let reasoning = reasoning_text_of(&message);
+        assert!(
+            reasoning.contains(r#"{"name": "get_weather", "arguments": {"city": "SF"}}"#),
+            "chunks must reassemble into the full JSON: {reasoning:?}",
+        );
+        // End-to-end scavenge.
+        let allowed = allowed_set(&["get_weather"]);
+        let result = scavenge_tool_calls(Some(&reasoning), &allowed, 4);
+        assert_eq!(
+            result.calls.len(),
+            1,
+            "scavenge must recover the orphan call from DeepSeek-style \
+             reasoning_content chunks: {result:?}",
+        );
+        assert_eq!(result.calls[0].name, "get_weather");
+        assert_eq!(result.calls[0].arguments["city"], "SF");
+    }
+
+    /// OpenAI o1 pattern: provider emits a single complete
+    /// Reasoning event with `ReasoningContent::Summary`. The
+    /// summary is a redacted overview of the model's internal
+    /// thinking — but if a tool-call JSON shows up in it (rare
+    /// but observed), scavenge must still recover it.
+    #[tokio::test]
+    async fn provider_coverage_openai_o1_summary_reasoning() {
+        let mut reasoning = Reasoning::new("");
+        // Public constructor builds an empty Reasoning; mutate
+        // its content via the same path the provider takes.
+        reasoning.content = vec![ReasoningContent::Summary(
+            r#"Plan: {"name": "search", "arguments": {"q": "rust async"}}"#.to_string(),
+        )];
+        let raw = raw_stream(vec![Ok(StreamedAssistantContent::Reasoning(reasoning))]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let message = match events.last() {
+            Some(StreamEvent::Done { message, .. }) => message.clone(),
+            _ => panic!("expected Done"),
+        };
+        let reasoning_text = reasoning_text_of(&message);
+        let allowed = allowed_set(&["search"]);
+        let result = scavenge_tool_calls(Some(&reasoning_text), &allowed, 4);
+        assert_eq!(
+            result.calls.len(),
+            1,
+            "scavenge must recover orphan call from o1 Summary: \
+             reasoning={reasoning_text:?}, result={result:?}",
+        );
+        assert_eq!(result.calls[0].name, "search");
+        assert_eq!(result.calls[0].arguments["q"], "rust async");
+    }
+
+    /// Anthropic extended-thinking pattern: provider emits a
+    /// complete Reasoning event with one or more
+    /// `ReasoningContent::Text` entries. End-to-end recovery
+    /// must work identically to the o1 case.
+    #[tokio::test]
+    async fn provider_coverage_anthropic_extended_thinking_text() {
+        let mut reasoning = Reasoning::new("");
+        reasoning.content = vec![
+            ReasoningContent::Text {
+                text: "Let me look this up.".to_string(),
+                signature: None,
+            },
+            ReasoningContent::Text {
+                text: r#"I'll dispatch: {"name": "search", "arguments": {"q": "anthropic"}}"#
+                    .to_string(),
+                signature: None,
+            },
+        ];
+        let raw = raw_stream(vec![Ok(StreamedAssistantContent::Reasoning(reasoning))]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let message = match events.last() {
+            Some(StreamEvent::Done { message, .. }) => message.clone(),
+            _ => panic!("expected Done"),
+        };
+        let reasoning_text = reasoning_text_of(&message);
+        let allowed = allowed_set(&["search"]);
+        let result = scavenge_tool_calls(Some(&reasoning_text), &allowed, 4);
+        assert_eq!(
+            result.calls.len(),
+            1,
+            "scavenge must recover orphan call from Anthropic-style \
+             multi-text reasoning: {result:?}",
+        );
+        assert_eq!(result.calls[0].name, "search");
+        assert_eq!(result.calls[0].arguments["q"], "anthropic");
+    }
+
+    /// Anthropic-specific edge: `ReasoningContent::Encrypted` and
+    /// `Redacted` payloads. These are opaque (the model never
+    /// emits them as scavengeable text) — they MUST be dropped
+    /// without panicking and without producing a Thinking block
+    /// with garbled bytes. Documents the intentional gap so a
+    /// future change that *does* surface them is conscious.
+    #[tokio::test]
+    async fn provider_coverage_anthropic_encrypted_thinking_is_dropped_silently() {
+        // Use the rig API directly so we don't depend on whether
+        // these variants are constructible from public APIs.
+        let mut reasoning = Reasoning::new("");
+        reasoning.content = vec![
+            ReasoningContent::Text {
+                text: "visible reasoning".to_string(),
+                signature: None,
+            },
+            ReasoningContent::Encrypted("OPAQUE_BYTES".to_string()),
+        ];
+        let raw = raw_stream(vec![Ok(StreamedAssistantContent::Reasoning(reasoning))]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let message = match events.last() {
+            Some(StreamEvent::Done { message, .. }) => message.clone(),
+            _ => panic!("expected Done"),
+        };
+        let reasoning_text = reasoning_text_of(&message);
+        // Visible text survives.
+        assert!(
+            reasoning_text.contains("visible reasoning"),
+            "Text content must survive: {reasoning_text:?}",
+        );
+        // Encrypted payload does NOT leak into the reasoning
+        // surface — scavenge would otherwise try to parse opaque
+        // bytes as JSON and could produce spurious notes.
+        assert!(
+            !reasoning_text.contains("OPAQUE_BYTES"),
+            "encrypted payload must be dropped, not appended: {reasoning_text:?}",
+        );
+        // Scavenge on the remaining text finds nothing actionable
+        // (no JSON in the visible portion). Important: it must
+        // not crash on the encrypted-was-dropped path.
+        let allowed = allowed_set(&["search"]);
+        let result = scavenge_tool_calls(Some(&reasoning_text), &allowed, 4);
+        assert!(
+            result.calls.is_empty(),
+            "no orphan call in visible text; scavenge must return empty",
+        );
+    }
+
+    /// Cross-provider negative: an orphan call to a tool the
+    /// model isn't allowed to call must be ignored regardless of
+    /// which reasoning surface surfaced it. Defense against the
+    /// failure mode where the model hallucinates a `rm -rf /`
+    /// tool in reasoning and scavenge would otherwise dispatch it.
+    #[tokio::test]
+    async fn provider_coverage_orphan_call_to_disallowed_tool_is_ignored() {
+        let raw = raw_stream(vec![Ok(StreamedAssistantContent::ReasoningDelta {
+            id: None,
+            reasoning: r#"{"name": "rm_rf_slash", "arguments": {}}"#.to_string(),
+        })]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let message = match events.last() {
+            Some(StreamEvent::Done { message, .. }) => message.clone(),
+            _ => panic!("expected Done"),
+        };
+        let reasoning_text = reasoning_text_of(&message);
+        // Only "search" is allowed; "rm_rf_slash" is not.
+        let allowed = allowed_set(&["search"]);
+        let result = scavenge_tool_calls(Some(&reasoning_text), &allowed, 4);
+        assert!(
+            result.calls.is_empty(),
+            "scavenge must skip disallowed tools regardless of reasoning surface",
+        );
+    }
+
+    /// Multiple Thinking blocks (interleaved with text content)
+    /// MUST all be joined the same way `run.rs:558-566` does so
+    /// a tool call that straddles a text→thinking→text boundary
+    /// gets recovered. Catches a regression where some future
+    /// refactor might forget to concat all Thinking blocks.
+    #[tokio::test]
+    async fn provider_coverage_multiple_thinking_blocks_all_scavenged() {
+        let mut r1 = Reasoning::new("");
+        r1.content = vec![ReasoningContent::Text {
+            text: r#"first: {"name": "get_weather", "arguments": {"city": "SF"}}"#.to_string(),
+            signature: None,
+        }];
+        let mut r2 = Reasoning::new("");
+        r2.content = vec![ReasoningContent::Text {
+            text: r#"second: {"name": "search", "arguments": {"q": "x"}}"#.to_string(),
+            signature: None,
+        }];
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::Reasoning(r1)),
+            Ok(StreamedAssistantContent::Text(Text {
+                text: "between".to_string(),
+            })),
+            Ok(StreamedAssistantContent::Reasoning(r2)),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let message = match events.last() {
+            Some(StreamEvent::Done { message, .. }) => message.clone(),
+            _ => panic!("expected Done"),
+        };
+        let reasoning_text = reasoning_text_of(&message);
+        let allowed = allowed_set(&["get_weather", "search"]);
+        let result = scavenge_tool_calls(Some(&reasoning_text), &allowed, 4);
+        assert_eq!(
+            result.calls.len(),
+            2,
+            "both Thinking blocks must contribute to scavenge: {result:?}",
+        );
+        let names: Vec<&str> = result.calls.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"get_weather"));
+        assert!(names.contains(&"search"));
+    }
+
+    /// dirge-ets0 end-to-end: full chain stream → assistant
+    /// message → scavenge → dedupe → tool_calls. Mirrors the
+    /// integration in `run.rs:558-636` to prove the wiring works
+    /// across the boundary, not just at the surface points the
+    /// per-provider tests check.
+    ///
+    /// Scenario: model emits ONE structured tool call AND a
+    /// reasoning block containing the SAME call (provider double-
+    /// emit, e.g. R1 leaking the call into reasoning_content) PLUS
+    /// a NEW orphan call. After integration:
+    /// - the structured call stays exactly once (dedupe wins)
+    /// - the orphan call is appended (novel signature)
+    /// - no third copy of the structured call shows up
+    #[tokio::test]
+    async fn provider_coverage_end_to_end_scavenge_dedupe_chain() {
+        use rig::completion::message::{ToolCall as RigToolCall, ToolFunction as RigToolFunction};
+
+        // Stream: structured tool call + reasoning describing
+        // the same call AND a new one.
+        let raw = raw_stream(vec![
+            Ok(StreamedAssistantContent::ReasoningDelta {
+                id: None,
+                reasoning: format!(
+                    "Plan: call get_weather. {} Then maybe also {}",
+                    r#"{"name": "get_weather", "arguments": {"city": "SF"}}"#,
+                    r#"{"name": "search", "arguments": {"q": "tide"}}"#,
+                ),
+            }),
+            Ok(StreamedAssistantContent::ToolCall {
+                tool_call: RigToolCall {
+                    id: "call-1".to_string(),
+                    function: RigToolFunction {
+                        name: "get_weather".to_string(),
+                        arguments: serde_json::json!({"city": "SF"}),
+                    },
+                    call_id: None,
+                    signature: None,
+                    additional_params: None,
+                },
+                internal_call_id: "internal-1".to_string(),
+            }),
+        ]);
+        let events = drain(wrap_streamed_assistant(raw, None, None)).await;
+        let message = match events.last() {
+            Some(StreamEvent::Done { message, .. }) => message.clone(),
+            _ => panic!("expected Done"),
+        };
+
+        // Mirror run.rs:535-554 — collect structured tool calls.
+        let mut tool_calls: Vec<crate::agent::agent_loop::tools::ToolCall> = message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Some(crate::agent::agent_loop::tools::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "structured tool call must be extracted exactly once"
+        );
+
+        // Mirror run.rs:558-636 — scavenge + dedupe.
+        let reasoning_text = reasoning_text_of(&message);
+        let allowed = allowed_set(&["get_weather", "search"]);
+        let scavenge_result = scavenge_tool_calls(Some(&reasoning_text), &allowed, 4);
+        assert_eq!(
+            scavenge_result.calls.len(),
+            2,
+            "scavenge must find both reasoning-embedded calls",
+        );
+
+        // Same canonical-JSON dedupe shape as run.rs.
+        fn canonical(v: &serde_json::Value) -> String {
+            match v {
+                serde_json::Value::Object(m) => {
+                    let mut keys: Vec<&String> = m.keys().collect();
+                    keys.sort();
+                    let mut s = String::from("{");
+                    for (i, k) in keys.iter().enumerate() {
+                        if i > 0 {
+                            s.push(',');
+                        }
+                        s.push_str(&serde_json::to_string(k).unwrap_or_default());
+                        s.push(':');
+                        s.push_str(&canonical(&m[*k]));
+                    }
+                    s.push('}');
+                    s
+                }
+                serde_json::Value::Array(a) => {
+                    let mut s = String::from("[");
+                    for (i, e) in a.iter().enumerate() {
+                        if i > 0 {
+                            s.push(',');
+                        }
+                        s.push_str(&canonical(e));
+                    }
+                    s.push(']');
+                    s
+                }
+                other => serde_json::to_string(other).unwrap_or_default(),
+            }
+        }
+        let seen: HashSet<String> = tool_calls
+            .iter()
+            .map(|tc| format!("{}::{}", tc.name, canonical(&tc.arguments)))
+            .collect();
+        for sc in &scavenge_result.calls {
+            let sig = format!("{}::{}", sc.name, canonical(&sc.arguments));
+            if !seen.contains(&sig) {
+                tool_calls.push(sc.clone());
+            }
+        }
+
+        // Final assertion: structured call preserved, orphan
+        // added, no double-count.
+        assert_eq!(
+            tool_calls.len(),
+            2,
+            "expected 2 calls (1 structured + 1 novel scavenged); got: {:?}",
+            tool_calls.iter().map(|t| &t.name).collect::<Vec<_>>(),
+        );
+        let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["get_weather", "search"]);
+        // Structured call's id is preserved (the reasoning copy
+        // had no id and would have been ignored only if dedupe
+        // hit — which it must).
+        assert_eq!(tool_calls[0].id, "call-1");
+    }
+
     /// Mixed content: text → reasoning → text produces 3 blocks
     /// because the reasoning resets the text-block index.
     #[tokio::test]
@@ -866,6 +1348,34 @@ mod tests {
         }))
     }
 
+    /// Stream that yields a partial ToolCallDelta then stalls
+    /// forever. Models the "DeepSeek stalled mid-tool-call"
+    /// failure that Phase-1 item #4 targets.
+    fn tool_call_delta_then_stall() -> Pin<
+        Box<
+            dyn Stream<Item = Result<StreamedAssistantContent<TestResponse>, CompletionError>>
+                + Send,
+        >,
+    > {
+        use futures::stream;
+        use rig::streaming::ToolCallDeltaContent;
+        Box::pin(stream::unfold(0u32, |n| async move {
+            if n == 0 {
+                Some((
+                    Ok(StreamedAssistantContent::ToolCallDelta {
+                        id: "call_a".to_string(),
+                        internal_call_id: "ica_a".to_string(),
+                        content: ToolCallDeltaContent::Name("read".to_string()),
+                    }),
+                    1,
+                ))
+            } else {
+                let () = futures::future::pending().await;
+                None
+            }
+        }))
+    }
+
     /// `None` chunk_timeout → no timeout enforcement. Verifies
     /// the disabled-timeout path is identical to the pre-h-3
     /// behavior.
@@ -882,6 +1392,130 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Error { .. }))
         );
+    }
+
+    /// Phase-1 #4 fix: forward-progress chunks (text, reasoning,
+    /// another tool-call delta) reset the gap budget. A
+    /// provider that emits one ToolCallDelta, then a few
+    /// TextDeltas across e.g. 25s, then more ToolCallDeltas
+    /// should NOT trigger the gap timeout — only true silence
+    /// of 30s does. Regression test for the review finding.
+    #[tokio::test]
+    async fn gap_timeout_resets_on_interleaved_text_delta() {
+        use rig::streaming::ToolCallDeltaContent;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        tokio::time::pause();
+        let step = Arc::new(AtomicU32::new(0));
+        let step_clone = step.clone();
+        let raw: Pin<
+            Box<
+                dyn Stream<Item = Result<StreamedAssistantContent<TestResponse>, CompletionError>>
+                    + Send,
+            >,
+        > = Box::pin(futures::stream::unfold(0u32, move |n| {
+            let step = step_clone.clone();
+            async move {
+                step.store(n, Ordering::SeqCst);
+                match n {
+                    0 => Some((
+                        Ok(StreamedAssistantContent::ToolCallDelta {
+                            id: "c1".to_string(),
+                            internal_call_id: "ic1".to_string(),
+                            content: ToolCallDeltaContent::Name("read".to_string()),
+                        }),
+                        1,
+                    )),
+                    1 => {
+                        // Sleep 20s — within the 30s gap budget.
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        Some((
+                            Ok(StreamedAssistantContent::Text(Text {
+                                text: "thinking…".to_string(),
+                            })),
+                            2,
+                        ))
+                    }
+                    2 => {
+                        // Sleep another 20s — still under 30s
+                        // since the previous text delta reset
+                        // the budget.
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        Some((
+                            Ok(StreamedAssistantContent::Text(Text {
+                                text: "more thinking…".to_string(),
+                            })),
+                            3,
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+        }));
+        let drain_task = tokio::spawn(async move {
+            drain(wrap_streamed_assistant(
+                raw,
+                Some(Duration::from_secs(300)),
+                None,
+            ))
+            .await
+        });
+        tokio::time::advance(Duration::from_secs(50)).await;
+        let events = drain_task.await.unwrap();
+
+        // The stream should complete naturally (Done) rather
+        // than timeout. The 30s gap budget never expires
+        // because each ~20s wait is followed by a chunk.
+        let has_timeout_error = events.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::Error { error } if error.contains("timed out")
+            )
+        });
+        assert!(
+            !has_timeout_error,
+            "gap timeout should NOT fire when forward progress \
+             (text deltas) keeps arriving within the 30s window: \
+             events = {events:?}",
+        );
+    }
+
+    /// Phase-1 #4: when a tool call is mid-assembly, the chunk
+    /// timeout narrows to the gap-timeout (30s) even if the
+    /// configured `chunk_timeout` is much larger. Without this,
+    /// a provider stalled emitting tool-call deltas would wait
+    /// the full 300s default before erroring.
+    #[tokio::test]
+    async fn tool_call_gap_timeout_fires_within_30s_even_with_large_chunk_timeout() {
+        tokio::time::pause();
+        let raw = tool_call_delta_then_stall();
+        let drain_task = tokio::spawn(async move {
+            drain(wrap_streamed_assistant(
+                raw,
+                Some(Duration::from_secs(300)),
+                None,
+            ))
+            .await
+        });
+        // Advance just past the gap timeout. The broad 300s
+        // timeout would not have fired yet.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let events = drain_task.await.unwrap();
+
+        let last = events.last().expect("must have events");
+        match last {
+            StreamEvent::Error { error } => {
+                assert!(
+                    error.contains("timed out"),
+                    "error must contain 'timed out' for retry routing: {error}"
+                );
+                assert!(
+                    error.contains("tool call was mid-assembly") || error.contains("tool-call"),
+                    "error should explain the tighter tool-call timeout: {error}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     /// Stalled stream + `Some(timeout)` → Error event with

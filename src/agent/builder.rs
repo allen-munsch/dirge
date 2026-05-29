@@ -2,7 +2,10 @@ use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
 use std::sync::Arc;
 
-use crate::agent::prompt::{SYSTEM_PROMPT, TODO_TOOLS_PROMPT};
+use crate::agent::prompt::{
+    MEMORY_GUIDANCE, PROJECT_SKILLS_PREAMBLE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    SYSTEM_PROMPT, TODO_TOOLS_PROMPT,
+};
 use crate::agent::tools;
 use crate::agent::tools::ToolCache;
 use crate::agent::tools::background::BackgroundStore;
@@ -20,6 +23,62 @@ use crate::sandbox::Sandbox;
 #[cfg(feature = "semantic")]
 use crate::semantic::SemanticManager;
 use crate::skill::{self, Skill};
+
+/// Append a memory provider's prompt block to the assembled preamble.
+/// Goes through `MemoryProvider::format_for_system_prompt`
+/// (trait-dispatched) so a non-default backend's block lands in the
+/// preamble too — pre-fix `builder.rs` called the concrete
+/// `MemoryToolStore::format_for_system_prompt` directly, which broke
+/// any future plugin provider's prompt contribution. See dirge-fmau.
+pub(crate) fn append_memory_to_preamble(
+    preamble: &mut String,
+    provider: &std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>,
+) {
+    tracing::debug!(
+        target: "dirge::memory",
+        provider = provider.name(),
+        "Injecting memory provider prompt block"
+    );
+    let block = provider.format_for_system_prompt();
+    if !block.is_empty() {
+        preamble.push_str(&block);
+    }
+}
+
+/// Assemble the always-on base preamble — `SYSTEM_PROMPT`,
+/// `TODO_TOOLS_PROMPT`, and the in-session `SKILLS_GUIDANCE`
+/// (dirge-xxun, mirroring hermes `SKILLS_GUIDANCE`). Other contextual
+/// blocks (AGENTS.md, prompts, project skills, memory) are layered on
+/// top by `build_agent_inner`. Extracted so the assembly is testable
+/// without exercising the full DI signature.
+pub(crate) fn assemble_base_preamble() -> String {
+    let mut p = SYSTEM_PROMPT.to_string();
+    p.push('\n');
+    p.push_str(TODO_TOOLS_PROMPT);
+    // dirge-xxun: skills self-improvement nudge (hermes SKILLS_GUIDANCE).
+    p.push_str(SKILLS_GUIDANCE);
+    // dirge-a6bv: memory + past-session recall guidance (hermes
+    // MEMORY_GUIDANCE + SESSION_SEARCH_GUIDANCE). Both tools are always
+    // present in dirge's registry, so we inject unconditionally rather
+    // than tool-gating like hermes does on `valid_tool_names`.
+    p.push_str(MEMORY_GUIDANCE);
+    p.push_str(SESSION_SEARCH_GUIDANCE);
+    p
+}
+
+/// Factory for the `SessionSearchTool` instance plumbed into both the
+/// rig-side tool registry and the new agent_loop registry. Lives here
+/// (rather than inline at each construction site) so the threading of
+/// `session_id` is testable without downcasting through `dyn LoopTool`.
+/// See dirge-502b.
+pub(crate) fn build_session_search_tool(
+    db_path: std::path::PathBuf,
+    session_id: Option<String>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+) -> tools::SessionSearchTool {
+    tools::SessionSearchTool::new(db_path, session_id, permission, ask_tx)
+}
 
 /// Wrap every tool with `HookedToolDyn` so plugins can intercept calls.
 /// On non-plugin builds this is a no-op identity, so callers can use it
@@ -39,6 +98,12 @@ fn hookify(tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> Vec<Box<dyn rig::tool::To
     }
 }
 
+// Arity reflects the wide dependency-injection signature the agent
+// builder uses — every collaborator (model, CLI, config, permission,
+// channels, plugin manager, semantic index, hooks, …) is passed
+// explicitly so wiring stays grep-able. Refactoring into a builder
+// struct is tracked separately; silence the lint here.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_agent_inner<M: CompletionModel + 'static>(
     model: M,
     cli: &Cli,
@@ -54,7 +119,19 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     parent_model: Option<AnyModel>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
-) -> (Agent<M>, ToolCache) {
+    // Active session id. Passed through to `SessionSearchTool` so the
+    // model's `session_search` calls exclude the live session's own
+    // turns. `None` is only correct for one-shot non-session runs.
+    // See dirge-502b.
+    session_id: Option<String>,
+) -> (
+    Agent<M>,
+    ToolCache,
+    // dirge-7tvq: surface the constructed MemoryProvider so the
+    // caller (provider::build_agent) can attach it to AnyAgent for
+    // session-lifecycle hook dispatch. `None` when load failed.
+    Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let skills: Arc<[Skill]> = Arc::from(
         tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
@@ -68,9 +145,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // at the permission-checker layer. Plan / review modes deny
     // edit/write/apply_patch/bash entirely, so the file-name gate
     // is unnecessary.
-    let mut preamble = SYSTEM_PROMPT.to_string();
-    preamble.push('\n');
-    preamble.push_str(TODO_TOOLS_PROMPT);
+    let mut preamble = assemble_base_preamble();
     if let Some(agents) = &context.agents {
         preamble.push_str("\n\n");
         preamble.push_str(agents);
@@ -144,14 +219,32 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         .unwrap_or_else(|_| {
             crate::extras::dirge_paths::ProjectPaths::new(std::path::Path::new("."))
         });
-    let memory_store: Option<Arc<crate::extras::memory_store::MemoryToolStore>> =
-        match crate::extras::memory_store::MemoryToolStore::load(&paths) {
+    // dirge-dktb: `MemoryToolStore::load` performs synchronous file
+    // I/O for both memory + pitfalls. On slow filesystems (NFS,
+    // network mounts) this blocks the async runtime worker thread
+    // during agent construction. Move the synchronous load onto
+    // the blocking pool, mirroring the `skill::discover_skills`
+    // shape above. `unwrap_or_default()` collapses both a
+    // `spawn_blocking` JoinError and a load error into `None`,
+    // which matches the previous `Err(_) => None` branch.
+    let paths_for_mem = paths.clone();
+    let memory_load_result: Result<crate::extras::memory_store::MemoryToolStore, String> =
+        tokio::task::spawn_blocking(move || {
+            crate::extras::memory_store::MemoryToolStore::load(&paths_for_mem)
+        })
+        .await
+        .unwrap_or_else(|_| Err("spawn_blocking join failed".to_string()));
+    // dirge-fmau: route the preamble snapshot through the
+    // `MemoryProvider` trait so a non-default backend's prompt block
+    // appears too. The unsizing coercion from `Arc<MemoryToolStore>`
+    // to `Arc<dyn MemoryProvider>` is the only call-site change.
+    let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
+        match memory_load_result {
             Ok(store) => {
-                let mem_text = store.format_for_system_prompt();
-                if !mem_text.is_empty() {
-                    preamble.push_str(&mem_text);
-                }
-                Some(Arc::new(store))
+                let provider: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
+                    Arc::new(store);
+                append_memory_to_preamble(&mut preamble, &provider);
+                Some(provider)
             }
             Err(_) => None,
         };
@@ -167,24 +260,20 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         Ok(names) if !names.is_empty() => {
             let mut skill_lines = Vec::new();
             for name in &names {
-                if let Ok(content) = skill_manager.read_content(name) {
-                    if let Some(spec) =
+                if let Ok(content) = skill_manager.read_content(name)
+                    && let Some(spec) =
                         crate::extras::skills::format::parse_skill_spec(&content, name)
-                    {
-                        let desc = if spec.description.is_empty() {
-                            "(no description)".to_string()
-                        } else {
-                            spec.description.clone()
-                        };
-                        skill_lines.push(format!("  - **{name}**: {desc}"));
-                    }
+                {
+                    let desc = if spec.description.is_empty() {
+                        "(no description)".to_string()
+                    } else {
+                        spec.description.clone()
+                    };
+                    skill_lines.push(format!("  - **{name}**: {desc}"));
                 }
             }
             if !skill_lines.is_empty() {
-                preamble.push_str("\n\n## Project Skills\n\n");
-                preamble.push_str("The following skills are available for this project. ");
-                preamble
-                    .push_str("Use the `skill` tool with action='view' to load full content.\n\n");
+                preamble.push_str(PROJECT_SKILLS_PREAMBLE);
                 for line in &skill_lines {
                     preamble.push_str(line);
                     preamble.push('\n');
@@ -236,8 +325,25 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         builder = builder.temperature(clamped);
     }
 
+    // Phase 3 / part 2: install configured inline-output budgets
+    // for the disk-backed-output relay. `set_thresholds` writes
+    // process-wide statics read by `relay_if_large` on every
+    // bash/webfetch call. Done once at builder time — re-calling
+    // with the same values is a cheap atomic store.
+    crate::agent::tools::output_relay::set_thresholds(
+        cfg.tools
+            .as_ref()
+            .and_then(|t| t.bash_output_inline_max_bytes),
+        cfg.tools
+            .as_ref()
+            .and_then(|t| t.webfetch_output_inline_max_bytes),
+        cfg.tools
+            .as_ref()
+            .and_then(|t| t.task_output_inline_max_bytes),
+    );
+
     if cli.resolve_no_tools(cfg) {
-        (builder.build(), ToolCache::new())
+        (builder.build(), ToolCache::new(), memory_store)
     } else {
         let cache = ToolCache::new();
 
@@ -298,9 +404,9 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 permission.clone(),
                 ask_tx.clone(),
             )),
-            Box::new(tools::SessionSearchTool::new(
+            Box::new(build_session_search_tool(
                 paths.session_db_path(),
-                None,
+                session_id.clone(),
                 permission.clone(),
                 ask_tx.clone(),
             )),
@@ -342,21 +448,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         });
 
         // Web tools: gated on config + an env-var escape hatch.
-        // CONFIG.md documents both keys as defaulting to `true`;
+        // docs/config.md documents both keys as defaulting to `true`;
         // explicit `false` in config disables. The env vars are
         // symmetric — previously only `WEBSEARCH_ENABLED` existed,
         // forcing webfetch users to edit config.json for an
         // equivalent toggle. The runtime API-key check still has
         // to pass for websearch.
-        let env_true = |k: &str| {
-            std::env::var(k)
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false)
-        };
-        let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
-            || env_true("WEBSEARCH_ENABLED");
-        let webfetch_enabled = cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true)
-            || env_true("WEBFETCH_ENABLED");
+        let websearch_enabled = crate::config::websearch_enabled(cfg);
+        let webfetch_enabled = crate::config::webfetch_enabled(cfg);
 
         // Websearch now works out of the box without an API key —
         // mirrors opencode's behavior. Backend: Exa's hosted MCP
@@ -366,7 +465,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         // optional — when set, it's appended as `?exaApiKey=…` for
         // higher rate limits.
         let websearch_tool = if websearch_enabled {
-            let key = std::env::var("EXA_API_KEY").ok().filter(|k| !k.is_empty());
+            let key = crate::config::exa_api_key();
             Some(Box::new(tools::WebSearchTool::new(
                 permission.clone(),
                 ask_tx.clone(),
@@ -415,12 +514,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 
         #[cfg(feature = "lsp")]
         if let Some(manager) = &lsp_manager {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
             let lsp_tool = Box::new(tools::LspTool::new(
                 permission.clone(),
                 ask_tx.clone(),
                 manager.clone(),
-                cwd,
             )) as Box<dyn rig::tool::ToolDyn>;
             builder = builder.tools(hookify(vec![lsp_tool]));
         }
@@ -499,7 +596,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             }
         }
 
-        (builder.build(), cache)
+        (builder.build(), cache, memory_store)
     }
 }
 
@@ -545,12 +642,18 @@ pub async fn build_loop_tools(
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
     cli: &Cli,
     cfg: &Config,
-) -> Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> {
+    // Active session id forwarded to SessionSearchTool — see
+    // dirge-502b. Mirrors the same param on `build_agent_inner`.
+    session_id: Option<String>,
+) -> (
+    Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+) {
     use crate::agent::agent_loop::types::ToolExecutionMode;
     use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
 
     if cli.resolve_no_tools(cfg) {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
@@ -563,12 +666,25 @@ pub async fn build_loop_tools(
             .unwrap_or_default(),
     );
 
-    let memory_store: Option<Arc<crate::extras::memory_store::MemoryToolStore>> =
+    // dirge-dktb: same synchronous-I/O fix as `build_agent_inner`.
+    // Off-load the disk read to the blocking pool so a slow
+    // filesystem can't stall the async runtime worker. dirge-fmau:
+    // returns `Arc<dyn MemoryProvider>` so plugin backends can plug
+    // in without churning the call sites.
+    let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         if let Ok(c) = std::env::current_dir() {
             let paths = crate::extras::dirge_paths::ProjectPaths::new(&c);
-            crate::extras::memory_store::MemoryToolStore::load(&paths)
-                .ok()
-                .map(Arc::new)
+            tokio::task::spawn_blocking(move || {
+                crate::extras::memory_store::MemoryToolStore::load(&paths)
+                    .ok()
+                    .map(|s| {
+                        let arc: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
+                            Arc::new(s);
+                        arc
+                    })
+            })
+            .await
+            .unwrap_or_default()
         } else {
             None
         };
@@ -697,9 +813,9 @@ pub async fn build_loop_tools(
         .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
     tools.push(
         wrap(
-            tools::SessionSearchTool::new(
+            build_session_search_tool(
                 session_db_path,
-                None,
+                session_id.clone(),
                 permission.clone(),
                 ask_tx.clone(),
             ),
@@ -777,17 +893,10 @@ pub async fn build_loop_tools(
     }
 
     // Web tools — network reads, leave at default Parallel.
-    let env_true = |k: &str| {
-        std::env::var(k)
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false)
-    };
-    let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
-        || env_true("WEBSEARCH_ENABLED");
-    let webfetch_enabled =
-        cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true) || env_true("WEBFETCH_ENABLED");
+    let websearch_enabled = crate::config::websearch_enabled(cfg);
+    let webfetch_enabled = crate::config::webfetch_enabled(cfg);
     if websearch_enabled {
-        let key = std::env::var("EXA_API_KEY").ok().filter(|k| !k.is_empty());
+        let key = crate::config::exa_api_key();
         tools.push(
             wrap(
                 tools::WebSearchTool::new(permission.clone(), ask_tx.clone(), key),
@@ -830,10 +939,9 @@ pub async fn build_loop_tools(
     // LSP tool — read-only queries against the manager.
     #[cfg(feature = "lsp")]
     if let Some(manager) = &lsp_manager {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         tools.push(
             wrap(
-                tools::LspTool::new(permission.clone(), ask_tx.clone(), manager.clone(), cwd),
+                tools::LspTool::new(permission.clone(), ask_tx.clone(), manager.clone()),
                 None,
             )
             .await,
@@ -905,7 +1013,33 @@ pub async fn build_loop_tools(
         }
     }
 
-    tools
+    // Phase-3: dynamic-tool-search opt-in. When enabled, take a
+    // metadata snapshot of EVERY tool registered above (registry
+    // includes plugin + MCP + semantic + built-ins), allocate the
+    // shared loaded-set Arc, and register `ToolSearchTool`
+    // alongside the rest. The SAME Arc is returned so
+    // `build_agent` can attach it to `AnyAgent.tool_def_filter`
+    // (which `spawn_runner` then forwards to the stream
+    // factory's filter).
+    let tool_def_filter = if cfg.resolve_dynamic_tool_search() {
+        let registry: Vec<tools::ToolMeta> = tools
+            .iter()
+            .map(|t| tools::tool_search::meta_from_loop_tool(t.as_ref()))
+            .collect();
+        let filter: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let search_tool = tools::ToolSearchTool::new(Arc::new(registry), filter.clone());
+        // ToolSearchTool implements LoopTool directly (not via
+        // RigToolAdapter — it needs to mutate session state and
+        // doesn't fit the rig::ToolDyn shape). Push as Arc
+        // straight away.
+        tools.push(Arc::new(search_tool));
+        Some(filter)
+    } else {
+        None
+    };
+
+    (tools, tool_def_filter)
 }
 
 /// Append a mode-specific reminder to `preamble` based on the active prompt
@@ -1043,7 +1177,7 @@ mod reminder_tests {
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
 
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None, // permission
             None, // ask_tx
@@ -1060,6 +1194,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
 
@@ -1073,6 +1208,295 @@ mod reminder_tests {
         }
     }
 
+    /// dirge-xxun — the always-on base preamble includes the in-session
+    /// skill creation/patch guidance, so the model sees the trigger
+    /// every turn (not just at post-session review).
+    #[test]
+    fn base_preamble_includes_skills_guidance() {
+        let p = assemble_base_preamble();
+        // Trigger fragments must be present.
+        assert!(p.contains("complex task"), "missing create trigger");
+        assert!(p.contains("5+ tool calls"), "missing 5+ trigger");
+        assert!(
+            p.contains("patch it immediately"),
+            "missing patch-now trigger"
+        );
+        // Must name the real `skill` actions.
+        assert!(p.contains("action='create'"), "missing create action");
+        assert!(p.contains("action='patch'"), "missing patch action");
+        // Must NOT name hermes's tool aliases.
+        assert!(!p.contains("skill_manage"), "leaked hermes tool name");
+        // Section heading present.
+        assert!(
+            p.contains("## Skill creation and maintenance"),
+            "missing heading"
+        );
+    }
+
+    /// dirge-fmau — the memory-preamble injection path goes through
+    /// the `MemoryProvider` trait, so a non-default backend's prompt
+    /// block lands in the preamble too. Recording provider verifies
+    /// the trait method is called exactly once and its output appears.
+    #[test]
+    fn memory_preamble_injection_uses_trait_dispatch() {
+        use crate::extras::memory_provider::MemoryProvider;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordingProvider {
+            calls: AtomicUsize,
+            block: String,
+        }
+        impl MemoryProvider for RecordingProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+            fn format_for_system_prompt(&self) -> String {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.block.clone()
+            }
+            fn view(&self, _: &str) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        let provider: Arc<dyn MemoryProvider> = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            block: "\n\n## RecordingProviderBlock\n\nplugin-supplied prompt text\n".into(),
+        });
+
+        let mut preamble = String::from("base");
+        append_memory_to_preamble(&mut preamble, &provider);
+
+        assert!(
+            preamble.contains("## RecordingProviderBlock"),
+            "plugin provider's prompt heading must appear: {preamble}"
+        );
+        assert!(
+            preamble.contains("plugin-supplied prompt text"),
+            "plugin provider's body must appear: {preamble}"
+        );
+
+        // Empty block must not append anything.
+        let empty: Arc<dyn MemoryProvider> = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            block: String::new(),
+        });
+        let mut preamble2 = String::from("base2");
+        append_memory_to_preamble(&mut preamble2, &empty);
+        assert_eq!(
+            preamble2, "base2",
+            "empty provider block must not append anything"
+        );
+    }
+
+    /// dirge-1ati — full end-to-end: `build_agent_inner` runs with
+    /// the same DI pattern as production and produces an `Agent<M>`
+    /// whose `preamble` field carries every guidance block the
+    /// unit-level tests assert on (SKILLS_GUIDANCE, MEMORY_GUIDANCE,
+    /// SESSION_SEARCH_GUIDANCE). Pre-fix only the assembly helper
+    /// was tested; this test exercises the full builder path so a
+    /// future change that accidentally drops a guidance block from
+    /// the wiring (rather than from the helper) is caught.
+    #[tokio::test]
+    async fn build_agent_inner_emits_assembled_preamble() {
+        use crate::context::ContextFiles;
+        use rig::client::CompletionClient;
+        use rig::providers::openai;
+
+        let cli = Cli::parse_from::<_, &str>(["dirge"]);
+        let cfg = Config::default();
+        let context = ContextFiles {
+            agents: None,
+            prompts: std::collections::HashMap::new(),
+            current_prompt: None,
+            current_prompt_name: None,
+            current_prompt_deny_tools: Vec::new(),
+        };
+        // Real openai client/model — never called (no network until
+        // first request). The builder only inspects type bounds and
+        // builds the rig Agent wrapper around it.
+        let client = openai::Client::new("test-key")
+            .expect("openai client builds")
+            .completions_api();
+        let model = client.completion_model("gpt-4o");
+        let sandbox = Sandbox::new(false);
+
+        let (agent, _cache, _provider) = build_agent_inner(
+            model,
+            &cli,
+            &cfg,
+            &context,
+            None, // permission
+            None, // ask_tx
+            None, // question_tx
+            None, // plan_tx
+            None, // bg_store
+            #[cfg(feature = "lsp")]
+            None,
+            sandbox,
+            None, // parent_model
+            #[cfg(feature = "mcp")]
+            None,
+            #[cfg(feature = "semantic")]
+            None,
+            None, // session_id
+        )
+        .await;
+
+        let preamble = agent.preamble.unwrap_or_default();
+
+        // SKILLS_GUIDANCE markers (dirge-xxun).
+        assert!(
+            preamble.contains("## Skill creation and maintenance"),
+            "preamble must include skills heading"
+        );
+        assert!(
+            preamble.contains("complex task"),
+            "preamble must include create trigger"
+        );
+        assert!(
+            preamble.contains("action='patch'"),
+            "preamble must include skill patch action"
+        );
+
+        // MEMORY_GUIDANCE markers (dirge-a6bv).
+        assert!(
+            preamble.contains("persistent memory"),
+            "preamble must include memory intro"
+        );
+        assert!(
+            preamble.contains("Do NOT save task progress"),
+            "preamble must include do-not-save rule"
+        );
+        assert!(
+            preamble.contains("declarative facts"),
+            "preamble must include declarative-fact framing"
+        );
+
+        // SESSION_SEARCH_GUIDANCE markers (dirge-a6bv).
+        assert!(
+            preamble.contains("session_search"),
+            "preamble must mention session_search"
+        );
+        assert!(
+            preamble.contains("before asking them to repeat"),
+            "preamble must include past-session-recall nudge"
+        );
+
+        // Memory tool action names match the real schema
+        // (dirge-yqmo) — caught here in the resolved preamble so a
+        // future change to the SYSTEM_PROMPT bullet is verified
+        // end-to-end, not just in the constant.
+        for action in ["view", "add", "replace", "remove"] {
+            assert!(
+                preamble.contains(action),
+                "preamble must mention real memory action '{}'",
+                action
+            );
+        }
+        for forbidden in ["delete", "create"] {
+            // Project skills preamble references action='create' /
+            // 'delete' for the skill tool — those are valid words in
+            // SKILLS_GUIDANCE / project-skills block. The memory
+            // bullet itself must not contain them. So grep the
+            // `- memory:` line specifically.
+            let mem_line = preamble
+                .lines()
+                .find(|l| l.trim_start().starts_with("- memory:"))
+                .expect("memory bullet present");
+            assert!(
+                !mem_line
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|w| w == forbidden),
+                "memory bullet must not name forbidden action '{}': {}",
+                forbidden,
+                mem_line
+            );
+        }
+
+        // Project-skills preamble action (dirge-rq65) — if the
+        // project happens to have no skills the block is absent,
+        // so only assert when present.
+        if preamble.contains("## Project Skills") {
+            assert!(
+                preamble.contains("action='load'"),
+                "project-skills preamble must direct to action='load'"
+            );
+        }
+    }
+
+    /// dirge-a6bv — assembled preamble carries hermes's MEMORY_GUIDANCE
+    /// and SESSION_SEARCH_GUIDANCE blocks: when to save vs not save,
+    /// declarative-fact phrasing, and the past-session-recall nudge.
+    #[test]
+    fn base_preamble_includes_memory_and_search_guidance() {
+        let p = assemble_base_preamble();
+
+        // MEMORY_GUIDANCE — must include the do/don't-save rules and the
+        // declarative-vs-imperative example pair.
+        assert!(p.contains("persistent memory"), "missing memory-tool intro");
+        assert!(
+            p.contains("Do NOT save task progress"),
+            "missing do-not-save rule"
+        );
+        assert!(
+            p.contains("PR numbers"),
+            "missing example list of stale artifacts"
+        );
+        assert!(
+            p.contains("declarative facts"),
+            "missing declarative-fact framing"
+        );
+        assert!(
+            p.contains("Procedures and workflows belong in skills"),
+            "missing memory-vs-skills boundary"
+        );
+
+        // SESSION_SEARCH_GUIDANCE — must name the trigger.
+        assert!(
+            p.contains("session_search"),
+            "missing session_search tool name"
+        );
+        assert!(
+            p.contains("before asking them to repeat"),
+            "missing past-session-recall nudge"
+        );
+    }
+
+    /// dirge-502b — the shared factory used by both `build_agent_inner`
+    /// and `build_loop_tools` actually carries the session id through
+    /// to the constructed `SessionSearchTool`. Exercising the factory
+    /// directly (rather than fishing the tool out of a `dyn LoopTool`
+    /// registry) lets us assert on the concrete type.
+    #[test]
+    fn build_session_search_tool_threads_session_id() {
+        let db_path = std::path::PathBuf::from("/tmp/dirge-502b-test.db");
+        let tool =
+            build_session_search_tool(db_path.clone(), Some("sess-test-id".into()), None, None);
+        assert_eq!(
+            tool.current_session_id(),
+            Some("sess-test-id"),
+            "factory must thread session_id into SessionSearchTool"
+        );
+
+        // And `None` truly means None (no silent default).
+        let tool_none = build_session_search_tool(db_path, None, None, None);
+        assert!(
+            tool_none.current_session_id().is_none(),
+            "factory must not invent a session id when called with None"
+        );
+    }
+
     /// `--no-tools` (or equivalent config) yields an empty
     /// registry. Mirrors `build_agent_inner`'s short-circuit.
     #[tokio::test]
@@ -1081,7 +1505,7 @@ mod reminder_tests {
         let cfg = Config::default();
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None,
             None,
@@ -1098,6 +1522,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
         assert!(tools.is_empty(), "--no-tools should yield empty registry");
@@ -1115,7 +1540,7 @@ mod reminder_tests {
         let cfg = Config::default();
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None,
             None,
@@ -1132,6 +1557,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
 
@@ -1158,7 +1584,7 @@ mod reminder_tests {
         let cfg = Config::default();
         let cache = ToolCache::new();
         let sandbox = Sandbox::new(false);
-        let tools = build_loop_tools(
+        let (tools, _) = build_loop_tools(
             cache,
             None,
             None,
@@ -1175,6 +1601,7 @@ mod reminder_tests {
             None,
             &cli,
             &cfg,
+            None, // session_id — test default
         )
         .await;
 

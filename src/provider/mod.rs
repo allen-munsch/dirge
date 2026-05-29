@@ -16,7 +16,7 @@ use crate::agent::tools::ToolCache;
 use crate::agent::tools::plan::PlanSwitchSender;
 use crate::agent::tools::question::QuestionSender;
 use crate::cli::Cli;
-use crate::config::{Config, CustomProviderConfig};
+use crate::config::{Config, ProviderEntry};
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 #[cfg(feature = "mcp")]
@@ -78,25 +78,33 @@ pub struct ProviderInfo {
     pub kind: ProviderKind,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Literal API key resolved from `entry.api_key` (with `${VAR}`
+    /// already expanded). When present, takes precedence over both
+    /// `api_key_env` and the standard env-var fallback chain.
+    pub api_key_literal: Option<String>,
 }
 
 pub fn resolve_provider_info(
     name: &str,
-    custom_providers: &HashMap<String, CustomProviderConfig>,
+    providers: &HashMap<String, ProviderEntry>,
 ) -> Option<ProviderInfo> {
-    // Config-declared custom providers win on name collision —
-    // user intent always trumps plugin defaults.
+    // Config-declared providers win on name collision — user intent
+    // always trumps plugin defaults.
     // #2 fix: lowercase-fallback lookup so `--provider My-VLLM` finds
-    // a `custom_providers["my-vllm"]` config entry. parse_provider
+    // a `providers["my-vllm"]` config entry. parse_provider
     // (for built-ins) is already case-insensitive; matching the same
     // convention here removes a silent miss.
     let lower = name.to_ascii_lowercase();
-    if let Some(custom) = custom_providers
-        .get(name)
-        .or_else(|| custom_providers.get(&lower))
-    {
-        let kind = parse_provider(&custom.provider_type)?;
-        if let Err(err) = validate_custom_provider(name, &custom.base_url, custom.allow_insecure) {
+    if let Some(entry) = providers.get(name).or_else(|| providers.get(&lower)) {
+        let ptype = Config::provider_type_of(name, entry);
+        let kind = parse_provider(&ptype)?;
+        // Only enforce URL safety when the entry actually carries
+        // a base_url. Built-in providers (e.g. `"deepseek": {}`)
+        // legitimately have no base_url — they fall through to the
+        // provider's default endpoint.
+        if let Some(url) = entry.base_url.as_deref()
+            && let Err(err) = validate_custom_provider(name, url, entry.allow_insecure)
+        {
             tracing::error!(
                 target: "dirge::provider",
                 "{err}"
@@ -104,18 +112,36 @@ pub fn resolve_provider_info(
             eprintln!("error: {err}");
             return None;
         }
+        let api_key_literal = match entry.resolved_api_key() {
+            Some(Ok(k)) => Some(k),
+            Some(Err(missing)) => {
+                tracing::error!(
+                    target: "dirge::provider",
+                    "provider '{name}' references env var ${{{missing}}} via api_key but it is unset",
+                );
+                eprintln!(
+                    "error: provider '{name}' references env var ${{{missing}}} via api_key but it is unset"
+                );
+                None
+            }
+            None => None,
+        };
         return Some(ProviderInfo {
             kind,
-            base_url: Some(custom.base_url.clone()),
-            api_key_env: custom.api_key_env.clone(),
+            base_url: entry.base_url.clone(),
+            api_key_env: entry.api_key_env.clone(),
+            api_key_literal,
         });
     }
     // Then plugin-registered providers from `harness/register-provider`.
     // Installed once at startup after plugin load; never mutated again
     // in this process.
-    if let Some(custom) = plugin_provider(name).or_else(|| plugin_provider(&lower)) {
-        let kind = parse_provider(&custom.provider_type)?;
-        if let Err(err) = validate_custom_provider(name, &custom.base_url, custom.allow_insecure) {
+    if let Some(entry) = plugin_provider(name).or_else(|| plugin_provider(&lower)) {
+        let ptype = Config::provider_type_of(name, &entry);
+        let kind = parse_provider(&ptype)?;
+        if let Some(url) = entry.base_url.as_deref()
+            && let Err(err) = validate_custom_provider(name, url, entry.allow_insecure)
+        {
             tracing::error!(
                 target: "dirge::provider",
                 "{err}"
@@ -123,10 +149,25 @@ pub fn resolve_provider_info(
             eprintln!("error: {err}");
             return None;
         }
+        let api_key_literal = match entry.resolved_api_key() {
+            Some(Ok(k)) => Some(k),
+            Some(Err(missing)) => {
+                tracing::error!(
+                    target: "dirge::provider",
+                    "plugin provider '{name}' references env var ${{{missing}}} via api_key but it is unset",
+                );
+                eprintln!(
+                    "error: plugin provider '{name}' references env var ${{{missing}}} via api_key but it is unset"
+                );
+                None
+            }
+            None => None,
+        };
         return Some(ProviderInfo {
             kind,
-            base_url: Some(custom.base_url),
-            api_key_env: custom.api_key_env,
+            base_url: entry.base_url,
+            api_key_env: entry.api_key_env,
+            api_key_literal,
         });
     }
     let kind = parse_provider(name)?;
@@ -134,6 +175,7 @@ pub fn resolve_provider_info(
         kind,
         base_url: None,
         api_key_env: None,
+        api_key_literal: None,
     })
 }
 
@@ -192,10 +234,7 @@ fn validate_custom_provider(
     // a public-looking host with allow_insecure gets a LOUD stderr
     // warning every session so a misconfigured production setup
     // doesn't silently leak conversation content.
-    if allow_insecure
-        && base_url.starts_with("http://")
-        && !looks_like_local_host(base_url)
-    {
+    if allow_insecure && base_url.starts_with("http://") && !looks_like_local_host(base_url) {
         eprintln!(
             "  ⚠️  WARNING: custom provider '{}' is using http:// over a NON-LOCAL host: {}\n  Every prompt, file content, and tool result is sent in plaintext.\n  This is allowed because allow_insecure: true is set in config.json,\n  but you should verify this is intentional — the typical allow_insecure\n  use case is loopback (127.0.0.1 / localhost) endpoints like ollama.",
             name, base_url,
@@ -218,9 +257,7 @@ fn looks_like_local_host(base_url: &str) -> bool {
         return false;
     };
     let after = &base_url[scheme_len..];
-    let end = after
-        .find(|c: char| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(after.len());
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
     let host_and_port = &after[..end];
     let host: &str = if let Some(rest) = host_and_port.strip_prefix('[')
         && let Some(end) = rest.find(']')
@@ -241,9 +278,7 @@ fn looks_like_local_host(base_url: &str) -> bool {
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local()
-            }
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
             std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
         };
     }
@@ -255,7 +290,7 @@ fn looks_like_local_host(base_url: &str) -> bool {
 /// after plugin load. Stored separately from `cfg.custom_providers`
 /// so a `/reload` (future) can swap plugin providers without
 /// disturbing the user's persistent config.
-static PLUGIN_PROVIDERS: OnceLock<HashMap<String, CustomProviderConfig>> = OnceLock::new();
+static PLUGIN_PROVIDERS: OnceLock<HashMap<String, ProviderEntry>> = OnceLock::new();
 
 /// Install the plugin-registered provider map. Only the first call
 /// wins (OnceLock semantics) — sufficient for current behavior where
@@ -263,13 +298,13 @@ static PLUGIN_PROVIDERS: OnceLock<HashMap<String, CustomProviderConfig>> = OnceL
 /// Returns the installed-or-already-installed map size so callers
 /// can log a confirmation.
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
-pub fn install_plugin_providers(map: HashMap<String, CustomProviderConfig>) -> usize {
+pub fn install_plugin_providers(map: HashMap<String, ProviderEntry>) -> usize {
     let size = map.len();
     let _ = PLUGIN_PROVIDERS.set(map);
     size
 }
 
-fn plugin_provider(name: &str) -> Option<CustomProviderConfig> {
+fn plugin_provider(name: &str) -> Option<ProviderEntry> {
     PLUGIN_PROVIDERS.get().and_then(|m| m.get(name).cloned())
 }
 
@@ -489,14 +524,43 @@ impl AnyClient {
             _ => "(none)".to_string(),
         };
 
+        // dirge-u13u: prompt-injection defense. Before we fence the
+        // untrusted inputs with our distinctive delimiter pair, scan
+        // them for the delimiter itself. If an attacker (via a prior
+        // tool output, fetched URL, user paste, etc.) has managed to
+        // smuggle the delimiter string in, re-wrapping would let them
+        // close our fence and inject instructions outside it. Bail
+        // rather than risk it. The warning stays on the operator side
+        // (tracing) — we do NOT surface the collision detail to the
+        // LLM. The caller treats this `Err` as "skip compaction for
+        // this turn".
+        let prev_summary_value = previous_summary.unwrap_or("(none)");
+        if prompt::input_contains_compaction_delimiter(&[
+            &conversation,
+            prev_summary_value,
+            &instructions_block,
+        ]) {
+            tracing::warn!(
+                "compaction input contains the untrusted-material delimiter — \
+                 skipping compaction this turn to avoid prompt-injection risk"
+            );
+            anyhow::bail!("compaction aborted: input contains reserved delimiter string");
+        }
+
         let prompt = prompt::COMPACTION_PROMPT
             .replace("{conversation}", &conversation)
-            .replace("{previous_summary}", previous_summary.unwrap_or("(none)"))
+            .replace("{previous_summary}", prev_summary_value)
             .replace("{instructions}", &instructions_block);
 
         let model = self.completion_model(model_name.to_string());
         let response = summarize::summarize_with_model(model, prompt).await?;
-        Ok(response)
+        // If the summarizer echoed the delimiters into its output,
+        // strip them before the summary gets injected into the next
+        // turn's system prompt via `rig_history_system_prompt`. A
+        // stray delimiter in the system prompt would (a) confuse the
+        // next-turn LLM about where the untrusted block ends and
+        // (b) trip our collision check on the next compaction.
+        Ok(prompt::strip_compaction_delimiters(&response))
     }
 }
 
@@ -521,36 +585,23 @@ impl AnyModel {
         // (`task` tool) call with no retry. Network + rate-limit
         // failures now get the standard 3-retry exponential backoff;
         // auth / context-length / other still bail immediately.
-        use crate::agent::recovery::{RecoveryPolicy, classify_error};
+        use crate::agent::recovery::{RecoveryPolicy, run_with_retry};
         let policy = RecoveryPolicy::default();
+        // The retry/backoff loop lives in `run_with_retry` (dirge-6cvc);
+        // the macro only exists to dispatch over `AnyModel`'s concrete
+        // per-variant model type (each `$m` has a different type).
         macro_rules! one_shot {
             ($m:expr) => {{
-                let m = $m;
-                let mut attempts = 0;
-                loop {
+                let m = $m.clone();
+                run_with_retry(&policy, "btw_query", || {
                     let agent = rig::agent::AgentBuilder::new(m.clone())
                         .preamble(preamble)
                         .build();
-                    match agent.prompt(prompt.clone()).await {
-                        Ok(reply) => break Ok::<String, anyhow::Error>(reply),
-                        Err(e) => {
-                            let msg = e.to_string();
-                            let kind = classify_error(&msg);
-                            if !policy.should_retry(attempts, kind) {
-                                break Err(e.into());
-                            }
-                            let delay = policy.backoff_duration_for_msg(attempts, &msg);
-                            tracing::warn!(
-                                attempt = attempts + 1,
-                                delay_ms = delay.as_millis() as u64,
-                                error = %msg,
-                                "btw_query retrying",
-                            );
-                            tokio::time::sleep(delay).await;
-                            attempts += 1;
-                        }
-                    }
-                }
+                    let prompt = prompt.clone();
+                    async move { agent.prompt(prompt).await }
+                })
+                .await
+                .map_err(anyhow::Error::from)
             }};
         }
         match self {
@@ -562,6 +613,84 @@ impl AnyModel {
             AnyModel::Glm(m) => one_shot!(m),
             AnyModel::Ollama(m) => one_shot!(m),
             AnyModel::Custom(m) => one_shot!(m),
+        }
+    }
+
+    /// Phase 4 part 1: build a standalone `StreamFn` from this
+    /// model + tool definitions. Used to construct the escalation
+    /// route when `ConfigRole::Escalation` resolves to a provider
+    /// different from `ConfigRole::Default`. The result is plumbed
+    /// into `LoopConfig.escalation_stream_fn` and invoked exactly
+    /// once after a repair-exhaustion or tree-sitter failure.
+    ///
+    /// Tools and chunk timeout are passed in (not extracted) for
+    /// symmetry with `AnyAgent::build_stream_fn_with_filter`. The
+    /// escalation stream uses the SAME tool definitions as the
+    /// default — only the model + provider differ.
+    pub fn build_stream_fn(
+        &self,
+        tools: Vec<rig::completion::ToolDefinition>,
+        chunk_timeout: std::time::Duration,
+        provider_name: Option<String>,
+    ) -> crate::agent::agent_loop::StreamFn {
+        use crate::agent::agent_loop::rig_stream_fn_from_model_with_filter;
+        match self {
+            AnyModel::OpenRouter(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
+            AnyModel::OpenAI(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
+            AnyModel::Anthropic(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
+            AnyModel::Gemini(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
+            AnyModel::DeepSeek(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
+            AnyModel::Glm(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
+            AnyModel::Ollama(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
+            AnyModel::Custom(m) => rig_stream_fn_from_model_with_filter(
+                m.clone(),
+                tools,
+                Some(chunk_timeout),
+                provider_name,
+                None,
+            ),
         }
     }
 
@@ -582,6 +711,20 @@ impl AnyModel {
             AnyModel::Custom(m) => m.model.clone(),
         }
     }
+}
+
+/// dirge-yai1 — pure-function tool-name filter used by tests to
+/// exercise the filter shape `spawn_filtered_runner_with_cache`
+/// applies internally. Gated `#[cfg(test)]` because production
+/// code uses the inline filter directly.
+#[cfg(test)]
+pub(crate) fn filter_tool_names<'a>(
+    all: impl Iterator<Item = &'a str>,
+    allowed: &[&str],
+) -> Vec<String> {
+    all.filter(|n| allowed.contains(n))
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Clone)]
@@ -611,6 +754,67 @@ pub struct AnyAgent {
     /// triple. `String::new()` is acceptable — telemetry falls back
     /// to `"unknown"` when the field is empty.
     model_name: String,
+    /// Phase-3: dynamic-tool-search opt-in. Resolved from
+    /// `config.dynamic_tool_search` at `build_agent` time.
+    /// When `true`, `spawn_runner` wires the shared
+    /// `tool_def_filter` Arc into both the stream factory (for
+    /// per-turn filtering) and (already) into the
+    /// `ToolSearchTool` instance in `loop_tools`. Default
+    /// `false` — the untouched-by-this-feature path.
+    dynamic_tool_search: bool,
+    /// Phase-3: per-session loaded-tool set. Allocated by
+    /// `build_agent` when `dynamic_tool_search` is on, and
+    /// shared with the `ToolSearchTool` instance registered in
+    /// `loop_tools`. `spawn_runner` forwards this Arc to the
+    /// stream factory so the filter sees the same set the tool
+    /// mutates. `None` when the feature is off.
+    tool_def_filter: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Phase 4 part 1: alternate stream function for dual-client
+    /// escalation. Constructed at `build_agent` time when
+    /// `ConfigRole::Escalation` resolves to a DIFFERENT provider
+    /// than `ConfigRole::Default`. `None` keeps the legacy single-
+    /// provider behaviour byte-for-byte identical.
+    escalation_stream_fn: Option<crate::agent::agent_loop::StreamFn>,
+    /// Phase 4 part 1: provider alias for the escalation route.
+    /// Forwarded to `LoopConfig.escalation_provider_name` so the
+    /// UI's `EscalationActivated` line can show the user which
+    /// provider is taking over. `None` when escalation is off.
+    escalation_provider_name: Option<String>,
+    /// Phase 4 part 2: optional context-depth reminder threshold.
+    /// Forwarded to `spawn_runner`, which constructs a fresh
+    /// `FileTouchTracker` for each session because the tracker is
+    /// per-prompt (`active_task` is the initial prompt).
+    context_depth_reminder_threshold: Option<usize>,
+    /// dirge-nqr: hard cap on assistant turns per run. Set via
+    /// `with_max_turns`. Forwarded to `LoopSpawnConfig.max_turns`
+    /// at spawn time. `None` = unlimited (legacy).
+    max_turns: Option<usize>,
+    /// dirge-z73i: alternate stream_fn for the background-review
+    /// path. Built at `build_agent` time when `ConfigRole::Review`
+    /// resolves to a different provider than `ConfigRole::Default`.
+    /// `None` falls back to the main agent's stream_fn (legacy
+    /// behavior; matches the original `spawn_review_runner`).
+    review_stream_fn: Option<crate::agent::agent_loop::StreamFn>,
+    /// dirge-z73i: provider alias for the review route, surfaced in
+    /// the review runner's `LoopConfig.provider_name` so telemetry
+    /// records the right backend.
+    review_provider_name: Option<String>,
+    /// dirge-z73i: model identifier for the review route, surfaced
+    /// in the review runner's `LoopConfig.model_name`.
+    review_model_name: Option<String>,
+    /// dirge-9tfq: per-session background-task store, forwarded into
+    /// `LoopSpawnConfig.bg_store` at spawn time so the loop's
+    /// `get_followup_messages` hook surfaces subagent completions
+    /// without needing the user to re-prompt. `None` when no store
+    /// was supplied (tests, `--no-tools`); the followup path stays
+    /// disabled in that case (legacy behaviour byte-identical).
+    bg_store: Option<crate::agent::tools::background::BackgroundStore>,
+    /// dirge-7tvq: memory provider held alongside the agent so
+    /// session-lifecycle hooks (`on_session_end`, `on_pre_compress`)
+    /// can dispatch through the trait. `None` when no provider was
+    /// built (test agents, --no-tools, build failure). The provider
+    /// is shared with `MemoryTool` via `Arc` — same instance.
+    memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
 }
 
 #[derive(Clone)]
@@ -641,15 +845,135 @@ impl AnyAgent {
             loop_tools,
             preamble,
             model_name,
+            dynamic_tool_search: false,
+            tool_def_filter: None,
+            escalation_stream_fn: None,
+            escalation_provider_name: None,
+            context_depth_reminder_threshold: None,
+            max_turns: None,
+            review_stream_fn: None,
+            review_provider_name: None,
+            review_model_name: None,
+            bg_store: None,
+            memory_provider: None,
         }
+    }
+
+    /// dirge-7tvq: install the `MemoryProvider` used for this session
+    /// so lifecycle hooks (`on_session_end`, `on_pre_compress`) can
+    /// dispatch through the trait. Called by `build_agent` once the
+    /// provider has been constructed. Idempotent — repeated calls
+    /// replace the held Arc.
+    pub fn with_memory_provider(
+        mut self,
+        provider: std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>,
+    ) -> Self {
+        self.memory_provider = Some(provider);
+        self
+    }
+
+    /// dirge-7tvq: accessor for the held memory provider. Used by
+    /// lifecycle call sites (session swap, compaction) to fire the
+    /// trait hooks. Returns `None` for test agents and `--no-tools`
+    /// runs where no provider was constructed.
+    pub fn memory_provider(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>> {
+        self.memory_provider.as_ref()
+    }
+
+    /// dirge-9tfq: install the per-session background-task store so
+    /// `spawn_runner` can wire the subagent-completion follow-up
+    /// hook into the agent loop. Called by `build_agent` whenever a
+    /// `BackgroundStore` was provided (production interactive paths;
+    /// not test / `--no-tools`). Idempotent — repeated calls replace
+    /// the stored handle but keep the Arc-internal state in the
+    /// shared store unchanged.
+    pub fn with_bg_store(
+        mut self,
+        store: crate::agent::tools::background::BackgroundStore,
+    ) -> Self {
+        self.bg_store = Some(store);
+        self
+    }
+
+    /// dirge-z73i: install a dedicated stream_fn for the
+    /// background-review path. Called from `build_agent` only when
+    /// `ConfigRole::Review` resolves to a different alias than
+    /// `ConfigRole::Default`. `spawn_review_runner` picks this up
+    /// and routes review work through the alternate provider/model.
+    pub fn with_review_route(
+        mut self,
+        stream_fn: crate::agent::agent_loop::StreamFn,
+        provider_name: String,
+        model_name: String,
+    ) -> Self {
+        self.review_stream_fn = Some(stream_fn);
+        self.review_provider_name = Some(provider_name);
+        self.review_model_name = Some(model_name);
+        self
+    }
+
+    /// dirge-nqr: install the per-run assistant-turn cap. `None`
+    /// clears any previous cap (unlimited). Forwarded to
+    /// `LoopSpawnConfig.max_turns` at spawn time.
+    pub fn with_max_turns(mut self, max_turns: Option<usize>) -> Self {
+        self.max_turns = max_turns;
+        self
+    }
+
+    /// Phase 4 part 1: wire the dual-client escalation route.
+    /// Called by `build_agent` only when `ConfigRole::Escalation`
+    /// resolves to a different provider than `ConfigRole::Default`.
+    /// Pass both the StreamFn and the provider alias so
+    /// `spawn_runner` can plumb them through to `LoopSpawnConfig`.
+    pub fn with_escalation(
+        mut self,
+        stream_fn: crate::agent::agent_loop::StreamFn,
+        provider_name: String,
+    ) -> Self {
+        self.escalation_stream_fn = Some(stream_fn);
+        self.escalation_provider_name = Some(provider_name);
+        self
+    }
+
+    /// Phase 4 part 2: enable the context-depth reminder system
+    /// with the given consecutive-turn threshold. Called by
+    /// `build_agent` only when `config.context_depth_reminder_threshold`
+    /// is `Some`. Carrying the threshold (rather than a tracker
+    /// instance) lets `spawn_runner` build a fresh tracker per
+    /// session seeded with the initial prompt.
+    pub fn with_context_depth_reminder(mut self, threshold: usize) -> Self {
+        self.context_depth_reminder_threshold = Some(threshold);
+        self
+    }
+
+    /// Phase-3: enable the dynamic-tool-search path for sessions
+    /// spawned from this agent. `filter` is the shared Arc
+    /// already wired into the `ToolSearchTool` registered in
+    /// `loop_tools` (so the tool's mutations and the request
+    /// filter see the SAME set). Caller (build_agent) reads
+    /// `config.dynamic_tool_search`; when off, this method
+    /// isn't called and the legacy path runs untouched.
+    pub fn with_dynamic_tool_search(
+        mut self,
+        filter: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.dynamic_tool_search = true;
+        self.tool_def_filter = Some(filter);
+        self
     }
 
     pub async fn run_print(
         &self,
         prompt: &str,
-        _max_turns: usize,
+        max_turns: usize,
         output_format: crate::cli::OutputFormat,
     ) -> anyhow::Result<String> {
+        // dirge-nqr: honor the cap explicitly even if the agent was
+        // built with a different one. `run_print` is the headless
+        // entry point — callers explicitly pass the cap they want.
+        let agent = self.clone().with_max_turns(Some(max_turns));
         let start_instant = std::time::Instant::now();
         let session_id = runner::uuid_v4_simple();
         let mut num_turns: u32 = 0;
@@ -692,10 +1016,9 @@ impl AnyAgent {
 
         // Wire through the new agent_loop path: clone the agent (cheap
         // — Arc internals + refcounts), spawn a runner, and drain the
-        // event channel collecting text.
-        let runner = self
-            .clone()
-            .spawn_runner(effective_prompt.clone(), Vec::new(), None);
+        // event channel collecting text. Use the max_turns-stamped
+        // `agent` from above so the cap is honored.
+        let runner = agent.spawn_runner(effective_prompt.clone(), Vec::new(), None);
         let task = runner.task;
         let mut event_rx = runner.event_rx;
 
@@ -835,6 +1158,15 @@ impl AnyAgent {
         }
     }
 
+    /// Internal accessor for the agent's tool result cache.
+    /// Exposed `pub(crate)` so tests in `provider::mod_tests`
+    /// can assert cache-isolation invariants (e.g. dirge-7ls:
+    /// the background-review runner must NOT share this Arc).
+    #[allow(dead_code)]
+    pub(crate) fn cache(&self) -> &ToolCache {
+        &self.cache
+    }
+
     pub fn spawn_runner(
         self,
         prompt: String,
@@ -862,8 +1194,17 @@ impl AnyAgent {
             .map(|t| loop_tool_to_rig_definition(t.as_ref()))
             .collect();
 
+        // Phase-3: per-session loaded-tool set was allocated at
+        // `build_agent` time (when `dynamic_tool_search` is on)
+        // and the SAME Arc was passed both to the
+        // `ToolSearchTool` registered in `self.loop_tools` and
+        // stored on `self.tool_def_filter`. The factory reads it
+        // per-request; the tool inserts into it on execute.
+        // `None` keeps the legacy path.
+        let tool_def_filter = self.tool_def_filter.clone();
+
         // Build the StreamFn (4.5h-2 + 4.5h-3 chunk timeout).
-        let inner_stream_fn = self.build_stream_fn(tool_defs);
+        let inner_stream_fn = self.build_stream_fn_with_filter(tool_defs, tool_def_filter.clone());
         // Wrap with retry (4.5g) so transient Network / RateLimit
         // errors auto-retry with exponential backoff + Retry-After.
         let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
@@ -874,17 +1215,50 @@ impl AnyAgent {
         // identity + tool docs) is the base; session-side
         // system messages append.
         let history_preamble = rig_history_system_prompt(&history);
-        let system_prompt = if history_preamble.is_empty() {
+        // `mut` is consumed only by the plugin-gated append below.
+        #[cfg_attr(not(feature = "plugin"), allow(unused_mut))]
+        let mut system_prompt = if history_preamble.is_empty() {
             self.preamble.clone()
         } else {
             format!("{}\n\n{}", self.preamble, history_preamble)
         };
 
+        // dirge-wqxj: fire the `before-agent-start` plugin hook with
+        // the assembled system prompt. A plugin may call
+        // `harness/append-system-prompt` to add project/team context
+        // to the preamble before the agent starts. Append-only — the
+        // model-identity + tool-docs preamble is preserved.
+        #[cfg(feature = "plugin")]
+        if let Some(pm) = crate::plugin::hook::global() {
+            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let ctx = format!(
+                "@{{:system-prompt \"{}\"}}",
+                crate::plugin::escape_janet_string(&system_prompt)
+            );
+            match mgr.dispatch("before-agent-start", &ctx) {
+                Ok(_) => {
+                    if let Some(append) = mgr.take_system_prompt_append() {
+                        let append = append.trim();
+                        if !append.is_empty() {
+                            system_prompt = format!("{system_prompt}\n\n{append}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        error = %e,
+                        "before-agent-start hook error — system prompt left unchanged",
+                    );
+                }
+            }
+        }
+
         // Convert rig history → loop messages (Session-side
         // user/assistant/toolResult shapes).
         let loop_history = rig_history_to_loop_messages(history);
 
-        let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt);
+        let mut cfg = LoopSpawnConfig::minimal(stream_fn, prompt.clone());
         cfg.system_prompt = system_prompt;
         cfg.history = loop_history;
         cfg.tools = self.loop_tools;
@@ -895,6 +1269,35 @@ impl AnyAgent {
             Some(self.model_name.clone())
         };
         cfg.steering_queue = steering_queue;
+        cfg.tool_def_filter = tool_def_filter;
+        cfg.dynamic_tool_search = self.dynamic_tool_search;
+        // Phase 4 part 1: thread the escalation route — when set,
+        // the loop's `stream_assistant_response` swaps to this
+        // StreamFn for the call immediately following a repair or
+        // tree-sitter failure. `escalation_stream_fn=None` keeps
+        // the legacy single-provider path byte-for-byte identical.
+        cfg.escalation_stream_fn = self.escalation_stream_fn.clone();
+        cfg.escalation_provider_name = self.escalation_provider_name.clone();
+        // Phase 4 part 2: build a fresh `FileTouchTracker` per
+        // session seeded with the current prompt as the active
+        // task. `None` keeps the feature off — byte-identical to
+        // today.
+        cfg.file_touch_tracker = self
+            .context_depth_reminder_threshold
+            .map(|t| crate::agent::agent_loop::context_depth::FileTouchTracker::new(t, prompt));
+        // dirge-nqr: forward the per-run turn cap. `None` keeps the
+        // legacy unlimited behavior.
+        cfg.max_turns = self.max_turns;
+        // dirge-9tfq: forward the BackgroundStore so the spawn pipeline
+        // installs a `get_followup_messages` hook that drains pending
+        // subagent completions at the outer-loop boundary. `None`
+        // (no-tools / test paths) leaves the hook unset and the loop
+        // behaves byte-identically to pre-9tfq.
+        cfg.bg_store = self.bg_store.clone();
+        // dirge-h5tv: thread the memory provider into the loop so
+        // auto-compaction can fire on_pre_compress. `None` paths
+        // (no provider attached) keep legacy no-op behavior.
+        cfg.memory_provider = self.memory_provider.clone();
         #[cfg(feature = "plugin")]
         {
             cfg.plugin_mgr = crate::plugin::hook::global();
@@ -907,24 +1310,118 @@ impl AnyAgent {
     /// Spawn a review runner with only memory + skill tools.
     /// Used by background review (Phase 4) to create a restricted
     /// agent that can only write to project memory and skills.
+    ///
+    /// dirge-7ls: the review runner gets its OWN `ToolCache` rather
+    /// than reusing the main agent's. Even though today's
+    /// memory/skill tools don't touch the cache directly, any
+    /// future tool added to the review allow-list (or any future
+    /// invalidation hook like `cache.clear()` on memory writes)
+    /// must not pollute the main agent's cache mid-session.
+    /// `subagents/task` is deliberately NOT changed — subagents
+    /// share with their parent by design.
     pub fn spawn_review_runner(
         &self,
         prompt: String,
         transcript: String,
     ) -> crate::agent::runner::AgentRunner {
+        let (runner, _isolated_cache) =
+            self.spawn_review_runner_with_cache(prompt, transcript, ToolCache::new());
+        runner
+    }
+
+    /// dirge-yai1 — skill-only fork used by the curator's
+    /// umbrella-consolidation pass. The curator prompt instructs
+    /// the model to only use `skill`, but a tool-level filter is
+    /// stronger than a prompt-level guard. Same isolation /
+    /// retry / stream-fn selection as `spawn_review_runner`.
+    pub fn spawn_curator_runner(
+        &self,
+        prompt: String,
+        transcript: String,
+    ) -> crate::agent::runner::AgentRunner {
+        let (runner, _isolated_cache) =
+            self.spawn_filtered_runner_with_cache(prompt, transcript, ToolCache::new(), &["skill"]);
+        runner
+    }
+
+    /// dirge-mo0w PR-2: memory-only forked runner for the memory
+    /// curator's LLM consolidation pass. Inverse of
+    /// `spawn_curator_runner` — same forked-runner pattern, but
+    /// the tool allow-list is `&["memory"]` so the consolidation
+    /// pass can ONLY add/replace/remove memory entries, not write
+    /// skills. The model literally cannot reach skill-write tools
+    /// even if the prompt-level guard slips.
+    pub fn spawn_memory_curator_runner(
+        &self,
+        prompt: String,
+        transcript: String,
+    ) -> crate::agent::runner::AgentRunner {
+        let (runner, _isolated_cache) = self.spawn_filtered_runner_with_cache(
+            prompt,
+            transcript,
+            ToolCache::new(),
+            &["memory"],
+        );
+        runner
+    }
+
+    /// Internal review-runner constructor with an explicit
+    /// caller-supplied cache. Returns the cache alongside the
+    /// runner so tests can assert cache isolation via
+    /// `ToolCache::shares_storage_with` against `self.cache()`
+    /// (dirge-7ls regression test). Callers in production code
+    /// should use `spawn_review_runner`, which passes
+    /// `ToolCache::new()` here.
+    pub(crate) fn spawn_review_runner_with_cache(
+        &self,
+        prompt: String,
+        transcript: String,
+        review_cache: ToolCache,
+    ) -> (crate::agent::runner::AgentRunner, ToolCache) {
+        // dirge-yai1: delegate to the parameterized helper so the
+        // curator can reuse the same machinery with a skill-only
+        // filter without duplicating the body.
+        self.spawn_filtered_runner_with_cache(
+            prompt,
+            transcript,
+            review_cache,
+            &["memory", "skill"],
+        )
+    }
+
+    /// dirge-yai1: forked-runner factory parameterized by the tool
+    /// allow-list. `spawn_review_runner_with_cache` calls in with
+    /// `&["memory", "skill"]`; the curator pass calls in with
+    /// `&["skill"]` so the model literally cannot write memory
+    /// entries even if the prompt-level guard slips. Same cache
+    /// isolation, same retry policy, same stream-fn selection as
+    /// the original review runner.
+    pub(crate) fn spawn_filtered_runner_with_cache(
+        &self,
+        prompt: String,
+        transcript: String,
+        review_cache: ToolCache,
+        allowed_tools: &[&str],
+    ) -> (crate::agent::runner::AgentRunner, ToolCache) {
         use crate::agent::agent_loop::{
             LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn, spawn_loop_runner,
         };
         use crate::agent::recovery::RecoveryPolicy;
 
-        // Filter to only memory + skill tools.
+        // Hard guard against accidental sharing: if a caller
+        // somehow passes the parent's cache, the regression test
+        // would fail — but defense-in-depth, debug_assert that
+        // the passed cache is distinct from the parent's.
+        debug_assert!(
+            !review_cache.shares_storage_with(&self.cache),
+            "spawn_filtered_runner_with_cache: review cache must not share storage with the main agent's cache (dirge-7ls)"
+        );
+
+        // Filter to the caller-supplied allow-list.
         let review_tools: Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> = self
             .loop_tools
             .iter()
-            .filter(|t| {
-                let name = t.name();
-                name == "memory" || name == "skill"
-            })
+            .filter(|t| allowed_tools.contains(&t.name()))
             .cloned()
             .collect();
 
@@ -933,7 +1430,31 @@ impl AnyAgent {
             .map(|t| loop_tool_to_rig_definition(t.as_ref()))
             .collect();
 
-        let inner_stream_fn = self.build_stream_fn(tool_defs);
+        // dirge-z73i: prefer the explicit review_stream_fn when the
+        // user configured `review_provider` to point at a different
+        // alias than `provider`. Falls back to the main agent's
+        // stream_fn so unconfigured sessions keep the legacy behavior
+        // byte-for-byte.
+        let (inner_stream_fn, provider_name_for_review, model_name_for_review) =
+            if let Some(rfn) = self.review_stream_fn.clone() {
+                (
+                    rfn,
+                    self.review_provider_name
+                        .clone()
+                        .unwrap_or_else(|| self.provider_name().to_string()),
+                    self.review_model_name.clone(),
+                )
+            } else {
+                (
+                    self.build_stream_fn(tool_defs),
+                    self.provider_name().to_string(),
+                    if self.model_name.is_empty() {
+                        None
+                    } else {
+                        Some(self.model_name.clone())
+                    },
+                )
+            };
         let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
 
         let full_prompt = format!(
@@ -944,15 +1465,11 @@ impl AnyAgent {
         let mut cfg = LoopSpawnConfig::minimal(stream_fn, full_prompt);
         cfg.system_prompt = self.preamble.clone();
         cfg.tools = review_tools;
-        cfg.provider_name = Some(self.provider_name().to_string());
-        cfg.model_name = if self.model_name.is_empty() {
-            None
-        } else {
-            Some(self.model_name.clone())
-        };
+        cfg.provider_name = Some(provider_name_for_review);
+        cfg.model_name = model_name_for_review;
 
         let loop_runner = spawn_loop_runner(cfg);
-        loop_runner.into_agent_runner()
+        (loop_runner.into_agent_runner(), review_cache)
     }
 
     /// Phase 4.5h-2: produce a `StreamFn` from this agent's
@@ -978,57 +1495,81 @@ impl AnyAgent {
         &self,
         tools: Vec<rig::completion::ToolDefinition>,
     ) -> crate::agent::agent_loop::StreamFn {
-        use crate::agent::agent_loop::rig_stream_fn_from_model_with_provider;
+        self.build_stream_fn_with_filter(tools, None)
+    }
+
+    /// Phase-3 dynamic-tool-search variant. When
+    /// `tool_def_filter` is `Some`, the per-request tool list is
+    /// filtered to the always-on set + names present in the
+    /// shared loaded set (plus `tool_search`). When `None`, the
+    /// behavior is byte-for-byte identical to the legacy
+    /// `build_stream_fn`.
+    pub fn build_stream_fn_with_filter(
+        &self,
+        tools: Vec<rig::completion::ToolDefinition>,
+        tool_def_filter: Option<
+            std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+        >,
+    ) -> crate::agent::agent_loop::StreamFn {
+        use crate::agent::agent_loop::rig_stream_fn_from_model_with_filter;
         let chunk_timeout = self.chunk_timeout;
         let provider = Some(self.provider_name().to_string());
         match &self.inner {
-            AnyAgentInner::OpenRouter(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::OpenRouter(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::OpenAI(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::OpenAI(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Anthropic(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Anthropic(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Gemini(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Gemini(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::DeepSeek(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::DeepSeek(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Glm(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Glm(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Ollama(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Ollama(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
-            AnyAgentInner::Custom(a) => rig_stream_fn_from_model_with_provider(
+            AnyAgentInner::Custom(a) => rig_stream_fn_from_model_with_filter(
                 (*a.model).clone(),
                 tools.clone(),
                 Some(chunk_timeout),
                 provider,
+                tool_def_filter,
             ),
         }
     }
@@ -1037,11 +1578,14 @@ impl AnyAgent {
 pub fn create_client(
     provider_name: &str,
     api_key: Option<&str>,
-    custom_providers: &HashMap<String, CustomProviderConfig>,
+    providers: &HashMap<String, ProviderEntry>,
 ) -> anyhow::Result<AnyClient> {
-    client::create_client(provider_name, api_key, custom_providers)
+    client::create_client(provider_name, api_key, providers)
 }
 
+// Arity matches `build_agent_inner` — explicit DI signature kept
+// grep-able, refactoring into a struct is tracked separately.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_agent(
     model: AnyModel,
     cli: &Cli,
@@ -1056,6 +1600,9 @@ pub async fn build_agent(
     sandbox: Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    // Live session id forwarded to SessionSearchTool so the model's
+    // session_search calls exclude the current session. See dirge-502b.
+    session_id: Option<String>,
 ) -> AnyAgent {
     let parent_model = model.clone();
     // Resolve the per-provider chunk timeout once here so every
@@ -1085,7 +1632,7 @@ pub async fn build_agent(
             #[cfg(feature = "lsp")]
             let lsp_for_loop = lsp_manager.clone();
 
-            let (agent, cache) = builder::build_agent_inner(
+            let (agent, cache, memory_provider) = builder::build_agent_inner(
                 $m,
                 cli,
                 cfg,
@@ -1103,6 +1650,7 @@ pub async fn build_agent(
                 mcp_manager,
                 #[cfg(feature = "semantic")]
                 semantic_manager,
+                session_id.clone(),
             )
             .await;
 
@@ -1111,7 +1659,13 @@ pub async fn build_agent(
             // the same cache as the rig path (tool result
             // dedup) — though after h-6 the rig path no longer
             // runs, so this is effectively single-owner.
-            let loop_tools = builder::build_loop_tools(
+            //
+            // Phase-3: build_loop_tools returns `(tools,
+            // tool_def_filter)`. When `cfg.dynamic_tool_search`
+            // is on, `tool_def_filter` is `Some` and a
+            // `ToolSearchTool` has been registered inside `tools`
+            // with the same Arc.
+            let (loop_tools, tool_def_filter) = builder::build_loop_tools(
                 cache.clone(),
                 permission_for_loop,
                 ask_tx_for_loop,
@@ -1128,26 +1682,46 @@ pub async fn build_agent(
                 semantic_manager,
                 cli,
                 cfg,
+                session_id.clone(),
             )
             .await;
 
             // Phase 4.5h-6: extract the rig Agent's preamble so
             // the new path can pass it as Context.system_prompt.
             // rig's Agent has `preamble: Option<String>` public.
-            let preamble = agent.preamble.clone().unwrap_or_default();
+            // Phase-3: when dynamic-tool-search is on, append a
+            // one-liner nudge so the model knows to call
+            // `tool_search` before reaching for unknown tools.
+            let mut preamble = agent.preamble.clone().unwrap_or_default();
+            if tool_def_filter.is_some() {
+                if !preamble.is_empty() {
+                    preamble.push_str("\n\n");
+                }
+                preamble.push_str(crate::agent::prompt::DYNAMIC_TOOL_SEARCH_PROMPT);
+            }
 
-            AnyAgent::new(
+            let mut agent = AnyAgent::new(
                 AnyAgentInner::$variant(agent),
                 cache,
                 chunk_timeout,
                 loop_tools,
                 preamble,
                 model_name.clone(),
-            )
+            );
+            // dirge-7tvq: attach the memory provider so session-end
+            // and pre-compress hooks can dispatch through the trait.
+            if let Some(provider) = memory_provider {
+                agent = agent.with_memory_provider(provider);
+            }
+            if let Some(filter) = tool_def_filter {
+                agent.with_dynamic_tool_search(filter)
+            } else {
+                agent
+            }
         }};
     }
 
-    match model {
+    let mut agent = match model {
         AnyModel::OpenRouter(m) => build_inner!(m, OpenRouter),
         AnyModel::OpenAI(m) => build_inner!(m, OpenAI),
         AnyModel::Anthropic(m) => build_inner!(m, Anthropic),
@@ -1156,423 +1730,262 @@ pub async fn build_agent(
         AnyModel::Glm(m) => build_inner!(m, Glm),
         AnyModel::Ollama(m) => build_inner!(m, Ollama),
         AnyModel::Custom(m) => build_inner!(m, Custom),
+    };
+
+    // Phase 4 part 1 — dual-client escalation wiring.
+    //
+    // When the user has configured `escalation_provider` AND it
+    // resolves to a DIFFERENT (alias, entry) than `ConfigRole::Default`,
+    // build a second StreamFn that the loop will swap to for ONE call
+    // after a repair-exhaustion or tree-sitter syntactic failure.
+    //
+    // The escalation route reuses:
+    //   - The same tool definitions as the default loop (we just
+    //     need a different model behind them).
+    //   - The same chunk timeout — escalation should not be
+    //     stricter or laxer than the default for stream chunk
+    //     health.
+    //
+    // If `escalation_provider` is configured but the alias doesn't
+    // resolve to a present entry AND isn't a built-in (this means
+    // `resolve_role` returns None), surface an error rather than
+    // silently disabling — the user asked for a feature and we
+    // owe them a clear failure mode.
+    if cfg.escalation_provider.is_some() {
+        let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
+        let escalation_role = cfg.resolve_role(crate::config::ConfigRole::Escalation);
+        match (default_role, escalation_role) {
+            (Some((default_alias, _)), Some((escalation_alias, escalation_entry))) => {
+                // Equal aliases (case-insensitive) → escalation
+                // has no effect; skip the duplicate client.
+                if default_alias.eq_ignore_ascii_case(&escalation_alias) {
+                    tracing::debug!(
+                        target: "dirge::provider",
+                        alias = %escalation_alias,
+                        "escalation provider equals default; skipping duplicate client construction",
+                    );
+                } else {
+                    match build_escalation_stream_fn(
+                        &escalation_alias,
+                        &escalation_entry,
+                        &cfg.providers_map(),
+                        chunk_timeout,
+                        &agent.loop_tools,
+                    ) {
+                        Ok(stream_fn) => {
+                            agent = agent.with_escalation(stream_fn, escalation_alias.clone());
+                            tracing::info!(
+                                target: "dirge::provider",
+                                alias = %escalation_alias,
+                                "dual-client escalation wired",
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "dirge::provider",
+                                alias = %escalation_alias,
+                                error = %e,
+                                "failed to construct escalation client; running without escalation",
+                            );
+                            eprintln!(
+                                "warning: escalation_provider '{}' configured but client build failed: {}",
+                                escalation_alias, e
+                            );
+                        }
+                    }
+                }
+            }
+            (_, None) => {
+                // escalation_provider was set but resolve_role
+                // returned None — alias doesn't name a present
+                // entry and isn't a built-in. Hard-fail loudly per
+                // the plan: don't silently disable.
+                let alias = cfg.escalation_provider.clone().unwrap_or_default();
+                tracing::error!(
+                    target: "dirge::provider",
+                    alias = %alias,
+                    "escalation_provider configured but alias does not resolve to a known provider",
+                );
+                eprintln!(
+                    "error: escalation_provider '{}' is configured but does not match any entry \
+                     in `providers` or any built-in (anthropic/openai/deepseek/glm/gemini/ollama/openrouter). \
+                     Either add it under `providers` or remove the `escalation_provider` setting.",
+                    alias
+                );
+            }
+            (None, _) => {
+                // Default itself isn't resolvable — let the
+                // caller's "no provider" error path handle it.
+            }
+        }
     }
+
+    // Phase 4 part 2 — context-depth reminder wiring.
+    if let Some(threshold) = cfg.resolve_context_depth_threshold() {
+        agent = agent.with_context_depth_reminder(threshold);
+    }
+
+    // dirge-9tfq — install the BackgroundStore on the agent so
+    // `spawn_runner` can thread it into `LoopSpawnConfig.bg_store`,
+    // wiring the subagent-completion follow-up path. Done after
+    // the variant-dispatch `build_inner!` macro so every variant
+    // gets the store. When `bg_store` is `None` (test paths,
+    // `--no-tools`) the agent skips the wiring entirely.
+    if let Some(store) = bg_store.as_ref() {
+        agent = agent.with_bg_store(store.clone());
+    }
+
+    // dirge-z73i — background-review route wiring.
+    //
+    // When the user has configured `review_provider` AND it
+    // resolves to a different (alias, entry) than `ConfigRole::Default`,
+    // build a review-specific stream_fn so `spawn_review_runner` runs
+    // through the configured cheaper / smarter model.
+    //
+    // Same equality short-circuit as escalation: if the resolved
+    // alias equals the default, skip the duplicate client (the
+    // fallback inside `spawn_review_runner_with_cache` produces an
+    // identical request).
+    if cfg.review_provider.is_some() {
+        let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
+        let review_role = cfg.resolve_role(crate::config::ConfigRole::Review);
+        match (default_role, review_role) {
+            (Some((default_alias, _)), Some((review_alias, review_entry))) => {
+                if default_alias.eq_ignore_ascii_case(&review_alias) {
+                    tracing::debug!(
+                        target: "dirge::provider",
+                        alias = %review_alias,
+                        "review provider equals default; skipping duplicate client construction",
+                    );
+                } else {
+                    match build_review_stream_fn(
+                        &review_alias,
+                        &review_entry,
+                        &cfg.providers_map(),
+                        chunk_timeout,
+                        &agent.loop_tools,
+                    ) {
+                        Ok((stream_fn, model_name)) => {
+                            agent = agent.with_review_route(
+                                stream_fn,
+                                review_alias.clone(),
+                                model_name,
+                            );
+                            tracing::info!(
+                                target: "dirge::provider",
+                                alias = %review_alias,
+                                "review-provider route wired",
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "dirge::provider",
+                                alias = %review_alias,
+                                "failed to build review stream_fn: {e}",
+                            );
+                            eprintln!(
+                                "error: failed to build review stream_fn for '{}': {}",
+                                review_alias, e
+                            );
+                        }
+                    }
+                }
+            }
+            (_, None) => {
+                let alias = cfg.review_provider.as_deref().unwrap_or("(unset)");
+                tracing::warn!(
+                    target: "dirge::provider",
+                    alias = %alias,
+                    "review_provider configured but alias does not resolve to a known provider",
+                );
+                eprintln!(
+                    "error: review_provider '{}' is configured but does not match any entry \
+                     in `providers` or any built-in. Either add it under `providers` or \
+                     remove the `review_provider` setting.",
+                    alias
+                );
+            }
+            (None, _) => {
+                // Default not resolvable — caller's "no provider"
+                // error path handles it.
+            }
+        }
+    }
+
+    // dirge-nqr — per-run assistant-turn cap. CLI `--max-agent-turns`
+    // > config `max_agent_turns` > default 100 (matches the existing
+    // `cli::resolve_max_agent_turns` precedence). Always set: the
+    // loop already had an implicit cap inherited from the legacy rig
+    // builder; this wires it through the agent_loop path so `run_print`
+    // and the interactive flow both honor it.
+    agent = agent.with_max_turns(Some(cli.resolve_max_agent_turns(cfg)));
+
+    agent
+}
+
+/// Phase 4 part 1: build a standalone StreamFn for the escalation
+/// route. Constructs a fresh `AnyClient` for the alias, builds an
+/// `AnyModel` against it using either the entry's `model` field or
+/// the provider's default, then wraps with the same tool defs as
+/// the main loop.
+fn build_escalation_stream_fn(
+    alias: &str,
+    entry: &ProviderEntry,
+    providers: &HashMap<String, ProviderEntry>,
+    chunk_timeout: std::time::Duration,
+    loop_tools: &[std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
+) -> anyhow::Result<crate::agent::agent_loop::StreamFn> {
+    use crate::agent::agent_loop::loop_tool_to_rig_definition;
+    let client = create_client(alias, None, providers)?;
+    let model_name = entry
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model_for(alias).to_string());
+    let model = client.completion_model(model_name);
+    let tool_defs: Vec<rig::completion::ToolDefinition> = loop_tools
+        .iter()
+        .map(|t| loop_tool_to_rig_definition(t.as_ref()))
+        .collect();
+    Ok(model.build_stream_fn(tool_defs, chunk_timeout, Some(alias.to_string())))
+}
+
+/// dirge-z73i: build a stream_fn for the background-review path,
+/// routed through `ConfigRole::Review`. Only the memory + skill tools
+/// are baked into the request — the review fork's `loop_tools` is
+/// filtered to the same set in `spawn_review_runner_with_cache`,
+/// so the model sees a tool catalog that matches what the dispatcher
+/// will actually accept. Returns `(stream_fn, model_name)` so the
+/// caller can stash the model identifier alongside the stream_fn for
+/// telemetry (`LoopConfig.model_name`).
+fn build_review_stream_fn(
+    alias: &str,
+    entry: &ProviderEntry,
+    providers: &HashMap<String, ProviderEntry>,
+    chunk_timeout: std::time::Duration,
+    loop_tools: &[std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
+) -> anyhow::Result<(crate::agent::agent_loop::StreamFn, String)> {
+    use crate::agent::agent_loop::loop_tool_to_rig_definition;
+    let client = create_client(alias, None, providers)?;
+    let model_name = entry
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model_for(alias).to_string());
+    let model = client.completion_model(model_name.clone());
+    // Review path uses ONLY memory + skill — match what
+    // `spawn_review_runner_with_cache` puts in `cfg.tools` so
+    // the request body and the dispatcher agree.
+    let tool_defs: Vec<rig::completion::ToolDefinition> = loop_tools
+        .iter()
+        .filter(|t| {
+            let n = t.name();
+            n == "memory" || n == "skill"
+        })
+        .map(|t| loop_tool_to_rig_definition(t.as_ref()))
+        .collect();
+    let stream_fn = model.build_stream_fn(tool_defs, chunk_timeout, Some(alias.to_string()));
+    Ok((stream_fn, model_name))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    /// Build an env-lookup closure backed by a HashMap. Avoids
-    /// mutating process-wide env vars — `std::env::set_var` is
-    /// thread-unsafe and the previous test suite raced under
-    /// parallel `cargo test`, producing intermittent failures.
-    fn mock_env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
-        let map: HashMap<String, String> = vars
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect();
-        move |name: &str| map.get(name).cloned()
-    }
-
-    #[test]
-    fn auto_detect_returns_none_when_no_vars_set() {
-        assert_eq!(auto_detect_provider_from(mock_env(&[])), None);
-    }
-
-    #[test]
-    fn auto_detect_finds_deepseek_when_key_set() {
-        let env = mock_env(&[("DEEPSEEK_API_KEY", "sk-test-123")]);
-        assert_eq!(auto_detect_provider_from(env), Some("deepseek"));
-    }
-
-    #[test]
-    fn auto_detect_finds_openai_when_key_set() {
-        let env = mock_env(&[("OPENAI_API_KEY", "sk-test-456")]);
-        assert_eq!(auto_detect_provider_from(env), Some("openai"));
-    }
-
-    #[test]
-    fn auto_detect_skips_empty_var() {
-        let env = mock_env(&[("DEEPSEEK_API_KEY", ""), ("OPENAI_API_KEY", "sk-test-789")]);
-        assert_eq!(auto_detect_provider_from(env), Some("openai"));
-    }
-
-    #[test]
-    fn auto_detect_returns_first_match_in_order() {
-        let env = mock_env(&[("DEEPSEEK_API_KEY", "sk-ds"), ("OPENAI_API_KEY", "sk-oai")]);
-        assert_eq!(auto_detect_provider_from(env), Some("deepseek"));
-    }
-
-    /// Cover every provider in the autodetect list — guards
-    /// against accidentally dropping or reordering an entry.
-    #[test]
-    fn auto_detect_each_provider_in_isolation() {
-        for &(env_var, expected) in PROVIDER_AUTODETECT_ORDER {
-            let env = mock_env(&[(env_var, "sk-x")]);
-            assert_eq!(
-                auto_detect_provider_from(env),
-                Some(expected),
-                "env_var={env_var}",
-            );
-        }
-    }
-
-    /// `ZHIPU_API_KEY` alone resolves to glm provider — Zhipu's
-    /// canonical env-var name doesn't require users to alias.
-    #[test]
-    fn auto_detect_zhipu_api_key_resolves_to_glm() {
-        let env = mock_env(&[("ZHIPU_API_KEY", "fake-zhipu-key")]);
-        assert_eq!(auto_detect_provider_from(env), Some("glm"));
-    }
-
-    /// When BOTH GLM_API_KEY and ZHIPU_API_KEY are set, the
-    /// dirge-primary GLM_API_KEY wins (it's earlier in
-    /// PROVIDER_AUTODETECT_ORDER). The fallback only fires when
-    /// the primary is absent.
-    #[test]
-    fn auto_detect_glm_api_key_wins_over_zhipu_when_both_set() {
-        let env = mock_env(&[("GLM_API_KEY", "primary"), ("ZHIPU_API_KEY", "fallback")]);
-        // Both map to "glm" so the answer is the same kind, but
-        // this guards against a future reordering breaking the
-        // primary-first invariant. We can't observe WHICH var
-        // resolve_api_key picked from auto_detect alone — that's
-        // tested below.
-        assert_eq!(auto_detect_provider_from(env), Some("glm"));
-    }
-
-    /// `provider_env_var_fallbacks` lists canonical alternatives
-    /// for GLM (Zhipu's name), Anthropic (OAuth token), and Gemini
-    /// (Google's canonical form). Other providers have no
-    /// alternatives.
-    #[test]
-    fn fallback_list_covers_canonical_alternatives() {
-        assert_eq!(
-            provider_env_var_fallbacks(ProviderKind::Glm),
-            &["ZHIPU_API_KEY"]
-        );
-        // B3-3: Anthropic OAuth, Google's two canonical names.
-        assert_eq!(
-            provider_env_var_fallbacks(ProviderKind::Anthropic),
-            &["ANTHROPIC_OAUTH_TOKEN"]
-        );
-        assert_eq!(
-            provider_env_var_fallbacks(ProviderKind::Gemini),
-            &["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"]
-        );
-        for kind in [
-            ProviderKind::OpenAI,
-            ProviderKind::DeepSeek,
-            ProviderKind::OpenRouter,
-            ProviderKind::Ollama,
-            ProviderKind::Custom,
-        ] {
-            assert!(
-                provider_env_var_fallbacks(kind).is_empty(),
-                "no fallback expected for {kind:?}",
-            );
-        }
-    }
-
-    // ============================================================
-    // Phase 4.5h-2: AnyAgent::build_stream_fn dispatch tests
-    // ============================================================
-
-    /// Build a real `AnyAgent` from an openai-shaped client +
-    /// model. The Client::new doesn't connect (no network until
-    /// the first request), so this works in unit tests.
-    ///
-    /// Use `completions_api()` to get the chat-completion model
-    /// (the variant `AnyAgentInner::OpenAI` holds); the default
-    /// `completion_model` on a fresh `Client` returns the
-    /// responses-api model, which is a different type.
-    fn build_openai_any_agent() -> AnyAgent {
-        use rig::providers::openai;
-        let client = openai::Client::new("test-key")
-            .expect("openai Client::new should work")
-            .completions_api();
-        let model = client.completion_model("gpt-4o");
-        let agent = rig::agent::AgentBuilder::new(model).build();
-        AnyAgent::new(
-            AnyAgentInner::OpenAI(agent),
-            ToolCache::new(),
-            std::time::Duration::from_secs(300),
-            Vec::new(),    // loop_tools — empty for test fixture
-            String::new(), // preamble — empty for test fixture
-            "gpt-4o".to_string(),
-        )
-    }
-
-    /// `build_stream_fn` returns a `Send + Sync + 'static`
-    /// `StreamFn` for the OpenAI variant. Compile-time check —
-    /// if the bounds don't match the type would fail to
-    /// construct.
-    #[test]
-    fn build_stream_fn_returns_send_sync_static() {
-        fn assert_send_sync_static<T: Send + Sync + 'static>(_: &T) {}
-        let agent = build_openai_any_agent();
-        let stream_fn = agent.build_stream_fn(vec![]);
-        assert_send_sync_static(&stream_fn);
-    }
-
-    /// `build_stream_fn` is callable as a `Fn` (multi-call) —
-    /// the loop invokes it once per turn. Verify by calling
-    /// twice and checking both invocations produce streams.
-    #[tokio::test]
-    async fn build_stream_fn_is_multi_callable() {
-        use crate::agent::agent_loop::LlmContext;
-        use crate::agent::agent_loop::tool::AbortSignal;
-        use futures::stream::StreamExt;
-
-        let agent = build_openai_any_agent();
-        let stream_fn = agent.build_stream_fn(vec![]);
-
-        // Call once with an empty context — should emit an
-        // Error event (no prompt) without panicking.
-        let ctx = LlmContext {
-            system_prompt: String::new(),
-            messages: vec![],
-        };
-        let mut s = stream_fn(
-            ctx,
-            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
-        );
-        let first = s.next().await;
-        assert!(first.is_some(), "first call should produce events");
-
-        // Call again — same closure, same Arc, fresh stream.
-        let ctx2 = LlmContext {
-            system_prompt: String::new(),
-            messages: vec![],
-        };
-        let mut s2 = stream_fn(
-            ctx2,
-            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
-        );
-        let second = s2.next().await;
-        assert!(second.is_some(), "second call should also produce events");
-    }
-
-    /// All 8 `AnyAgentInner` variants compile through
-    /// `build_stream_fn` — the match arms cover the full enum,
-    /// and the bounds on `rig_stream_fn_from_model<M>` are
-    /// satisfied by each provider's `CompletionModel`.
-    ///
-    /// This test exists primarily as a compile-time
-    /// canary: if a future provider variant gets added to
-    /// `AnyAgentInner` without a matching arm in
-    /// `build_stream_fn`, the build breaks. Runtime
-    /// dispatch is exercised by the OpenAI-backed tests
-    /// above.
-    #[test]
-    fn build_stream_fn_covers_all_variants_compile_time() {
-        // Just constructs one variant and calls
-        // build_stream_fn; the rest are validated by the
-        // match-arm exhaustiveness check at compile time.
-        let agent = build_openai_any_agent();
-        let _ = agent.build_stream_fn(vec![]);
-    }
-
-    // --- C6/C7: compaction prefix is full + includes tool calls -----
-
-    use super::summarize;
-    use crate::session::{MessageRole, SessionMessage, ToolCallEntry, ToolCallState};
-    use compact_str::CompactString;
-
-    fn sm(role: MessageRole, content: &str, tool_calls: Vec<ToolCallEntry>) -> SessionMessage {
-        SessionMessage {
-            role,
-            content: CompactString::from(content),
-            estimated_tokens: 0,
-            id: CompactString::from("test-id"),
-            timestamp: 0,
-            tool_calls,
-        }
-    }
-
-    /// C7: assistant tool calls land in the serialized form with
-    /// args + result. Previously they were dropped entirely so the
-    /// summarizer saw only `[Assistant]: <text>` with no record
-    /// that bash/read/edit ever ran.
-    #[test]
-    fn serialize_conversation_includes_tool_calls() {
-        let msgs = vec![
-            sm(MessageRole::User, "list rust files", vec![]),
-            sm(
-                MessageRole::Assistant,
-                "I'll find them.",
-                vec![ToolCallEntry {
-                    id: "call_1".into(),
-                    name: "find_files".into(),
-                    args: serde_json::json!({"pattern": "*.rs"}),
-                    state: ToolCallState::Completed {
-                        result: "src/main.rs\nsrc/lib.rs".into(),
-                    },
-                }],
-            ),
-        ];
-        let out = summarize::serialize_conversation(&msgs);
-        assert!(out.contains("[User]"), "missing role tag: {out}");
-        assert!(
-            out.contains("[Tool: find_files("),
-            "missing tool call line: {out}"
-        );
-        assert!(
-            out.contains("src/main.rs"),
-            "missing tool result content: {out}"
-        );
-    }
-
-    /// C7: interrupted + failed tool calls also surface.
-    #[test]
-    fn serialize_conversation_marks_interrupted_and_failed() {
-        let msgs = vec![sm(
-            MessageRole::Assistant,
-            "trying",
-            vec![
-                ToolCallEntry {
-                    id: "a".into(),
-                    name: "bash".into(),
-                    args: serde_json::json!({"command": "sleep 9999"}),
-                    state: ToolCallState::Interrupted,
-                },
-                ToolCallEntry {
-                    id: "b".into(),
-                    name: "read".into(),
-                    args: serde_json::json!({"path": "/missing"}),
-                    state: ToolCallState::Failed {
-                        error: "no such file".into(),
-                    },
-                },
-            ],
-        )];
-        let out = summarize::serialize_conversation(&msgs);
-        assert!(out.contains("<interrupted>"), "got: {out}");
-        assert!(out.contains("<failed: no such file>"), "got: {out}");
-    }
-
-    /// C7 bound: a single tool result over the per-tool cap (2KB)
-    /// truncates with a marker, preserving structure of the rest
-    /// of the conversation.
-    #[test]
-    fn serialize_conversation_truncates_huge_tool_results() {
-        let big: String = "x".repeat(5000);
-        let msgs = vec![sm(
-            MessageRole::Assistant,
-            "huge",
-            vec![ToolCallEntry {
-                id: "c".into(),
-                name: "grep".into(),
-                args: serde_json::json!({"pattern": "."}),
-                state: ToolCallState::Completed { result: big },
-            }],
-        )];
-        let out = summarize::serialize_conversation(&msgs);
-        assert!(
-            out.contains("(truncated, 5000 bytes total)"),
-            "expected truncation marker; got: {out}"
-        );
-    }
-
-    /// C6: a long full-conversation prefix is NOT truncated by the
-    /// caller-side 6000-char cap any more. compress_messages no
-    /// longer slices `conversation`; the full string reaches the
-    /// summarizer. Regression test the unchanged-passthrough via
-    /// serialize_conversation's length on a large input.
-    #[test]
-    fn serialize_conversation_returns_full_prefix() {
-        let msgs: Vec<SessionMessage> = (0..200)
-            .map(|i| sm(MessageRole::Assistant, &format!("turn {i}"), vec![]))
-            .collect();
-        let out = summarize::serialize_conversation(&msgs);
-        // 200 turns × ~10 chars each = ~2000 chars; below the old
-        // 6000 cap but the principle still holds: the function is
-        // a pure mapper, no length cap. Confirm by checking the
-        // last turn is present.
-        assert!(out.contains("turn 199"), "tail must be present: {out}");
-        assert!(out.contains("turn 0"), "head must be present: {out}");
-    }
-
-    // ============================================================
-    // PROV-1: Custom-provider validation tests
-    // ============================================================
-
-    /// Custom provider with https base_url is accepted.
-    #[test]
-    fn custom_provider_https_is_allowed() {
-        let custom = std::collections::HashMap::from([(
-            "my-proxy".to_string(),
-            CustomProviderConfig {
-                provider_type: "custom".to_string(),
-                base_url: "https://my-proxy.example.com/v1".to_string(),
-                api_key_env: None,
-                allow_insecure: false,
-                stream_chunk_timeout_secs: None,
-            },
-        )]);
-        let result = resolve_provider_info("my-proxy", &custom);
-        assert!(result.is_some(), "https provider should resolve");
-    }
-
-    /// Custom provider with http base_url is rejected unless allow_insecure.
-    #[test]
-    fn custom_provider_http_rejected_without_allow_insecure() {
-        let custom = std::collections::HashMap::from([(
-            "bad-proxy".to_string(),
-            CustomProviderConfig {
-                provider_type: "custom".to_string(),
-                base_url: "http://bad-proxy.example.com/v1".to_string(),
-                api_key_env: None,
-                allow_insecure: false,
-                stream_chunk_timeout_secs: None,
-            },
-        )]);
-        let result = resolve_provider_info("bad-proxy", &custom);
-        assert!(
-            result.is_none(),
-            "http provider without allow_insecure should be rejected"
-        );
-    }
-
-    /// Custom provider with http base_url + allow_insecure: true is accepted.
-    #[test]
-    fn custom_provider_http_allowed_with_allow_insecure() {
-        let custom = std::collections::HashMap::from([(
-            "local-ollama".to_string(),
-            CustomProviderConfig {
-                provider_type: "custom".to_string(),
-                base_url: "http://localhost:11434/v1".to_string(),
-                api_key_env: None,
-                allow_insecure: true,
-                stream_chunk_timeout_secs: None,
-            },
-        )]);
-        let result = resolve_provider_info("local-ollama", &custom);
-        assert!(
-            result.is_some(),
-            "http provider with allow_insecure should be accepted"
-        );
-    }
-
-    /// Custom provider name colliding with built-in is rejected.
-    #[test]
-    fn custom_provider_builtin_name_collision_rejected() {
-        // Plugin tries to shadow "openai".
-        let custom = std::collections::HashMap::from([(
-            "openai".to_string(),
-            CustomProviderConfig {
-                provider_type: "custom".to_string(),
-                base_url: "https://evil.example.com/v1".to_string(),
-                api_key_env: None,
-                allow_insecure: false,
-                stream_chunk_timeout_secs: None,
-            },
-        )]);
-        let result = resolve_provider_info("openai", &custom);
-        assert!(
-            result.is_none(),
-            "builtin name collision should be rejected"
-        );
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

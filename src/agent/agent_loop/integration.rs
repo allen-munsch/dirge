@@ -69,7 +69,7 @@ use crate::event::AgentEvent;
 use super::bridge::EventBridge;
 use super::heal;
 use super::message::{LoopMessage, UserMessage};
-use super::run::run_agent_loop_with_summarizer;
+use super::run::run_agent_loop;
 use super::steering::steering_from_queue;
 use super::stream::StreamFn;
 use super::tool::{AbortSignal, LoopTool};
@@ -107,25 +107,36 @@ impl LoopRunner {
     /// long runs and bounded prevents an unbounded queue.
     pub fn into_agent_runner(self) -> crate::agent::runner::AgentRunner {
         let (interject_tx, mut interject_rx) = mpsc::channel::<()>(64);
-        let signal_for_bridge = self.signal.clone();
-        // Spawn a small bridge: first interject signal triggers
-        // a GRACEFUL interjection (LOOP-4). The loop stops at
-        // the next turn boundary; in-flight tools complete
-        // normally. Hard cancellation (Ctrl+C) uses signal.cancel()
-        // directly and is NOT routed through this channel.
+        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(64);
+        let signal_for_interject = self.signal.clone();
+        let signal_for_cancel = self.signal.clone();
+        // First interject signal → GRACEFUL interjection (LOOP-4).
+        // The loop stops at the next turn boundary; in-flight tools
+        // complete normally.
         tokio::spawn(async move {
             if interject_rx.recv().await.is_some() {
-                signal_for_bridge.interject();
+                signal_for_interject.interject();
                 // Drain remaining signals so the UI's bounded
-                // channel doesn't backpressure on the second
-                // press.
+                // channel doesn't backpressure on the second press.
                 while interject_rx.try_recv().is_ok() {}
+            }
+        });
+        // First cancel signal → HARD cancellation. The UI pairs
+        // this with `JoinHandle::abort()` for a belt-and-suspenders
+        // shutdown: abort kills the task, cancel gives the retry
+        // loop and rig stream a chance to observe `is_cancelled()`
+        // and exit through their clean-error paths first.
+        tokio::spawn(async move {
+            if cancel_rx.recv().await.is_some() {
+                signal_for_cancel.cancel();
+                while cancel_rx.try_recv().is_ok() {}
             }
         });
         crate::agent::runner::AgentRunner {
             event_rx: self.event_rx,
             task: self.task,
             interject_tx,
+            cancel_tx,
         }
     }
 }
@@ -343,6 +354,63 @@ pub struct LoopSpawnConfig {
     /// can call the auxiliary model. Production code builds this
     /// from `AnyClient::compress_messages`; tests can mock it.
     pub summarize_fn: Option<crate::agent::compression::SummarizeFn>,
+
+    /// Phase-3: per-session loaded-tool set. When `Some`, the
+    /// request builder filters tool defs sent to the model
+    /// against this set + the always-on list. Must be the SAME
+    /// Arc passed to the `ToolSearchTool` instance in `tools` —
+    /// that's how the meta-tool's results surface to the next
+    /// turn's request. `None` keeps the legacy "ship every tool
+    /// every turn" behavior.
+    pub tool_def_filter: Option<Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+
+    /// Phase-3: whether dynamic-tool-search is on. Mirrors the
+    /// `dynamic_tool_search` config knob. Carried alongside
+    /// `tool_def_filter` for introspection.
+    pub dynamic_tool_search: bool,
+
+    /// Phase 4 part 1: alternate stream function used for ONE
+    /// call after a repair-exhaustion or tree-sitter failure.
+    /// `None` when no escalation is configured.
+    pub escalation_stream_fn: Option<StreamFn>,
+
+    /// Phase 4 part 1: provider name for the escalation route.
+    /// Surfaced in `LoopEvent::EscalationActivated` so the UI can
+    /// show the user which provider just took over.
+    pub escalation_provider_name: Option<String>,
+
+    /// Phase 4 part 1: per-session escalation cap. `None` uses the
+    /// hardcoded default of 3.
+    pub escalation_max_per_session: Option<usize>,
+
+    /// Phase 4 part 2: optional file-touch tracker for the
+    /// context-depth reminder system. `None` keeps the feature
+    /// off (legacy behavior, byte-identical to today).
+    pub file_touch_tracker:
+        Option<std::sync::Arc<crate::agent::agent_loop::context_depth::FileTouchTracker>>,
+
+    /// dirge-nqr: hard cap on assistant turns within a single run.
+    /// `None` = unlimited. Forwarded to `LoopConfig.max_turns`.
+    pub max_turns: Option<usize>,
+
+    /// dirge-9tfq: per-session background-task store. When `Some`,
+    /// `spawn_loop_runner` installs a `get_followup_messages` hook
+    /// that drains the store's pending notifications at every
+    /// outer-loop boundary and synthesises a `<system-reminder>`
+    /// user message so the parent agent sees the subagent's result
+    /// without needing the user to re-prompt. `None` keeps the
+    /// legacy behaviour where completion only surfaces when the
+    /// user types (via `prepend_pending_notifications` on the next
+    /// prompt).
+    pub bg_store: Option<crate::agent::tools::background::BackgroundStore>,
+
+    /// dirge-h5tv: memory provider passed through to the auto-compaction
+    /// path so `on_pre_compress` can fire when the loop folds messages.
+    /// Pre-fix the hook only fired from `handle_compress` (the /compress
+    /// slash command), so the silent auto-fold path dropped plugin-provider
+    /// insights every time. `None` is a no-op (no provider attached, or a
+    /// non-interactive test path).
+    pub memory_provider: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
 }
 
 impl LoopSpawnConfig {
@@ -365,6 +433,15 @@ impl LoopSpawnConfig {
             tool_execution: ToolExecutionMode::Parallel,
             event_channel_capacity: 256,
             summarize_fn: None,
+            tool_def_filter: None,
+            dynamic_tool_search: false,
+            escalation_stream_fn: None,
+            escalation_provider_name: None,
+            escalation_max_per_session: None,
+            file_touch_tracker: None,
+            max_turns: None,
+            bg_store: None,
+            memory_provider: None,
         }
     }
 }
@@ -388,6 +465,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     let mut loop_config = LoopConfig {
         convert_to_llm: default_convert_to_llm(),
         transform_context: None,
+        compaction_hooks: None,
         get_api_key: None,
         api_key: None,
         tool_execution: cfg.tool_execution,
@@ -398,7 +476,14 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         get_steering_messages: cfg
             .steering_queue
             .map(|q| steering_from_queue(q, QueueMode::All)),
-        get_followup_messages: None,
+        // dirge-9tfq: when a background-task store is provided, install
+        // a follow-up hook that surfaces subagent completions at the
+        // outer-loop boundary. Without this, the parent agent only sees
+        // results when the user re-prompts.
+        get_followup_messages: cfg
+            .bg_store
+            .clone()
+            .map(|store| crate::agent::tools::background::followup_from_background_store(store)),
         reasoning: None,
         thinking_budgets: None,
         headers: std::collections::HashMap::new(),
@@ -409,6 +494,23 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         compact_model: None,
         storm_mutating_tools: None,
         storm_exempt_tools: None,
+        repair_stats: std::sync::Arc::new(
+            crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
+        ),
+        truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        tool_def_filter: cfg.tool_def_filter.clone(),
+        dynamic_tool_search: cfg.dynamic_tool_search,
+        escalation_stream_fn: cfg.escalation_stream_fn.clone(),
+        escalation_provider_name: cfg.escalation_provider_name.clone(),
+        escalation_pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        escalation_max_per_session: cfg.escalation_max_per_session.unwrap_or(3),
+        escalation_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            cfg.escalation_max_per_session.unwrap_or(3),
+        )),
+        file_touch_tracker: cfg.file_touch_tracker.clone(),
+        max_turns: cfg.max_turns,
     };
 
     #[cfg(feature = "plugin")]
@@ -421,6 +523,24 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             loop_config.after_tool_call = Some(
                 super::plugin_hooks::after_hook_from_plugin_manager(pm.clone()),
             );
+            // dirge-264x: plugin-driven context transform, dispatched
+            // before each LLM call (stream_assistant_response reads
+            // config.transform_context). Only install if the host
+            // didn't supply one — it doesn't today, so this is the
+            // sole consumer of the otherwise-always-None field.
+            if loop_config.transform_context.is_none() {
+                loop_config.transform_context = Some(
+                    super::plugin_hooks::transform_context_from_plugin_manager(pm.clone()),
+                );
+            }
+            // dirge-jia8: plugin compaction hooks (observe-only
+            // before-compact + custom-summary on-compact), consumed
+            // by run_compaction_pass.
+            if loop_config.compaction_hooks.is_none() {
+                loop_config.compaction_hooks = Some(
+                    super::plugin_hooks::compaction_hooks_from_plugin_manager(pm.clone()),
+                );
+            }
             // Phase 5: pi-loop hook surface for plugins.
             // Each polls a dedicated Janet slot the plugin sets
             // via harness/* helpers. Hooks fire at the right
@@ -443,8 +563,26 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
                     super::plugin_hooks::get_steering_messages_from_plugin_manager(pm.clone()),
                 );
             }
-            loop_config.get_followup_messages =
-                Some(super::plugin_hooks::get_followup_messages_from_plugin_manager(pm));
+            // dirge-9tfq: when both plugin AND background-store
+            // followups are configured, run both at each boundary and
+            // concatenate (background notifications first so the
+            // subagent result is observed before any plugin-injected
+            // continuation). Without composing, installing the plugin
+            // hook would silently shadow subagent completion delivery.
+            let plugin_followup =
+                super::plugin_hooks::get_followup_messages_from_plugin_manager(pm);
+            loop_config.get_followup_messages = match loop_config.get_followup_messages.take() {
+                Some(bg_followup) => Some(std::sync::Arc::new(move || {
+                    let bg = bg_followup.clone();
+                    let pl = plugin_followup.clone();
+                    Box::pin(async move {
+                        let mut out = bg().await;
+                        out.extend(pl().await);
+                        out
+                    })
+                })),
+                None => Some(plugin_followup),
+            };
         }
     }
 
@@ -458,6 +596,9 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     })];
     let stream_fn = cfg.stream_fn;
     let summarize_fn = cfg.summarize_fn.clone();
+    // dirge-h5tv: capture the provider before the move-closure so
+    // auto-compaction can fire on_pre_compress mid-loop.
+    let memory_provider = cfg.memory_provider.clone();
 
     let task = tokio::spawn(async move {
         // Inner channel for LoopEvents emitted by run_agent_loop.
@@ -496,7 +637,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         // killing both. Tools that poll the AbortSignal still
         // observe the cancellation cooperatively.
         let loop_future = async move {
-            let _final_messages = run_agent_loop_with_summarizer(
+            let _final_messages = run_agent_loop(
                 prompts,
                 context,
                 loop_config,
@@ -504,6 +645,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
                 &loop_tx,
                 &stream_fn,
                 summarize_fn,
+                memory_provider,
             )
             .await;
             // Drop the sender so the pump observes channel
@@ -885,6 +1027,134 @@ mod tests {
         );
     }
 
+    /// dirge-9tfq integration: while a background subagent is
+    /// running, the parent agent finishes its initial turn and the
+    /// inner loop drains (no more tool calls, no pending steering).
+    /// Without this fix the run would terminate and the user would
+    /// have to re-prompt to see the subagent's result.
+    ///
+    /// With `cfg.bg_store = Some(store)`, the outer-loop boundary
+    /// poll picks up the completion notification, re-enters the
+    /// inner loop with the result as `pending_messages`, and the
+    /// model sees `[task <id>] completed: <result>` in its next
+    /// turn. The final transcript contains both the synthetic
+    /// follow-up user message AND a subsequent assistant turn that
+    /// observed it.
+    ///
+    /// Stream factory is a state machine across three LLM calls:
+    ///   call 0: emit a text-only response (initial work done)
+    ///           — between this call and the next outer-poll, push
+    ///           a completion into the store from outside.
+    ///   call 1: the call AFTER the followup is injected; we
+    ///           inspect llm_ctx.messages to assert the synthetic
+    ///           reminder is present, then emit a final text.
+    ///
+    /// The parent loop transitions: turn 0 (text) → inner exits →
+    /// outer polls followup → store has 1 notification → inject as
+    /// pending → re-enter inner → turn 1 (sees notification) →
+    /// exit.
+    #[tokio::test]
+    async fn parent_idle_during_subagent_run_resumes_on_completion() {
+        use crate::agent::tools::background::{BackgroundStore, TaskState};
+
+        let store = BackgroundStore::new();
+        store.insert("sub-1".into());
+
+        let saw_reminder = Arc::new(Mutex::new(false));
+        let saw_clone = saw_reminder.clone();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let store_for_factory = store.clone();
+
+        let factory: StreamFn = Arc::new(move |llm_ctx, _opts| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => {
+                    // First call: parent finishes its initial work
+                    // and pretends to be idle. After we return,
+                    // the inner loop exits (text response = no
+                    // tool calls). Between this return and the
+                    // outer-loop followup poll, the subagent
+                    // "completes" — simulate that by notifying
+                    // the store right now.
+                    store_for_factory.notify(
+                        "sub-1",
+                        TaskState::Completed("subagent finished work".into()),
+                    );
+                }
+                1 => {
+                    // Second call: the followup must have been
+                    // injected as a user message before this call.
+                    // Inspect llm_ctx.messages for the marker.
+                    let found = llm_ctx.messages.iter().any(|m| {
+                        m.get("role").and_then(|r| r.as_str()) == Some("user")
+                            && m.get("content").and_then(|c| c.as_str()).map(|s| {
+                                s.contains("[task sub-1] completed:")
+                                    && s.contains("subagent finished work")
+                            }) == Some(true)
+                    });
+                    *saw_clone.lock().unwrap() = found;
+                }
+                _ => {}
+            }
+            let msg = if n == 0 {
+                text_response("initial work done; awaiting subagent")
+            } else {
+                text_response("acknowledged subagent result")
+            };
+            let reason = msg.stop_reason;
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason,
+                message: msg,
+                usage: None,
+            }]))
+        });
+
+        let mut cfg = LoopSpawnConfig::minimal(factory, "start work, then wait");
+        cfg.bg_store = Some(store.clone());
+
+        let runner = spawn_loop_runner(cfg);
+        let _events = drain(runner.event_rx).await;
+        let _ = runner.task.await;
+
+        assert!(
+            *saw_reminder.lock().unwrap(),
+            "second LLM call must see the [task sub-1] completed marker; \
+             the parent loop should have re-entered the inner loop with \
+             the subagent completion as a pending user message",
+        );
+        // Pending queue must be drained after the followup fires —
+        // otherwise the same notification would re-inject on every
+        // outer-boundary poll and spam the model.
+        assert!(
+            store.drain_notifications().is_empty(),
+            "completion must be consumed exactly once",
+        );
+    }
+
+    /// dirge-9tfq: without a bg_store, the follow-up hook stays
+    /// unset and the loop behaves byte-identically to pre-9tfq —
+    /// no synthetic user message is injected and the run ends
+    /// after the assistant's text-only response. Guards against a
+    /// regression where the hook fires on every poll regardless of
+    /// configuration.
+    #[tokio::test]
+    async fn no_bg_store_means_no_followup_injection() {
+        let mut cfg = LoopSpawnConfig::minimal(canned_factory(vec![text_response("done")]), "hi");
+        cfg.bg_store = None; // explicit for clarity
+
+        let runner = spawn_loop_runner(cfg);
+        let events = drain(runner.event_rx).await;
+        let _ = runner.task.await;
+
+        // Exactly one TurnEnd — outer loop did NOT re-enter with a
+        // phantom follow-up.
+        let turn_ends = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnEnd { .. }))
+            .count();
+        assert_eq!(turn_ends, 1, "expected single turn; got {turn_ends}");
+    }
+
     fn agent_event_kind(e: &AgentEvent) -> &'static str {
         match e {
             AgentEvent::Token(_) => "Token",
@@ -902,6 +1172,8 @@ mod tests {
             AgentEvent::UserMessage { .. } => "UserMessage",
             AgentEvent::ContextCompacted { .. } => "ContextCompacted",
             AgentEvent::RetryNotice { .. } => "RetryNotice",
+            AgentEvent::RepairStats { .. } => "RepairStats",
+            AgentEvent::EscalationActivated { .. } => "EscalationActivated",
         }
     }
 

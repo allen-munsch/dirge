@@ -1,4 +1,3 @@
-use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -6,10 +5,16 @@ use crate::permission::allowlist;
 use crate::permission::engine;
 use crate::permission::path;
 use crate::permission::pattern::Pattern;
-use crate::permission::{Action, PermissionConfig, SecurityMode, ToolPerm};
+use crate::permission::{PermissionConfig, SecurityMode};
 
 pub type PermCheck = Arc<Mutex<PermissionChecker>>;
 
+/// Synchronous decision result. A `CheckResult`-returning query API
+/// over the engine, used by the test oracle (`check`/`check_path`
+/// exercise the engine across ~1700 assertions). No production caller
+/// today — the runtime path returns an engine `Decision` via
+/// `authorize_scope`/`enforce` — so it's `dead_code`-allowed.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     Allowed,
@@ -17,72 +22,71 @@ pub enum CheckResult {
     Denied(String),
 }
 
+/// Render a decision's audit trail for the `/why` command: the final
+/// effect + deciding policy, then every applicable policy's vote in
+/// evaluation order (and the skipped ones, so it's clear what did and
+/// didn't apply).
+fn format_decision(tool: &str, input: &str, decision: &engine::types::Decision) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "why: {tool} {input:?}");
+    let _ = writeln!(out, "  → {:?}  ({})", decision.effect, decision.reason());
+    for e in &decision.trace {
+        if e.applied {
+            let eff = e
+                .effect
+                .map(|x| format!("{x:?}"))
+                .unwrap_or_else(|| "—".to_string());
+            let _ = writeln!(out, "  · {:<16} {eff:<6} {}", e.policy, e.why);
+        } else {
+            let _ = writeln!(out, "  · {:<16} (n/a)  {}", e.policy, e.why);
+        }
+    }
+    out
+}
+
+/// Map an engine `Decision` onto the `CheckResult` returned by the
+/// `check`/`check_path` test-oracle facade.
+#[allow(dead_code)]
+fn effect_to_result(decision: engine::types::Decision) -> CheckResult {
+    use engine::types::Effect;
+    match decision.effect {
+        Effect::Allow => CheckResult::Allowed,
+        Effect::Ask => CheckResult::Ask,
+        Effect::Deny => CheckResult::Denied(decision.reason()),
+    }
+}
+
+/// Thin facade over the unified authorization [`Engine`]. Tools call
+/// `authorize_scope` / `authorize_request` (via the `enforce`
+/// chokepoint) and `check` / `check_path` (a `CheckResult` wrapper used
+/// by `/allow`, `/why`, and the tests). All decision logic lives in the
+/// engine; the checker just normalizes inputs, holds the working
+/// directory + mode, and keeps a display copy of the session allowlist.
 pub struct PermissionChecker {
-    rules: HashMap<String, Vec<(Pattern, Action)>>,
-    default_action: Action,
-    ext_dir_rules: Vec<(Pattern, Action)>,
-    doom_loop_action: Action,
     working_dir: String,
-    /// Cached canonical form of `working_dir`, computed once at
-    /// construction (and refreshed by `set_working_dir`). Used by
-    /// `is_external_path` to compare canonical paths without
-    /// hitting the filesystem on every permission check — the
-    /// canonicalize syscall is otherwise called once per
-    /// read/write/edit/grep call, accumulating to hundreds of
-    /// stat()s per session.
+    /// Cached canonical form of `working_dir`. Used by
+    /// `is_external_path` (a live API consumed by the MCP tool) to
+    /// compare canonical paths without a syscall per check.
     working_dir_canonical: String,
-    /// The currently-installed CWD-scoped allow-glob (e.g.
-    /// `/Users/foo/proj/**`) used by `install_cwd_allow_rules` and
-    /// `set_working_dir`. Recorded so that on cd we can find and
-    /// remove the stale entries from `rules` before installing
-    /// fresh ones, without touching user-configured rules pushed
-    /// onto the same Vec. `None` when no CWD-allow was installable
-    /// (degenerate working_dir, e.g. empty or `/`).
-    cwd_allow_pattern: Option<String>,
+    /// Display/persistence copy of the session "allow always" grants
+    /// (the engine holds the authoritative op-scoped copy used for
+    /// decisions). Powers `/allow list|remove|clear` and session save.
     session_allowlist: Vec<(String, Pattern)>,
-    recent_calls: VecDeque<(String, String)>,
-    /// PERM-1: per-key repeat counter. Tracks how many times each
-    /// (tool, input) pair has been seen. Uses a HashMap keyed by
-    /// "{tool}\x00{input}" so the lookup is O(1) instead of scanning
-    /// the FIFO window. Counts persist until evicted by the FIFO
-    /// ring (window 32) — a 14-call decoy-gap attack can't flush a
-    /// specific key because the ring is 2× the old window.
-    repeat_counts: HashMap<String, u32>,
     mode: SecurityMode,
-    /// Tools denied by the currently-active prompt's frontmatter
-    /// `deny_tools` list. Enforced at the top of every `check` /
-    /// `check_path` call — even before Yolo mode's blanket allow.
-    /// This is the permission-layer enforcement of plan/review/etc.
-    /// modes; previously plan mode relied on prose ("don't write
-    /// code") + inline `is_plan_file` gates in edit/write/apply_patch,
-    /// which an adversarial / confused LLM could route around via
-    /// `bash` or by bypassing the gate name-check.
-    ///
-    /// Updated by `set_prompt_deny_tools` whenever the active prompt
-    /// changes (slash `/prompt <name>`, session load, startup). Empty
-    /// when no prompt is active or the active prompt has no
-    /// frontmatter.
+    /// Tools denied by the active prompt's frontmatter `deny_tools`.
+    /// Mirrored into the engine's `PolicyCtx`; this copy backs
+    /// `any_prompt_denied` (the MCP concrete-name probe).
     prompt_deny_tools: Vec<String>,
+    /// The unified authorization engine — the source of truth for every
+    /// runtime decision.
+    engine: engine::Engine,
 }
 
-/// Tools that execute external code with broad effects. Accept mode
-/// does NOT coerce `Ask → Allow` for these — the "I trust the agent
-/// inside cwd" rationale that justifies the coercion for other
-/// non-path tools doesn't generalize to shell + MCP servers.
-fn is_high_risk_non_path_tool(tool: &str) -> bool {
-    engine::is_high_risk_non_path_tool(tool)
-}
-
-/// Tool names where the input is a filesystem path. For these, `*` keeps
-/// classic glob semantics (one segment, doesn't cross `/`). Everything else
-/// is treated as shell/text where `*` means "any chars including /".
+/// Tool names where the input is a filesystem path. Used by the
+/// session-allowlist helpers to decide raw-vs-resolved matching.
 pub(crate) fn is_path_tool_name(tool: &str) -> bool {
     engine::is_path_tool_name(tool)
-}
-
-/// Build a Pattern with the right `*` semantics for the given tool.
-pub(crate) fn pattern_for_tool(tool: &str, pat: &str) -> Pattern {
-    engine::pattern_for_tool(tool, pat)
 }
 
 impl PermissionChecker {
@@ -91,258 +95,124 @@ impl PermissionChecker {
         mode: SecurityMode,
         working_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        // M4 (dirge-ojn): default flipped Allow → Ask. Unconfigured
-        // tools now prompt the user instead of silently executing.
-        // Read-only tools that should NOT prompt get explicit Allow
-        // rules installed below (see `install_default_allow_rules`).
-        //
-        // Why: dirge previously defaulted every unmatched tool to
-        // Allow — e.g. `write` had no rules installed, so write to
-        // any cwd path executed silently. Combined with the bash
-        // redirect-target bug closed in M3 (fbcc09b), the practical
-        // posture was "anything runs unless an explicit rule says no",
-        // the opposite of what users expect from a coding agent.
-        //
-        // Mirrors maki's posture (`maki-agent/src/permissions.rs:199`:
-        // bash, write, edit, MCP all default to Ask; an explicit
-        // BUILTIN_ALLOW_RULES list opens specific safe tools) and
-        // opencode's (`evaluate.ts:14`: `return match ?? { action:
-        // "ask" }` — Ask is the universal fallback).
-        let default_action = config.default.unwrap_or(Action::Ask);
-        let doom_loop_action = config.doom_loop.unwrap_or(Action::Ask);
-
-        // Resolve `working_dir` UP-FRONT so the CWD-scoped builtin
-        // allow rules installed below can embed it in their
-        // patterns. The actual struct field is populated from this
-        // same value at the bottom of `new`.
         let working_dir = working_dir
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
             .to_string_lossy()
             .to_string();
-
-        let mut rules: HashMap<String, Vec<(Pattern, Action)>> = HashMap::new();
-
-        // M4 (dirge-ojn): install the builtin-allow list FIRST so user
-        // rules added later (last-match-wins per check_path's
-        // `matched.last()`) can override specific patterns while the
-        // tool's overall posture stays Allow-by-default for safety.
-        //
-        // Example: user writes `read: { "/etc/**": "deny" }`. With the
-        // builtin already installed as `read: { "**": allow }`, the
-        // user's specific deny appends to the same Vec. On lookup the
-        // last matching pattern wins:
-        //   - `/etc/passwd` → both rules match → user's deny wins ✓
-        //   - `/tmp/safe.txt` → only `**` matches → builtin allow ✓
-        //
-        // Tools NOT in this list (write/edit/apply_patch/bash/webfetch/
-        // websearch/task/skill/memory) fall to the global default Ask
-        // unless the user installs explicit rules.
-        //
-        // Adapts maki's `BUILTIN_ALLOW_RULES`
-        // (`maki-agent/src/permissions.rs:16-24`) for dirge's tool set.
-        // Maki includes write/edit/multiedit in its allow list — a
-        // different posture choice that doesn't suit dirge given the
-        // audit history (C1/C8/etc.).
-        for tool in [
-            "read",
-            "glob",
-            "grep",
-            "find_files",
-            "list_dir",
-            "list_symbols",
-            "find_definition",
-            "find_callers",
-            "find_callees",
-            "get_symbol_body",
-            "repo_overview",
-            "lsp",
-            "write_todo_list", // Internal-only TODO tracking; no side effects
-            "task_status",     // Read-only status query for background tasks
-            "question",        // Interactive by definition; gating it just adds friction
-        ] {
-            rules
-                .entry(tool.to_string())
-                .or_default()
-                .push((pattern_for_tool(tool, "**"), Action::Allow));
-        }
-
-        // CWD-scoped builtin-allow for mutating filesystem tools.
-        // Helper handles canonicalization + safety guards; see
-        // `install_cwd_allow_rules` for the contract.
-        let cwd_allow_pattern = install_cwd_allow_rules(&mut rules, &working_dir);
-
-        // /dev/null is a harmless bit-bucket — writes silently
-        // discard data, reads return immediate EOF. It must be
-        // allowed for ALL tools without prompting, regardless of
-        // security mode. Without this, every `> /dev/null` bash
-        // redirect and every `write /dev/null` call triggers an
-        // unnecessary permission dialog.
-        install_dev_null_allow(&mut rules);
-
-        // Helper: append a `ToolPerm` (Simple or Granular) onto a
-        // tool's rule vec. Used by both the legacy per-tool fields and
-        // the M2 `tools` map. The legacy fields are syntactic sugar
-        // for `tools.{name}` — same code path.
-        fn append_tool_perm(
-            rules: &mut HashMap<String, Vec<(Pattern, Action)>>,
-            tool_name: &str,
-            tp: &ToolPerm,
-        ) {
-            let entries = rules.entry(tool_name.to_string()).or_default();
-            match tp {
-                ToolPerm::Simple(action) => {
-                    entries.push((pattern_for_tool(tool_name, "*"), *action));
-                }
-                ToolPerm::Granular(map) => {
-                    for (pat, action) in map {
-                        entries.push((pattern_for_tool(tool_name, pat), *action));
-                    }
-                }
-            }
-        }
-
-        // Track which tools the user explicitly configured (legacy
-        // OR via `tools` map) so the bash / MCP default-installers
-        // below can decide whether to skip themselves.
-        let mut user_configured: std::collections::HashSet<&str> = std::collections::HashSet::new();
-
-        for (tool_name, tool_perm) in [
-            ("bash", &config.bash),
-            ("read", &config.read),
-            ("write", &config.write),
-            ("edit", &config.edit),
-            ("grep", &config.grep),
-            ("find_files", &config.find_files),
-            ("list_dir", &config.list_dir),
-            // Adversarial-review #5 added; both are read-only walkers.
-            ("glob", &config.glob),
-            ("repo_overview", &config.repo_overview),
-            ("write_todo_list", &config.write_todo_list),
-            ("apply_patch", &config.apply_patch),
-            ("lsp", &config.lsp),
-            ("question", &config.question),
-            // Newly-configurable tools (previously the perm checker
-            // had no rules for them, so they always fell through to
-            // the `*` default and couldn't be individually gated).
-            ("webfetch", &config.webfetch),
-            ("websearch", &config.websearch),
-            ("task", &config.task),
-            ("task_status", &config.task_status),
-            ("memory", &config.memory),
-            ("skill", &config.skill),
-            ("list_symbols", &config.list_symbols),
-            ("get_symbol_body", &config.get_symbol_body),
-            ("find_definition", &config.find_definition),
-            ("find_callers", &config.find_callers),
-            ("find_callees", &config.find_callees),
-            ("mcp_tool", &config.mcp_tool),
-        ] {
-            if let Some(tp) = tool_perm {
-                append_tool_perm(&mut rules, tool_name, tp);
-                user_configured.insert(tool_name);
-            }
-        }
-
-        // M2 (dirge-cep): merge the unified `tools` map. New configs
-        // declare rules for ANY tool name (including plugin / MCP /
-        // future tools) without extending `PermissionConfig`. Same
-        // append semantics as the legacy fields: tools-map rules are
-        // pushed after legacy rules so last-match-wins.
-        if let Some(tools_map) = &config.tools {
-            for (tool_name, tp) in tools_map {
-                append_tool_perm(&mut rules, tool_name, tp);
-                // Static lifetime needed for HashSet entry —
-                // restrict to the known tool name set; unknown tool
-                // names (plugin/MCP) don't gate the bash/MCP
-                // defaults below anyway.
-                if matches!(tool_name.as_str(), "bash" | "mcp_tool") {
-                    user_configured.insert(match tool_name.as_str() {
-                        "bash" => "bash",
-                        "mcp_tool" => "mcp_tool",
-                        _ => unreachable!(),
-                    });
-                }
-            }
-        }
-
-        // Bash defaults: only install if the user didn't supply ANY
-        // bash rules (legacy or `tools` map). Bash's defaults are
-        // specific allow + deny patterns that don't compose well
-        // with arbitrary user rules — a `cargo *: deny` from the
-        // user shouldn't have to co-exist with the default
-        // `cargo build: allow`.
-        if !user_configured.contains("bash") {
-            let mut defaults = Vec::new();
-            for (pat, action) in crate::permission::default_bash_rules() {
-                defaults.push((pattern_for_tool("bash", pat), action));
-            }
-            // Replace any builtin-allow entry (bash isn't in the
-            // builtin-allow list anyway, but be explicit).
-            rules.insert("bash".to_string(), defaults);
-        }
-
-        // MCP tools execute external code (the MCP server's
-        // implementation, plus whatever effects the server has on
-        // the filesystem / network / API services). The previous
-        // default was the inherited `default_action` (Allow) since
-        // `mcp_tool` had no rule installed; that let an entire
-        // sequence of MCP calls execute silently, with only the
-        // doom-loop detector eventually prompting on the 3rd
-        // identical call. User reported running through several
-        // MCP queries without ever being asked. Install a default
-        // `Ask` rule when no explicit config exists. Users who
-        // trust a specific MCP server can pin it with config:
-        //
-        //   "permission": {
-        //     "mcp_tool": {
-        //       "mcp_tool:lattice:*": "allow"
-        //     }
-        //   }
-        //
-        // …or accept once and pick "allow always" for the same
-        // effect via the session allowlist.
-        if !user_configured.contains("mcp_tool") {
-            rules.insert(
-                "mcp_tool".to_string(),
-                vec![(pattern_for_tool("mcp_tool", "*"), Action::Ask)],
-            );
-        }
-
-        // External-directory rules are always path patterns by definition.
-        let ext_dir_rules = config
-            .external_directory
-            .as_ref()
-            .map(|map| {
-                map.iter()
-                    .map(|(pat, action)| (Pattern::new(pat), *action))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // `working_dir` was already resolved earlier in this fn (used
-        // by the CWD-scoped builtin allow installer above).
         let working_dir_canonical = canonicalize_for_cache(&working_dir);
+        // All rule installation (builtin-allow, cwd-allow, dev-null,
+        // bash/mcp defaults, user rules, external_directory) lives in
+        // the engine now — see `Engine::from_config`.
+        let engine = engine::Engine::from_config(config);
 
         PermissionChecker {
-            rules,
-            default_action,
-            ext_dir_rules,
-            doom_loop_action,
             working_dir,
             working_dir_canonical,
-            cwd_allow_pattern,
             session_allowlist: Vec::new(),
-            recent_calls: VecDeque::with_capacity(32),
-            repeat_counts: HashMap::new(),
             mode,
             prompt_deny_tools: Vec::new(),
+            engine,
         }
+    }
+
+    /// Engine-backed decision for the `enforce` chokepoint. Normalizes
+    /// a single (tool, input) into an [`engine::types::AccessRequest`],
+    /// authorizes it, commits (loop-guard accounting), and returns the
+    /// [`engine::types::Decision`]. `is_path` selects path-resource
+    /// classification (resolved + in_cwd + dev_null) vs a raw resource.
+    pub fn authorize_scope(
+        &mut self,
+        tool: &str,
+        input: &str,
+        is_path: bool,
+    ) -> engine::types::Decision {
+        let req = self.build_request(tool, input, is_path);
+        let decision = self.engine.authorize(&req);
+        self.engine.commit(&req, &decision);
+        decision
+    }
+
+    /// Authorize a pre-built (possibly multi-claim) request and commit
+    /// it. Used by tools — bash especially — that decompose one
+    /// invocation into several claims (command segments + redirect /
+    /// mutation targets) and want ONE atomic decision + at most one
+    /// prompt instead of N independent `enforce` calls.
+    pub fn authorize_request(
+        &mut self,
+        req: &engine::types::AccessRequest,
+    ) -> engine::types::Decision {
+        let decision = self.engine.authorize(req);
+        self.engine.commit(req, &decision);
+        decision
+    }
+
+    /// The checker's working directory — tools building their own
+    /// multi-claim requests need it to classify path resources. (Only
+    /// the `semantic-bash` bash path uses this today.)
+    #[cfg_attr(not(feature = "semantic-bash"), allow(dead_code))]
+    pub fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+
+    /// Dry-run a decision and render its full audit trail (which
+    /// policy decided and why, plus every applicable policy's vote).
+    /// Pure: no commit, no loop-guard accounting. Backs the `/why`
+    /// command so the user can see exactly what governs an action.
+    pub fn explain(&self, tool: &str, input: &str, is_path: bool) -> String {
+        let req = self.build_request(tool, input, is_path);
+        let decision = self.engine.authorize(&req);
+        format_decision(tool, input, &decision)
+    }
+
+    /// Normalize a (tool, input) pair into a one-resource request. The
+    /// raw-resource variant picks the resource type from the tool:
+    /// shell → Command, mcp_tool → Mcp, webfetch/websearch → Url,
+    /// everything else → Bareword (memory/skill action, grep pattern…).
+    fn build_request(
+        &self,
+        tool: &str,
+        input: &str,
+        is_path: bool,
+    ) -> engine::types::AccessRequest {
+        use engine::types::Resource;
+        let resource = if is_path {
+            engine::classify_path(input, &self.working_dir)
+        } else {
+            match tool {
+                "bash" | "shell" => Resource::Command {
+                    raw: input.to_string(),
+                    head: input.split_whitespace().next().unwrap_or("").to_string(),
+                },
+                "mcp_tool" => {
+                    // input shape: "mcp_tool:<server>:<name>"
+                    let mut parts = input.splitn(3, ':');
+                    let _umbrella = parts.next();
+                    let server = parts.next().unwrap_or("").to_string();
+                    let name = parts.next().unwrap_or("").to_string();
+                    Resource::Mcp {
+                        server,
+                        name,
+                        raw: input.to_string(),
+                    }
+                }
+                "webfetch" | "websearch" => Resource::Url(input.to_string()),
+                _ => Resource::Bareword(input.to_string()),
+            }
+        };
+        engine::types::AccessRequest::single(
+            tool,
+            engine::tool_operation(tool),
+            resource,
+            self.mode,
+            input,
+        )
     }
 
     /// Install the current prompt's deny-list. Called when the
     /// active prompt changes (startup, session load, `/prompt
     /// <name>`); pass an empty vec to clear.
     pub fn set_prompt_deny_tools(&mut self, denied: Vec<String>) {
+        self.engine.ctx_mut().prompt_deny = denied.clone();
         self.prompt_deny_tools = denied;
     }
 
@@ -366,287 +236,119 @@ impl PermissionChecker {
         names.iter().any(|n| self.is_prompt_denied(n))
     }
 
+    #[allow(dead_code)] // test oracle (see CheckResult)
+    /// Decision for a non-path tool input (bash command, mcp id,
+    /// memory/skill action, grep pattern…). Delegates to the unified
+    /// engine. A `CheckResult` convenience wrapper used by `/allow`,
+    /// `/why`, and the test suite; the engine is the source of truth.
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
-        // Prompt-level deny list runs BEFORE every other gate,
-        // including Yolo mode's blanket allow. This is the
-        // permission-layer enforcement of plan/review/etc. modes:
-        // the prompt's frontmatter declares which tools that mode
-        // CANNOT use (e.g. plan mode denies edit/write/apply_patch/
-        // bash), and the LLM gets a hard refusal instead of relying
-        // on the prompt prose to dissuade it from calling. Yolo is
-        // still "no rule-set, all calls allowed" but a prompt's
-        // deny-list is a stronger contract — the user opted into
-        // this mode, so we honor it even under Yolo.
-        if self.is_prompt_denied(tool) {
-            return CheckResult::Denied(format!(
-                "Tool {tool:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
-            ));
-        }
-        // PERM-7: MCP tools route through `check_perm("mcp_tool", input)`
-        // with input shaped `mcp_tool:<server>:<name>`. The umbrella
-        // tool name `"mcp_tool"` won't match a deny-list entry like
-        // `edit` even if the MCP server exports an `edit` tool. Probe
-        // the concrete tool name (the part after the second `:`) so
-        // a prompt's `deny_tools: [edit]` denies an MCP-exported
-        // `edit` too. Centralized here so any caller (not just the
-        // McpTool wrapper) gets the defense; the wrapper's explicit
-        // `any_prompt_denied` probe becomes redundant but harmless.
-        if tool == "mcp_tool"
-            && let Some(rest) = input.strip_prefix("mcp_tool:")
-            && let Some((_server, concrete)) = rest.split_once(':')
-            && self.is_prompt_denied(concrete)
-        {
-            return CheckResult::Denied(format!(
-                "MCP tool {concrete:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
-            ));
-        }
-        if self.mode == SecurityMode::Yolo {
-            return CheckResult::Allowed;
-        }
-
-        if self.is_session_allowed(tool, input) {
-            return CheckResult::Allowed;
-        }
-
-        // Track both the action AND the matching pattern so denial
-        // messages can name which rule blocked the call (was just
-        // "Blocked by permission rules", giving the user no way to
-        // identify and edit the offending rule).
-        let mut matched: Vec<(Action, String)> = Vec::new();
-        if let Some(rules) = self.rules.get(tool) {
-            for (pattern, action) in rules {
-                if pattern.matches(input) {
-                    matched.push((*action, pattern.original.clone()));
-                }
-            }
-        }
-
-        let base = matched
-            .last()
-            .map(|(a, _)| *a)
-            .unwrap_or(self.default_action);
-        let last_pat = matched.last().map(|(_, p)| p.clone());
-        let action = match self.mode {
-            SecurityMode::Restrictive => {
-                if matched.is_empty() && self.default_action == Action::Allow {
-                    Action::Ask
-                } else {
-                    base
-                }
-            }
-            SecurityMode::Accept => match base {
-                Action::Ask => {
-                    if self.is_path_tool(tool) && self.is_external_path(input) {
-                        self.match_ext_dir(input).unwrap_or(Action::Ask)
-                    } else if is_high_risk_non_path_tool(tool) {
-                        // Accept mode coerces Ask → Allow for non-path
-                        // tools on the assumption that "trust the
-                        // agent inside cwd" generalizes. That breaks
-                        // for tools that execute external code with
-                        // arbitrary effects: MCP servers run third-
-                        // party code; `bash` runs shell. Keep the Ask
-                        // for these specifically. Review #1.
-                        Action::Ask
-                    } else {
-                        Action::Allow
-                    }
-                }
-                other => other,
-            },
-            SecurityMode::Standard => base,
-            SecurityMode::Yolo => unreachable!(),
-        };
-
-        if action != Action::Deny {
-            // PERM-2: check doom-loop BEFORE tracking the current
-            // call. The counter reflects previous identical calls
-            // only — the current call doesn't count itself.
-            if self.is_doom_loop(tool, input) {
-                match self.doom_loop_action {
-                    Action::Deny => {
-                        let preview: String = input.chars().take(60).collect();
-                        return CheckResult::Denied(format!(
-                            "Doom loop: repeated identical {} call ({}{})",
-                            tool,
-                            preview,
-                            if input.chars().count() > 60 {
-                                "…"
-                            } else {
-                                ""
-                            },
-                        ));
-                    }
-                    Action::Ask => return CheckResult::Ask,
-                    Action::Allow => {}
-                }
-            }
-            self.track_doom_loop(tool, input);
-        }
-
-        match action {
-            Action::Allow => CheckResult::Allowed,
-            Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied(match last_pat {
-                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
-                None => format!("Blocked: {tool} denied by default action"),
-            }),
-        }
+        effect_to_result(self.authorize_scope(tool, input, false))
     }
 
+    #[allow(dead_code)] // test oracle (see CheckResult)
+    /// Decision for a filesystem-path tool input. Path classification
+    /// (resolved / in_cwd / dev_null) happens inside `authorize_scope`.
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
-        // Reject paths that are clearly LLM hallucinations
-        // (e.g. "1", "a", "xy") before they trigger permission
-        // dialogs for non-existent files.  Absolute paths and
-        // relative paths with directory components or file
-        // extensions pass through to the normal check.
+        // Reject obvious LLM hallucinations ("1", "a") before the
+        // engine — preserves the old `validate_path` guard.
         if let Err(reason) = path::validate_path(path) {
             return CheckResult::Denied(reason);
         }
-
-        // Prompt deny-list runs first, same reasoning as `check`.
-        if self.is_prompt_denied(tool) {
-            return CheckResult::Denied(format!(
-                "Tool {tool:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
-            ));
-        }
-        if self.mode == SecurityMode::Yolo {
-            return CheckResult::Allowed;
-        }
-
-        // Resolve BEFORE the allowlist check so we can test both the
-        // raw path and the absolute form. Without this, a user who
-        // granted AllowAlways for a relative path (e.g. src/main.rs)
-        // gets re-prompted when the LLM sends an absolute path for
-        // the same file.
-        let abs_path = resolve_absolute(path, &self.working_dir);
-
-        if self.is_session_allowed(tool, path) || self.is_session_allowed(tool, &abs_path) {
-            return CheckResult::Allowed;
-        }
-
-        let mut matched: Vec<(Action, String)> = Vec::new();
-        if let Some(rules) = self.rules.get(tool) {
-            for (pattern, action) in rules {
-                if pattern.matches(&abs_path) || pattern.matches(path) {
-                    matched.push((*action, pattern.original.clone()));
-                }
-            }
-        }
-
-        let base = matched
-            .last()
-            .map(|(a, _)| *a)
-            .unwrap_or(self.default_action);
-        let last_pat = matched.last().map(|(_, p)| p.clone());
-
-        // Audit H9: `external_directory` rules used to fire only in
-        // `SecurityMode::Accept`. A user who configured
-        // `external_directory = { "/external/safe/**" = "allow" }`
-        // saw the rule silently ignored under Standard/Restrictive.
-        // Pre-compute the overlay so each mode can opt into it
-        // uniformly.
-        let is_external = self.is_external_path(&abs_path);
-        let ext_dir_action = if is_external {
-            self.match_ext_dir(&abs_path)
-        } else {
-            None
-        };
-
-        let action = match self.mode {
-            SecurityMode::Restrictive => {
-                if let Some(a) = ext_dir_action {
-                    a
-                } else if matched.is_empty() && self.default_action == Action::Allow {
-                    Action::Ask
-                } else {
-                    base
-                }
-            }
-            SecurityMode::Accept => match base {
-                Action::Ask => {
-                    if is_external {
-                        ext_dir_action.unwrap_or(Action::Ask)
-                    } else {
-                        Action::Allow
-                    }
-                }
-                other => other,
-            },
-            SecurityMode::Standard => {
-                // Explicit ext_dir rule overrides the base for external
-                // paths. For non-external paths (or external paths
-                // without a matching ext_dir rule) keep the prior
-                // base-action behavior — the catch-all below will
-                // demote unmatched external Allows to Ask.
-                if let Some(a) = ext_dir_action {
-                    a
-                } else {
-                    base
-                }
-            }
-            SecurityMode::Yolo => unreachable!(),
-        };
-
-        let action = if matched.is_empty()
-            && action == Action::Allow
-            && is_external
-            && ext_dir_action.is_none()
-        {
-            Action::Ask
-        } else {
-            action
-        };
-
-        if action != Action::Deny {
-            self.track_doom_loop(tool, path);
-            if self.is_doom_loop(tool, path) {
-                match self.doom_loop_action {
-                    Action::Deny => {
-                        let preview: String = path.chars().take(80).collect();
-                        return CheckResult::Denied(format!(
-                            "Doom loop: repeated identical {} call ({}{})",
-                            tool,
-                            preview,
-                            if path.chars().count() > 80 { "…" } else { "" },
-                        ));
-                    }
-                    Action::Ask => return CheckResult::Ask,
-                    Action::Allow => {}
-                }
-            }
-        }
-
-        match action {
-            Action::Allow => CheckResult::Allowed,
-            Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied(match last_pat {
-                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
-                None => format!("Blocked: {tool} denied by default action"),
-            }),
-        }
+        effect_to_result(self.authorize_scope(tool, path, true))
     }
 
+    #[allow(dead_code)] // test oracle
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
         allowlist::is_allowed(&self.session_allowlist, tool, input)
     }
 
+    /// Side-effect-free re-check of ONLY the session allowlist (the
+    /// state a fresh "allow always" mutates) for a pending request.
+    /// Unlike [`Self::check`] / [`Self::check_path`] it does NOT touch
+    /// the doom-loop counters or apply mode coercion — it answers the
+    /// narrow question "would the current session allowlist allow this
+    /// right now?".
+    ///
+    /// Used by the UI to coalesce parallel-tool permission prompts:
+    /// when the agent fires several tool calls at once, each that needs
+    /// permission queues its own request. If the user picks "allow
+    /// always" on the first, the queued siblings that the new pattern
+    /// now covers should be auto-allowed instead of re-prompting (and
+    /// re-flashing the Alert avatar). Mirrors the raw-vs-path dispatch
+    /// and the resolve-both-forms logic of the real checks so a
+    /// relative allow-always pattern matches an absolute probe.
+    pub fn session_allows_now(&self, tool: &str, input: &str) -> bool {
+        // Read the ENGINE allowlist (the runtime source of truth that
+        // `enforce` consults), op-scoped.
+        let op = engine::tool_operation(tool);
+        let al = &self.engine.ctx().allowlist;
+        if is_path_tool_name(tool) {
+            let abs = resolve_absolute(input, &self.working_dir);
+            al.allows(op, input) || al.allows(op, &abs)
+        } else {
+            al.allows(op, input)
+        }
+    }
+
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
-        allowlist::add(&mut self.session_allowlist, &tool, pattern_str);
+        // dirge-yevn fix #1: register the pattern AND a
+        // canonicalized variant for path-tool entries so the check
+        // hits whichever form the upstream path arrives in (raw vs
+        // canonical, symlinked vs realpath). The UI's
+        // `suggest_pattern` derives the pattern from the input the
+        // LLM passed (often the symlinked form), but `check_path`
+        // canonicalizes the probe path via `resolve_absolute`. Prior
+        // to this fix, a user who "Allow always"'d a write under
+        // `/tmp/proj/src/` on macOS got the pattern stored as
+        // `/tmp/proj/src/**` while subsequent checks compared against
+        // `/private/tmp/proj/src/foo.rs` — no match, re-prompt.
+        register_with_canonical_variant(
+            &mut self.session_allowlist,
+            &tool,
+            pattern_str,
+            &self.working_dir,
+        );
         // F2 write↔edit↔apply_patch aliasing: when the user "always
         // allows" any of these three, also register the pattern under
-        // the other two so the alias check in enforce() doesn't
+        // the OTHER TWO so the alias check in enforce() doesn't
         // re-prompt. Without this, a user who "always allows" write
         // gets asked again on the next write because the edit-alias
         // check returns Ask with no allowlist match.
-        match tool.as_str() {
-            "write" | "apply_patch" => {
-                allowlist::add(&mut self.session_allowlist, "edit", pattern_str);
-            }
-            "edit" => {
-                allowlist::add(&mut self.session_allowlist, "write", pattern_str);
-                allowlist::add(&mut self.session_allowlist, "apply_patch", pattern_str);
-            }
-            _ => {}
+        //
+        // dirge-yevn fix #2: previously this only mirrored
+        // write→edit and edit→{write,apply_patch}, leaving
+        // apply_patch→write unmirrored. Result: an "Allow always" on
+        // a write left apply_patch's own rules (in the checker's
+        // `check_path("apply_patch", ...)`) with no allowlist entry,
+        // so a subsequent apply_patch call re-prompted. The fix is
+        // full bidirectional mirroring across the three aliases.
+        let aliases: &[&str] = match tool.as_str() {
+            "write" => &["edit", "apply_patch"],
+            "edit" => &["write", "apply_patch"],
+            "apply_patch" => &["write", "edit"],
+            _ => &[],
+        };
+        for alias in aliases {
+            register_with_canonical_variant(
+                &mut self.session_allowlist,
+                alias,
+                pattern_str,
+                &self.working_dir,
+            );
+        }
+
+        // Engine (runtime source of truth). Op-scoped: write/edit/
+        // apply_patch all map to Operation::Edit, so a single grant
+        // covers the trio — no mirroring needed. Add a canonical
+        // variant for path tools so a relative "allow always" pattern
+        // matches the absolute probe the engine checks against.
+        let op = engine::tool_operation(&tool);
+        self.engine.allow_always(op, pattern_str);
+        if is_path_tool_name(&tool)
+            && let Some(canon) = canonicalize_path_pattern(pattern_str, &self.working_dir)
+            && canon != pattern_str
+        {
+            self.engine.allow_always(op, &canon);
         }
     }
 
@@ -668,45 +370,42 @@ impl PermissionChecker {
     /// removed `(tool, pattern)` on success, or `None` if the
     /// index is out of range. Used by `/allow remove <n>`.
     pub fn remove_session_allowlist_at(&mut self, idx: usize) -> Option<(String, String)> {
-        allowlist::remove_at(&mut self.session_allowlist, idx)
+        let removed = allowlist::remove_at(&mut self.session_allowlist, idx)?;
+        let (tool, pattern_str) = &removed;
+        // Also revoke from the ENGINE allowlist (the runtime source of
+        // truth that SessionAllowlistPolicy reads). The display list and
+        // engine list aren't 1:1, so remove by matched (op, original) —
+        // for both the raw pattern and the canonical-path twin that
+        // `add_session_allowlist` registered for path tools.
+        let op = engine::tool_operation(tool);
+        let canon = if is_path_tool_name(tool) {
+            canonicalize_path_pattern(pattern_str, &self.working_dir).filter(|c| c != pattern_str)
+        } else {
+            None
+        };
+        let al = &mut self.engine.ctx_mut().allowlist;
+        al.remove(op, pattern_str);
+        if let Some(c) = canon {
+            al.remove(op, &c);
+        }
+        Some(removed)
     }
 
     /// Remove ALL allowlist entries. Used by `/allow clear`.
     pub fn clear_session_allowlist(&mut self) {
         allowlist::clear(&mut self.session_allowlist);
+        self.engine.ctx_mut().allowlist.clear();
     }
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
         self.mode = mode;
     }
 
-    /// Resolve a possibly-relative, possibly-symlinked path to its
-    /// canonical form using the checker's own working_dir.
-    /// Exposes `resolve_absolute` to callers that need the same
-    /// canonical path the check ran against (audit H12 — pass this
-    /// to `File::open` instead of the raw `args.path` to close the
-    /// symlink-swap TOCTOU between check and open).
-    pub fn resolve_path_for_tool(&self, path: &str) -> String {
-        resolve_absolute(path, &self.working_dir)
-    }
-
-    /// Count of explicit `Deny` rules across all tools + the
-    /// external-directory ruleset. Used by the host to warn the user
-    /// when Yolo mode is active alongside non-empty deny rules —
-    /// Yolo unconditionally returns `Allowed` before any rule
-    /// lookup, so those deny rules are silently inert (audit H11).
+    /// Count of explicit `Deny` rules (configured + external_directory).
+    /// Used by the host to warn when Yolo mode renders them inert
+    /// (audit H11). Delegates to the engine, the rule owner.
     pub fn deny_rule_count(&self) -> usize {
-        let in_tool_rules: usize = self
-            .rules
-            .values()
-            .map(|v| v.iter().filter(|(_, a)| *a == Action::Deny).count())
-            .sum();
-        let in_ext_dir = self
-            .ext_dir_rules
-            .iter()
-            .filter(|(_, a)| *a == Action::Deny)
-            .count();
-        in_tool_rules + in_ext_dir
+        self.engine.deny_rule_count()
     }
 
     pub fn mode(&self) -> SecurityMode {
@@ -716,48 +415,16 @@ impl PermissionChecker {
     pub fn set_working_dir(&mut self, dir: &str) {
         self.working_dir = dir.to_string();
         self.working_dir_canonical = canonicalize_for_cache(dir);
-        // Refresh the CWD-scoped builtin-allow rules so the new
-        // project gets its own auto-allow and the OLD pattern
-        // doesn't keep matching after cd. Surgically removes only
-        // the previously-installed pattern (identified by
-        // `pattern.original`) so user-configured rules pushed onto
-        // the same Vec stay intact.
-        if let Some(old_pat) = self.cwd_allow_pattern.take() {
-            for tool in ["write", "edit", "apply_patch"] {
-                if let Some(entries) = self.rules.get_mut(tool) {
-                    entries.retain(|(p, _)| p.original != old_pat);
-                }
-            }
-        }
-        self.cwd_allow_pattern = install_cwd_allow_rules(&mut self.rules, dir);
-        // B3-5 (audit fix): clear session-scoped state that was
-        // implicitly tied to the OLD cwd. Two concerns:
-        //   1. `recent_calls` is the doom-loop counter — stale
-        //      entries from before the cd would falsely trip the
-        //      3-identical-calls limiter on the first calls in
-        //      the new project.
-        //   2. `session_allowlist` holds patterns the user
-        //      approved for the prior project (e.g. `cd *`,
-        //      `cargo *`). Carrying them silently to a new
-        //      project means the user has implicitly granted
-        //      those permissions there too — a privilege carry-
-        //      over the audit flagged. Pi rebuilds the session
-        //      on cwd change.
-        self.recent_calls.clear();
-        self.repeat_counts.clear();
+        // A cwd change drops session-scoped state tied to the old
+        // project: the loop-guard counters and the "allow always"
+        // grants (privilege carry-over guard — the engine recomputes
+        // in_cwd per request, so no rule glob needs rebuilding).
         self.session_allowlist.clear();
+        self.engine.ctx_mut().repeat.clear();
+        self.engine.ctx_mut().allowlist.clear();
     }
 
-    fn is_path_tool(&self, tool: &str) -> bool {
-        // Must match `is_path_tool_name` — these are the tools that
-        // take a filesystem path as their permission input and need
-        // `external_directory` rule consultation. `apply_patch` and
-        // `lsp` are included because both route filesystem-path
-        // strings through `check_perm_path`.
-        is_path_tool_name(tool)
-    }
-
-    fn is_external_path(&self, path_str: &str) -> bool {
+    pub fn is_external_path(&self, path_str: &str) -> bool {
         // F18: previously `!is_absolute → return false`, which
         // treated `../../etc/passwd` as "internal" (not external).
         // In Accept mode that bypassed external_directory rules:
@@ -795,45 +462,6 @@ impl PermissionChecker {
             && !p.starts_with(canonical_cwd_cached)
             && !p.starts_with(cwd)
     }
-
-    fn match_ext_dir(&self, path_str: &str) -> Option<Action> {
-        for (pattern, action) in &self.ext_dir_rules {
-            if pattern.matches(path_str) {
-                return Some(*action);
-            }
-        }
-        None
-    }
-
-    fn track_doom_loop(&mut self, tool: &str, input: &str) {
-        let key = format!("{}\x00{}", tool, input);
-        let count = self.repeat_counts.entry(key).or_insert(0);
-        *count = count.saturating_add(1);
-        // Maintain a FIFO ring for TTL-based eviction.
-        // PERM-1: window 32 (was 16) so a 14-call decoy gap
-        // can't flush a specific key before it repeats.
-        self.recent_calls
-            .push_back((tool.to_string(), input.to_string()));
-        if self.recent_calls.len() > 32 {
-            if let Some((t, i)) = self.recent_calls.pop_front() {
-                let old_key = format!("{}\x00{}", t, i);
-                if let Some(c) = self.repeat_counts.get_mut(&old_key) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        self.repeat_counts.remove(&old_key);
-                    }
-                }
-            }
-        }
-    }
-
-    fn is_doom_loop(&self, tool: &str, input: &str) -> bool {
-        let key = format!("{}\x00{}", tool, input);
-        // PERM-2: threshold is 2 (blocks on the 3rd identical call).
-        // `track_doom_loop` fires AFTER this check, so the counter
-        // reflects previous calls only — not the current one.
-        self.repeat_counts.get(&key).copied().unwrap_or(0) >= 2
-    }
 }
 
 /// One-shot canonicalize for the working-directory cache. Best
@@ -845,897 +473,165 @@ fn canonicalize_for_cache(working_dir: &str) -> String {
     path::canonicalize_for_cache(working_dir)
 }
 
-/// Install the CWD-scoped builtin-allow rule on `rules` for the
-/// mutating filesystem tools (write/edit/apply_patch). Returns the
-/// pattern string installed (`Some`) so `set_working_dir` can find
-/// and remove it on cd; `None` when the working_dir is too
-/// degenerate to install safely.
-///
-/// Refuses to install when:
-///   - `working_dir` is empty (config-only init w/o cwd resolution).
-///   - The canonical form is `/` or shorter than 2 chars — the
-///     resulting pattern (`/**`) would silently allow writes anywhere
-///     on the filesystem, defeating the "permissive only inside the
-///     project" intent.
-///   - `working_dir` contains glob metacharacters (`*`, `?`, `[`,
-///     `{`). Such characters would be re-interpreted by the glob
-///     compiler rather than matched literally; a user starting dirge
-///     from `/tmp/[odd]` would get a character-class pattern matching
-///     unintended paths.
-///
-/// Uses `canonicalize_for_cache` so the pattern matches the canonical
-/// form `resolve_absolute` produces. Without this, macOS users whose
-/// `/var` / `/tmp` resolve to `/private/var` / `/private/tmp` would
-/// see the rule silently fail to match for any abs_path the checker
-/// computed.
-fn install_cwd_allow_rules(
-    rules: &mut HashMap<String, Vec<(Pattern, Action)>>,
-    working_dir: &str,
-) -> Option<String> {
-    path::install_cwd_allow_rules(rules, working_dir)
-}
-
-/// Install a builtin-allow for `/dev/null` on every tool so the
-/// harmless bit-bucket never triggers a permission prompt. Writes
-/// to `/dev/null` discard data; reads return immediate EOF — no
-/// side effects, no security risk, no reason to ask.
-fn install_dev_null_allow(rules: &mut HashMap<String, Vec<(Pattern, Action)>>) {
-    path::install_dev_null_allow(rules)
-}
-
 pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
     path::resolve_absolute(path, working_dir)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::permission::PermissionConfig;
-
-    fn fresh_checker() -> PermissionChecker {
-        PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp")),
-        )
+/// Register `pattern_str` under `tool` in the session allowlist,
+/// and ALSO register a canonicalized variant when the pattern is a
+/// path-tool entry whose literal prefix differs from its canonical
+/// form. Closes the symlink-mismatch bug: a pattern derived from
+/// the symlinked working_dir (e.g. `/tmp/proj/src/**`) wouldn't
+/// otherwise match a canonicalized probe path (e.g.
+/// `/private/tmp/proj/src/foo.rs`).
+///
+/// Non-path tools (`bash`, `mcp_tool`, etc.) skip the second
+/// registration since their patterns aren't filesystem paths and
+/// canonicalization is meaningless.
+///
+/// Dedup is handled by `allowlist::add`, so a no-op when the
+/// canonical form already equals the original.
+fn register_with_canonical_variant(
+    allowlist: &mut Vec<(String, crate::permission::pattern::Pattern)>,
+    tool: &str,
+    pattern_str: &str,
+    working_dir: &str,
+) {
+    allowlist::add(allowlist, tool, pattern_str);
+    if !is_path_tool_name(tool) {
+        return;
     }
+    if let Some(canonical_pat) = canonicalize_path_pattern(pattern_str, working_dir)
+        && canonical_pat != pattern_str
+    {
+        allowlist::add(allowlist, tool, &canonical_pat);
+    }
+}
 
-    /// Prompt-level deny list refuses the named tool before any
-    /// rule matching, in every security mode. This is the
-    /// permission-layer enforcement of plan/review modes
-    /// (replaces the prompt-text-only "don't write code"
-    /// restriction). Even Yolo respects the deny list — the user
-    /// opted into the mode, that's a stronger contract than the
-    /// security mode's blanket allow.
-    #[test]
-    fn prompt_deny_tools_refuses_listed_tool_in_every_mode() {
-        for mode in [
-            SecurityMode::Standard,
-            SecurityMode::Accept,
-            SecurityMode::Restrictive,
-            SecurityMode::Yolo,
-        ] {
-            let mut checker = PermissionChecker::new(
-                &PermissionConfig::default(),
-                mode,
-                Some(std::path::PathBuf::from("/tmp")),
-            );
-            checker.set_prompt_deny_tools(vec!["edit".to_string(), "write".to_string()]);
-            assert!(
-                matches!(checker.check("edit", "/tmp/foo"), CheckResult::Denied(_)),
-                "edit must be denied in mode {:?} when prompt deny-list includes it",
-                mode,
-            );
-            assert!(
-                matches!(checker.check("write", "/tmp/foo"), CheckResult::Denied(_)),
-                "write must be denied in mode {:?} when prompt deny-list includes it",
-                mode,
-            );
-            // Unrelated tools still flow through normal rule eval.
-            // `read` isn't in the deny list, so Yolo allows it
-            // (other modes might Ask, that's mode-specific).
-            if mode == SecurityMode::Yolo {
-                assert!(matches!(
-                    checker.check("read", "/tmp/foo"),
-                    CheckResult::Allowed
-                ));
+/// Best-effort canonicalize the literal-prefix portion of a path
+/// glob pattern. Splits on the first glob metacharacter (`*`, `?`,
+/// `[`, `{`); canonicalizes the prefix; reassembles the pattern.
+/// Used by `register_with_canonical_variant` to add a realpath-form
+/// twin to a symlink-form session-allowlist pattern.
+///
+/// Returns `None` when:
+///   - the literal prefix is empty (pattern starts with a glob),
+///   - `canonicalize` fails AND the prefix doesn't resolve via
+///     `resolve_absolute` (relative path that doesn't exist on
+///     disk and `working_dir` itself is bogus).
+fn canonicalize_path_pattern(pattern_str: &str, working_dir: &str) -> Option<String> {
+    let split_idx = pattern_str
+        .find(['*', '?', '[', '{'])
+        .unwrap_or(pattern_str.len());
+    if split_idx == 0 {
+        return None;
+    }
+    let (head, tail) = pattern_str.split_at(split_idx);
+    // Trim a trailing `/` from the head so the canonicalize call
+    // operates on the directory itself; we re-attach the slash
+    // when reassembling. Without this, a head like
+    // `/tmp/proj/src/` would round-trip as `/private/tmp/proj/src`
+    // (no trailing slash) and the reassembled pattern would lose
+    // a slash compared to the original.
+    let (head_trimmed, had_trailing_slash) = match head.strip_suffix('/') {
+        Some(stripped) => (stripped, true),
+        None => (head, false),
+    };
+    if head_trimmed.is_empty() {
+        return None;
+    }
+    // RELATIVE-HEAD ANCHORING (re-prompt bug): `suggest_pattern`
+    // derives a path-tool pattern from the parent of the LLM's input.
+    // When the LLM sends a relative path (e.g. `src/main.rs`), the
+    // stored pattern is the RELATIVE glob `src/**`, which compiles to
+    // `^src(?:/.*)?$`. But `check_path` always matches against the
+    // canonical ABSOLUTE form via `resolve_absolute`, so the next call
+    // (especially when the LLM sends an absolute path, or the same
+    // file resolved through the cwd) never matches the relative
+    // pattern and the user is re-prompted despite "allow always".
+    //
+    // The canonical twin must be anchored at the CHECKER's
+    // `working_dir`, not the process cwd. A bare `std::fs::canonicalize`
+    // on a relative head resolves against `std::env::current_dir()`,
+    // which can differ from the checker's working_dir (the agent may
+    // have `cd`'d via `set_working_dir`). For relative heads, anchor at
+    // `working_dir` first; this keeps the boundary tight — the twin can
+    // only point inside `working_dir` (or wherever the symlink-followed
+    // canonical path lands), never escaping to an arbitrary absolute
+    // location chosen by the LLM.
+    if !std::path::Path::new(head_trimmed).is_absolute() {
+        let resolved = resolve_absolute(head_trimmed, working_dir);
+        if resolved != head_trimmed {
+            let mut out = resolved;
+            if had_trailing_slash {
+                out.push('/');
             }
+            out.push_str(tail);
+            return Some(out);
         }
     }
-
-    /// M4 (dirge-ojn): the post-flip defaults.
-    /// - Read-only tools in the builtin-allow list don't prompt.
-    /// - Mutating / network / code-execution tools fall to the new
-    ///   global Ask default OUTSIDE CWD. (Mutating tools inside the
-    ///   working directory are auto-allowed by the CWD-scoped
-    ///   builtin-allow rule installed alongside the read-only ones
-    ///   — see `path_tool_writes_inside_cwd_auto_allowed` for that
-    ///   path.)
-    /// - The `--yolo` mode bypass (via `SecurityMode::Yolo`) still
-    ///   short-circuits everything (line 362 of `check_path`).
-    /// - An explicit user rule overrides the builtin-allow.
-    #[test]
-    fn m4_defaults_allow_safe_ask_dangerous() {
-        // `working_dir = /tmp` so the dangerous-tool probes below
-        // hit /opt/... — outside CWD — and exercise the global Ask
-        // default rather than the CWD-scoped allow installer.
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-
-        // Builtin-allow: read-only tools don't prompt.
-        for tool in [
-            "read",
-            "glob",
-            "grep",
-            "find_files",
-            "list_dir",
-            "list_symbols",
-            "find_definition",
-            "find_callers",
-            "find_callees",
-            "get_symbol_body",
-            "repo_overview",
-            "lsp",
-            "write_todo_list",
-            "task_status",
-            "question",
-        ] {
-            let result = checker.check_path(tool, "/tmp/anything.rs");
-            assert!(
-                matches!(result, CheckResult::Allowed),
-                "builtin-allow tool {tool} should Allow without prompting; got {result:?}",
-            );
-        }
-
-        // Mutating / network / code-execution tools fall to Ask.
-        for tool in [
-            "write",
-            "edit",
-            "apply_patch",
-            "webfetch",
-            "websearch",
-            "task",
-            "skill",
-            "memory",
-        ] {
-            // Path is OUTSIDE working_dir (/tmp) so the CWD-scoped
-            // allow installer does not apply.
-            let result = checker.check_path(tool, "/opt/anywhere/anything.rs");
-            assert!(
-                matches!(result, CheckResult::Ask | CheckResult::Denied(_)),
-                "dangerous tool {tool} should Ask or Deny outside CWD by default; got {result:?}",
-            );
-        }
+    let canonical_head = std::fs::canonicalize(head_trimmed)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| {
+            // Fallback 1: try resolving as a possibly-relative path
+            // anchored at working_dir. Only useful when the head
+            // exists on disk; resolve_absolute is best-effort.
+            let resolved = resolve_absolute(head_trimmed, working_dir);
+            if resolved != head_trimmed {
+                return Some(resolved);
+            }
+            // Fallback 2: the literal head doesn't exist (yet) —
+            // walk up to the closest existing ancestor, canonicalize
+            // THAT, and project the missing suffix back on. Handles
+            // "Allow always" on a not-yet-existent path that gets
+            // created later (e.g. user opts into a directory that
+            // doesn't exist; the next operation creates it; the
+            // canonicalised probe would otherwise diverge from the
+            // stored symlink-form pattern). See the symlink discussion
+            // in `register_with_canonical_variant`.
+            project_canonical_from_existing_ancestor(head_trimmed)
+        })?;
+    let mut out = canonical_head;
+    if had_trailing_slash {
+        out.push('/');
     }
+    out.push_str(tail);
+    Some(out)
+}
 
-    /// F2 (dirge-jlj): write / apply_patch alias to the `edit`
-    /// permission. `edit: deny` blocks all three uniformly (matches
-    /// opencode's `EDIT_TOOLS` aliasing). This is enforced at the
-    /// `enforce` chokepoint, not in the checker — but the underlying
-    /// rules behavior must be sound, which we exercise here.
-    #[test]
-    fn f2_edit_alias_check_path_directly_for_write_and_apply_patch() {
-        // The checker itself doesn't alias — that lives in
-        // `tools::enforce`. But pin that the checker's `edit`
-        // rules behave as the user expects when consulted with
-        // the edit tool name.
-        use crate::permission::ToolPerm;
-        use std::collections::HashMap;
-
-        let mut edit_rules = HashMap::new();
-        edit_rules.insert("**".to_string(), Action::Deny);
-        let config = PermissionConfig {
-            edit: Some(ToolPerm::Granular(edit_rules)),
-            ..Default::default()
-        };
-
-        let mut checker = PermissionChecker::new(
-            &config,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-
-        // Direct `edit` query: hit the deny rule.
-        assert!(matches!(
-            checker.check_path("edit", "/tmp/x.rs"),
-            CheckResult::Denied(_)
-        ));
-        // Direct `write` query (no aliasing at checker level): the
-        // CWD-scoped builtin-allow rule only fires for paths inside
-        // working_dir (/tmp here), so probe an OUTSIDE path to
-        // exercise the global Ask default — that's the "write has
-        // no user-configured rules and no in-CWD allow" path the
-        // checker is asserted on.
-        assert!(matches!(
-            checker.check_path("write", "/opt/elsewhere/x.rs"),
-            CheckResult::Ask
-        ));
-        // `tools::enforce` is what ties these together. The
-        // alias test for that path lives in src/agent/tools/mod.rs
-        // (covered indirectly by the bash F1 tests below since
-        // write rules drive the redirect-target gate).
-    }
-
-    /// CWD-scoped builtin-allow for mutating tools: writes inside
-    /// the working directory are silent, writes outside still
-    /// prompt. Without this, users had to "allow always" on every
-    /// first write to each new subdir of their project — partly
-    /// from the `parent/*` bug, partly from the post-M4 posture of
-    /// no global allow for write/edit. This test pins both halves
-    /// (inside-allow + outside-ask) on the same checker instance.
-    #[test]
-    fn write_inside_cwd_allowed_outside_cwd_asks() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp/proj")),
-        );
-        for tool in ["write", "edit", "apply_patch"] {
-            // Inside CWD: silent.
-            assert!(
-                matches!(
-                    checker.check_path(tool, "/tmp/proj/src/main.rs"),
-                    CheckResult::Allowed
-                ),
-                "{tool} inside CWD must be auto-allowed",
-            );
-            // Nested inside CWD: same.
-            assert!(
-                matches!(
-                    checker.check_path(tool, "/tmp/proj/src/agent/foo.rs"),
-                    CheckResult::Allowed
-                ),
-                "{tool} nested-inside-CWD must be auto-allowed",
-            );
-            // Outside CWD: prompt.
-            assert!(
-                matches!(checker.check_path(tool, "/etc/passwd"), CheckResult::Ask),
-                "{tool} outside CWD must prompt",
-            );
-        }
-    }
-
-    /// A user's explicit `write: { "<cwd>/build/**": deny }` must
-    /// beat the CWD-scoped builtin-allow rule. Last-match-wins is
-    /// already the documented semantics; this pins it for the new
-    /// CWD-allow installer specifically.
-    #[test]
-    fn user_write_deny_overrides_cwd_builtin_allow() {
-        use crate::permission::ToolPerm;
-        use std::collections::HashMap;
-
-        let mut write_rules = HashMap::new();
-        write_rules.insert("/tmp/proj/build/**".to_string(), Action::Deny);
-        let config = PermissionConfig {
-            write: Some(ToolPerm::Granular(write_rules)),
-            ..Default::default()
-        };
-
-        let mut checker = PermissionChecker::new(
-            &config,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp/proj")),
-        );
-
-        // User's deny beats CWD-allow for the configured subtree.
-        assert!(matches!(
-            checker.check_path("write", "/tmp/proj/build/out.txt"),
-            CheckResult::Denied(_)
-        ));
-        // Outside the user's deny scope, still allowed via CWD-allow.
-        assert!(matches!(
-            checker.check_path("write", "/tmp/proj/src/main.rs"),
-            CheckResult::Allowed
-        ));
-    }
-
-    /// `/cd` mid-session refreshes the CWD-allow rule. After cd from
-    /// `/tmp/old` to `/tmp/new`, writes inside `/tmp/new` must be
-    /// auto-allowed AND writes inside `/tmp/old` must NOT be
-    /// (the old rule must not linger).
-    #[test]
-    fn set_working_dir_refreshes_cwd_allow_rule() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp/old")),
-        );
-        // Baseline: old CWD allows.
-        assert!(matches!(
-            checker.check_path("write", "/tmp/old/foo.rs"),
-            CheckResult::Allowed
-        ));
-
-        checker.set_working_dir("/tmp/new");
-
-        // New CWD now allowed.
-        assert!(matches!(
-            checker.check_path("write", "/tmp/new/foo.rs"),
-            CheckResult::Allowed
-        ));
-        // Old CWD no longer auto-allowed — the stale rule was
-        // removed, so it falls through to default Ask.
-        assert!(
-            matches!(
-                checker.check_path("write", "/tmp/old/foo.rs"),
-                CheckResult::Ask
-            ),
-            "stale CWD-allow for /tmp/old must be removed after cd",
-        );
-    }
-
-    /// Repeated `/cd` calls don't accumulate stale CWD-allow rules.
-    /// Pin that after N cds, only one CWD-allow entry per tool
-    /// remains (matching the current working_dir).
-    #[test]
-    fn set_working_dir_does_not_accumulate_stale_rules() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp/a")),
-        );
-        checker.set_working_dir("/tmp/b");
-        checker.set_working_dir("/tmp/c");
-        checker.set_working_dir("/tmp/d");
-
-        // Only the most-recent CWD allows.
-        for stale in ["/tmp/a/x", "/tmp/b/x", "/tmp/c/x"] {
-            assert!(
-                matches!(checker.check_path("write", stale), CheckResult::Ask),
-                "{stale} should no longer be allowed",
-            );
-        }
-        assert!(matches!(
-            checker.check_path("write", "/tmp/d/x"),
-            CheckResult::Allowed
-        ));
-    }
-
-    /// Degenerate working_dirs (`/`, empty) must NOT install a
-    /// CWD-allow rule — `/` would generate `/**` which silently
-    /// allows everything, defeating the "permissive only inside the
-    /// project" intent.
-    #[test]
-    fn cwd_allow_refuses_root_and_empty() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/")),
-        );
-        // `/` cwd: writes anywhere still prompt — no `/**` allow installed.
-        assert!(matches!(
-            checker.check_path("write", "/etc/passwd"),
-            CheckResult::Ask
-        ));
-        assert!(matches!(
-            checker.check_path("write", "/tmp/anything.rs"),
-            CheckResult::Ask
-        ));
-    }
-
-    /// Working dirs containing glob metacharacters (`*`, `?`, `[`,
-    /// `{`) must NOT install a CWD-allow rule — the glob compiler
-    /// would interpret them as wildcards / classes and match
-    /// unintended paths.
-    #[test]
-    fn cwd_allow_refuses_paths_with_glob_metachars() {
-        // The test working_dir doesn't have to exist on disk;
-        // canonicalize falls back to the literal string for the
-        // safety check.
-        for dir in ["/tmp/proj-*", "/tmp/p[a-z]", "/tmp/{a,b}"] {
-            let mut checker = PermissionChecker::new(
-                &PermissionConfig::default(),
-                SecurityMode::Standard,
-                Some(std::path::PathBuf::from(dir)),
-            );
-            // A write that would normally land inside the project
-            // must still prompt — no rule installed.
-            let inside = format!("{}/foo.rs", dir);
-            assert!(
-                matches!(checker.check_path("write", &inside), CheckResult::Ask),
-                "{dir} must not install CWD-allow (glob metachar present)",
-            );
-        }
-    }
-
-    /// Explicit user rules override the M4 builtin-allow list.
-    #[test]
-    fn m4_user_rule_overrides_builtin_allow() {
-        use crate::permission::ToolPerm;
-        use std::collections::HashMap;
-
-        let mut read_rules = HashMap::new();
-        read_rules.insert("/etc/**".to_string(), Action::Deny);
-        let config = PermissionConfig {
-            read: Some(ToolPerm::Granular(read_rules)),
-            ..Default::default()
-        };
-
-        let mut checker = PermissionChecker::new(
-            &config,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-
-        // User's explicit deny wins over builtin Allow.
-        assert!(matches!(
-            checker.check_path("read", "/etc/passwd"),
-            CheckResult::Denied(_)
-        ));
-        // Other paths still hit builtin Allow.
-        assert!(matches!(
-            checker.check_path("read", "/tmp/safe.txt"),
-            CheckResult::Allowed
-        ));
-    }
-
-    /// M2 (dirge-cep): the unified `tools` map at the top of
-    /// `PermissionConfig` lets rules be declared for ANY tool name
-    /// (including ones dirge doesn't ship per-tool struct fields
-    /// for — plugin-registered tools, future tools). Pin three
-    /// invariants:
-    ///   1. A rule in `tools` for a tool name with no legacy field
-    ///      is honored.
-    ///   2. A rule in `tools` for a tool name that ALSO has a
-    ///      legacy field overrides the legacy field (explicit
-    ///      newer shape wins).
-    ///   3. The `Simple(action)` shape (string shorthand for
-    ///      `{"*": action}`) works in the map.
-    #[test]
-    fn tools_map_unified_schema_honored_and_overrides_legacy() {
-        use crate::permission::{PermissionConfig, ToolPerm};
-        use std::collections::HashMap;
-
-        // Tool with no legacy field — only reachable via `tools`.
-        let mut tools_map = HashMap::new();
-        let mut plugin_rules = HashMap::new();
-        plugin_rules.insert("dangerous".to_string(), Action::Deny);
-        tools_map.insert("plugin_xyz".to_string(), ToolPerm::Granular(plugin_rules));
-
-        // Tool with a legacy field — map version should win.
-        tools_map.insert("websearch".to_string(), ToolPerm::Simple(Action::Deny));
-
-        let config = PermissionConfig {
-            // Legacy field says Allow…
-            websearch: Some(ToolPerm::Simple(Action::Allow)),
-            tools: Some(tools_map),
-            ..Default::default()
-        };
-
-        let mut checker = PermissionChecker::new(
-            &config,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-
-        // (1) tools-only entry honored.
-        assert!(matches!(
-            checker.check("plugin_xyz", "dangerous"),
-            CheckResult::Denied(_)
-        ));
-
-        // (2) tools map overrides legacy field.
-        assert!(matches!(
-            checker.check("websearch", "anything"),
-            CheckResult::Denied(_)
-        ));
-    }
-
-    /// Adversarial-review #1: the deny-list match must also fire for
-    /// the umbrella `mcp_tool` name and the qualified `mcp_tool:srv:name`
-    /// form, since MCP tools route through `check_perm("mcp_tool", …)`.
-    /// `any_prompt_denied` is the API the MCP wrapper uses; pin its
-    /// behavior here so a refactor can't silently re-open the bypass.
-    #[test]
-    fn prompt_deny_any_matches_concrete_and_qualified_mcp_names() {
-        let mut checker = fresh_checker();
-        // Plan-mode-style deny list.
-        checker.set_prompt_deny_tools(vec!["edit".to_string(), "write".to_string()]);
-        // Concrete MCP tool name matches.
-        assert!(checker.any_prompt_denied(&["edit", "mcp_tool:fs:edit", "mcp_tool"]));
-        // Umbrella match too.
-        checker.set_prompt_deny_tools(vec!["mcp_tool".to_string()]);
-        assert!(checker.any_prompt_denied(&["whatever", "mcp_tool:any:any", "mcp_tool"]));
-        // Qualified-only deny.
-        checker.set_prompt_deny_tools(vec!["mcp_tool:fs:write_file".to_string()]);
-        assert!(checker.any_prompt_denied(&["write_file", "mcp_tool:fs:write_file", "mcp_tool"]));
-        assert!(!checker.any_prompt_denied(&[
-            "write_file",
-            "mcp_tool:other:write_file",
-            "mcp_tool:fs:write_other"
-        ]));
-    }
-
-    /// Adversarial-review #7: case-insensitive deny-list. A prompt
-    /// that says `deny_tools: [Edit]` must deny the tool registered
-    /// as `edit`. (Frontmatter parser also lowercases at load, but
-    /// pin the matcher-side guarantee here too.)
-    #[test]
-    fn prompt_deny_is_case_insensitive() {
-        let mut checker = fresh_checker();
-        checker.set_prompt_deny_tools(vec!["Edit".to_string(), "BASH".to_string()]);
-        assert!(matches!(
-            checker.check("edit", "foo"),
-            CheckResult::Denied(_)
-        ));
-        assert!(matches!(
-            checker.check("bash", "ls"),
-            CheckResult::Denied(_)
-        ));
-    }
-
-    /// User report: a sequence of MCP tool calls ran silently
-    /// before any permission prompt fired. Root cause was that
-    /// `mcp_tool` had no default rule, so the checker fell back to
-    /// `default_action` (Allow). MCP tools execute external code;
-    /// the default should be Ask. This test pins the new contract.
-    #[test]
-    fn mcp_tool_defaults_to_ask_when_unconfigured() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-        let r = checker.check("mcp_tool", "mcp_tool:lattice:lattice_query");
-        assert!(
-            matches!(r, CheckResult::Ask),
-            "unconfigured mcp_tool must default to Ask, got {:?}",
-            r,
-        );
-    }
-
-    /// Review #1: Accept mode previously coerced `Ask → Allow` for
-    /// every non-path tool, silently bypassing the new default-Ask
-    /// for `mcp_tool`. The coercion now special-cases
-    /// `is_high_risk_non_path_tool` so MCP / shell keep their Ask
-    /// even under `--accept`. (For bash, the legacy bash rule table
-    /// already auto-allows safe commands by name; the special case
-    /// here matters when an explicit user config sets bash to Ask —
-    /// Accept mode must not silently undo that.)
-    #[test]
-    fn accept_mode_does_not_coerce_mcp_to_allow() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Accept,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-        // mcp_tool has its default-Ask rule installed; accept-mode
-        // coercion must NOT downgrade it to Allow.
-        let r = checker.check("mcp_tool", "mcp_tool:lattice:lattice_query");
-        assert!(
-            matches!(r, CheckResult::Ask),
-            "Accept mode must NOT bypass mcp_tool's default-Ask, got {:?}",
-            r,
-        );
-    }
-
-    /// Accept mode STILL coerces other non-path Ask tools to Allow —
-    /// the special-case is targeted, not a wholesale change.
-    /// `question` (a non-path tool with Ask semantics in some
-    /// configs) still gets the Accept-mode allow.
-    #[test]
-    fn accept_mode_still_coerces_safe_non_path_tools() {
-        use std::collections::HashMap;
-        let mut config = PermissionConfig::default();
-        // Set question to Ask explicitly so Accept's coercion path
-        // is exercised.
-        let mut q_map: HashMap<String, Action> = HashMap::new();
-        q_map.insert("*".to_string(), Action::Ask);
-        config.question = Some(crate::permission::ToolPerm::Granular(q_map));
-        let mut checker = PermissionChecker::new(
-            &config,
-            SecurityMode::Accept,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-        let r = checker.check("question", "some question");
-        assert!(
-            matches!(r, CheckResult::Allowed),
-            "Accept mode SHOULD coerce question's Ask → Allow (not high-risk), got {:?}",
-            r,
-        );
-    }
-
-    /// A user who explicitly configures mcp_tool rules retains
-    /// control — the default-Ask only fires when no rule exists.
-    #[test]
-    fn mcp_tool_explicit_config_overrides_default_ask() {
-        use std::collections::HashMap;
-        let mut config = PermissionConfig::default();
-        let mut granular = HashMap::new();
-        granular.insert("mcp_tool:lattice:*".to_string(), Action::Allow);
-        config.mcp_tool = Some(crate::permission::ToolPerm::Granular(granular));
-        let mut checker = PermissionChecker::new(
-            &config,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp")),
-        );
-        let r = checker.check("mcp_tool", "mcp_tool:lattice:lattice_query");
-        assert!(
-            matches!(r, CheckResult::Allowed),
-            "explicit Allow rule must win, got {:?}",
-            r,
-        );
-    }
-
-    /// Empty deny list is a no-op — back to normal rule eval.
-    #[test]
-    fn prompt_deny_empty_is_noop() {
-        let mut checker = fresh_checker();
-        checker.set_prompt_deny_tools(Vec::new());
-        // Under default rules in Standard mode, `read` is allowed.
-        assert!(matches!(
-            checker.check("read", "/tmp/foo"),
-            CheckResult::Allowed
-        ));
-    }
-
-    // Regression: "allow always" → `cd *` saved to session allowlist must
-    // satisfy the NEXT bash check for `cd /absolute/path`. Before the fix,
-    // path-glob semantics on `*` (`[^/]*`) refused to match the absolute
-    // path, so the user was re-prompted every command.
-    #[test]
-    fn regression_session_allowlist_cd_star_matches_path_arg() {
-        let mut checker = fresh_checker();
-        checker.add_session_allowlist("bash".to_string(), "cd *");
-
-        // The exact scenario from the bug report.
-        let r1 = checker.check(
-            "bash",
-            "cd /Users/yogthos/src/work/rigging-workshop && git diff",
-        );
-        assert!(
-            matches!(r1, CheckResult::Allowed),
-            "expected Allowed, got {:?}",
-            r1
-        );
-
-        let r2 = checker.check("bash", "cd /Users/yogthos/src/work/rigging-workshop");
-        assert!(matches!(r2, CheckResult::Allowed));
-    }
-
-    // Path-tool patterns still get filesystem-glob semantics — adding
-    // `src/*` doesn't allow nested files. Force default Ask so we can read
-    // the session-allowlist contribution in isolation from the default.
-    #[test]
-    fn path_tool_session_allowlist_keeps_one_segment_semantics() {
-        let mut cfg = PermissionConfig::default();
-        cfg.default = Some(Action::Ask);
-        // The CWD-scoped builtin-allow rule for write/edit/apply_patch
-        // would otherwise intercept any path under `working_dir` and
-        // mask the session-allowlist semantics under test. Pin
-        // `working_dir = /cwd-off-test-axis` and probe paths that
-        // live elsewhere (`/probe/src/...`) so the CWD-allow rule
-        // never matches and the session allowlist alone gates the
-        // decision.
-        let mut checker = PermissionChecker::new(
-            &cfg,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
-        );
-        checker.add_session_allowlist("write".to_string(), "/probe/src/*");
-
-        // One-segment hit from the session allowlist.
-        assert!(matches!(
-            checker.check_path("write", "/probe/src/main.rs"),
-            CheckResult::Allowed
-        ));
-        // Nested path: not in allowlist, falls through to default Ask.
-        let nested = checker.check_path("write", "/probe/src/agent/main.rs");
-        assert!(
-            matches!(nested, CheckResult::Ask),
-            "/probe/src/* must not match nested path; got {:?}",
-            nested
-        );
-    }
-
-    /// F2 write↔edit aliasing: when a user "always allows" a write
-    /// path, the alias check against "edit" must also match so the
-    /// most-restrictive merge doesn't re-prompt on every subsequent
-    /// call. Without this, `enforce()` sees Allowed from write rules
-    /// but Ask from edit (no session-allowlist entry), and the
-    /// combined result is Ask — infinite re-prompt loop.
-    #[test]
-    fn add_session_allowlist_mirrors_write_to_edit() {
-        let mut cfg = PermissionConfig::default();
-        cfg.default = Some(Action::Ask);
-        let mut checker = PermissionChecker::new(
-            &cfg,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
-        );
-        checker.add_session_allowlist("write".to_string(), "/probe/src/**");
-
-        // The write tool itself hits the allowlist.
-        assert!(matches!(
-            checker.check_path("write", "/probe/src/main.rs"),
-            CheckResult::Allowed
-        ));
-        // The edit alias MUST also match — this is what enforce() checks.
-        assert!(
-            matches!(
-                checker.check_path("edit", "/probe/src/main.rs"),
-                CheckResult::Allowed,
-            ),
-            "edit alias must reflect write session-allowlist entry"
-        );
-
-        // Reverse direction: "always allow" edit → write must match.
-        let mut checker2 = PermissionChecker::new(
-            &cfg,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
-        );
-        checker2.add_session_allowlist("edit".to_string(), "/probe/src/**");
-        assert!(
-            matches!(
-                checker2.check_path("write", "/probe/src/main.rs"),
-                CheckResult::Allowed,
-            ),
-            "write must reflect edit session-allowlist entry"
-        );
-        assert!(
-            matches!(
-                checker2.check_path("apply_patch", "/probe/src/main.rs"),
-                CheckResult::Allowed,
-            ),
-            "apply_patch must reflect edit session-allowlist entry"
-        );
-
-        // apply_patch → edit mirroring too.
-        let mut checker3 = PermissionChecker::new(
-            &cfg,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
-        );
-        checker3.add_session_allowlist("apply_patch".to_string(), "/probe/src/**");
-        assert!(
-            matches!(
-                checker3.check_path("edit", "/probe/src/main.rs"),
-                CheckResult::Allowed,
-            ),
-            "edit must reflect apply_patch session-allowlist entry"
-        );
-
-        // Via load_session_allowlist too (persisted-session path).
-        let mut checker4 = PermissionChecker::new(
-            &cfg,
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
-        );
-        checker4.load_session_allowlist(&[("write".to_string(), "/probe/src/**".to_string())]);
-        assert!(
-            matches!(
-                checker4.check_path("edit", "/probe/src/main.rs"),
-                CheckResult::Allowed,
-            ),
-            "load_session_allowlist must also mirror write→edit"
-        );
-
-        // Non-aliased tools are unaffected.
-        let mut checker5 = fresh_checker();
-        checker5.add_session_allowlist("read".to_string(), "/tmp/**");
-        assert!(matches!(
-            checker5.check_path("read", "/tmp/foo.txt"),
-            CheckResult::Allowed,
-        ));
-        // read doesn't alias to write/edit.
-        assert!(
-            !checker5.is_session_allowed("write", "/tmp/foo.txt"),
-            "read allowlist entry must not leak to write"
-        );
-    }
-
-    // load_session_allowlist roundtrip: persisted patterns from a previous
-    // session should match the way they did when saved.
-    #[test]
-    fn regression_load_session_allowlist_preserves_command_semantics() {
-        let mut checker = fresh_checker();
-        let saved = vec![("bash".to_string(), "cd *".to_string())];
-        checker.load_session_allowlist(&saved);
-
-        let r = checker.check("bash", "cd /home/me/project");
-        assert!(matches!(r, CheckResult::Allowed));
-    }
-
-    #[test]
-    fn pattern_for_tool_distinguishes_path_and_command_tools() {
-        assert!(pattern_for_tool("bash", "cd *").matches("cd /a/b/c"));
-        assert!(!pattern_for_tool("read", "cd *").matches("cd /a/b/c"));
-        assert!(pattern_for_tool("read", "cd *").matches("cd file"));
-    }
-
-    /// Regression: the prior bash defaults used exact patterns
-    /// (`cargo build`, `git status`, etc.) so any flagged
-    /// invocation re-prompted (`cargo build --release` →
-    /// no match → Ask). The widened defaults wildcard those AND
-    /// add the common dev commands users hit constantly. Pin a
-    /// representative sample so a future tightening can't quietly
-    /// regress the friction.
-    #[test]
-    fn default_bash_rules_cover_common_flagged_invocations() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp/proj")),
-        );
-        for cmd in [
-            // The original friction cases.
-            "cargo build --release",
-            "cargo test --bin dirge --features plugin",
-            "cargo fmt --all --check",
-            "cargo clippy --all-targets",
-            "git status -s",
-            "git log --oneline -10",
-            // Newly-added safe dev commands.
-            "cargo run --release",
-            "git add -A",
-            "git commit -m \"msg\"",
-            "git checkout main",
-            "git switch -c feat/foo",
-            "git pull --rebase",
-            "git fetch origin",
-            "git restore --staged file.rs",
-            "make test",
-            "pytest -x tests/",
-            "python3 script.py",
-            "node index.js",
-            "npx eslint .",
-            "npm test -- --coverage",
-            "go test ./...",
-        ] {
-            let result = checker.check("bash", cmd);
-            assert!(
-                matches!(result, CheckResult::Allowed),
-                "{cmd:?} should be auto-allowed by default bash rules; got {result:?}",
-            );
-        }
-    }
-
-    /// Defense: high-risk operations stay Ask (or Deny) even after
-    /// the bash defaults were widened. If anyone accidentally adds
-    /// `npm install **` or similar to the allow list this fires.
-    #[test]
-    fn default_bash_rules_keep_high_risk_gated() {
-        let mut checker = PermissionChecker::new(
-            &PermissionConfig::default(),
-            SecurityMode::Standard,
-            Some(std::path::PathBuf::from("/tmp/proj")),
-        );
-        // Destructive / network-side-effect / privilege-escalation
-        // commands must NOT be silently allowed.
-        for cmd in [
-            "git push",
-            "git push origin main",
-            "git reset --hard",
-            "git rebase -i main",
-            "git stash drop",
-            "npm install lodash",
-            "pip install requests",
-            "curl http://example.com",
-            "wget http://example.com",
-            "sudo make install",
-        ] {
-            let result = checker.check("bash", cmd);
-            assert!(
-                matches!(result, CheckResult::Ask | CheckResult::Denied(_)),
-                "{cmd:?} must NOT be silently allowed; got {result:?}",
-            );
-        }
-
-        // Hard denies stay hard denies.
-        for cmd in [
-            "rm -rf /etc",
-            "sudo rm -rf /usr",
-            "dd if=/dev/zero of=/dev/sda",
-        ] {
-            let result = checker.check("bash", cmd);
-            assert!(
-                matches!(result, CheckResult::Denied(_)),
-                "{cmd:?} must remain hard-denied; got {result:?}",
-            );
+/// Walk up the ancestors of `path` until we find one that exists on
+/// disk, canonicalize that, and re-attach the missing-from-disk
+/// suffix. Returns `None` when no ancestor canonicalizes (e.g.
+/// pathological inputs or filesystem permission errors). Used by
+/// `canonicalize_path_pattern` to handle "Allow always" on a
+/// not-yet-existent path that's later created.
+fn project_canonical_from_existing_ancestor(path: &str) -> Option<String> {
+    let p = std::path::Path::new(path);
+    let mut tail_components: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut anchor = p;
+    loop {
+        match anchor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                // Cache the component we're stripping so we can
+                // re-attach it after canonicalizing the parent.
+                if let Some(name) = anchor.file_name() {
+                    tail_components.push(name);
+                }
+                anchor = parent;
+                if let Ok(canonical) = std::fs::canonicalize(anchor) {
+                    let mut out = canonical;
+                    for name in tail_components.iter().rev() {
+                        out.push(name);
+                    }
+                    return Some(out.to_string_lossy().into_owned());
+                }
+            }
+            _ => return None,
         }
     }
 }
+
+#[cfg(test)]
+#[path = "checker_tests.rs"]
+mod tests;

@@ -102,16 +102,12 @@ impl Tool for RepoOverviewTool {
         let depth = args
             .max_depth
             .unwrap_or(DEFAULT_OVERVIEW_DEPTH)
-            .min(MAX_OVERVIEW_DEPTH)
-            .max(1);
+            .clamp(1, MAX_OVERVIEW_DEPTH);
         let want_lines = args.include_line_counts.unwrap_or(false);
 
         // LOOP-3: include root-dir stamp so external edits invalidate.
         let stamp = crate::agent::tools::cache::fs_stamp_or_cwd(path);
-        let cache_key = format!(
-            "repo_overview:{}:{}:{}:{}",
-            path, depth, want_lines, stamp,
-        );
+        let cache_key = format!("repo_overview:{}:{}:{}:{}", path, depth, want_lines, stamp,);
         if let Some(ref cache) = self.cache
             && let Some(cached) = cache.get(&cache_key)
         {
@@ -126,7 +122,7 @@ impl Tool for RepoOverviewTool {
             return Err(ToolError::Msg(format!("path is not a directory: {}", path)));
         }
 
-        let canonical_root = root.canonicalize().unwrap_or(root.clone());
+        let canonical_root = crate::permission::path::canonical_or_self(&root);
         let result = build_overview(&canonical_root, depth, want_lines)?;
 
         if let Some(ref cache) = self.cache {
