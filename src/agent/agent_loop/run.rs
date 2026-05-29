@@ -367,6 +367,14 @@ async fn run_compaction_pass_with_focus(
         }
     }
 
+    // IMPROVEMENTS_PLAN #5: report what the pass did so consumers can
+    // tell pruning-only from a summary, and spot a failing summarizer.
+    let compaction_kind = match outcome {
+        SummaryOutcome::Succeeded(_) => crate::event::CompactionKind::PruneAndSummary,
+        SummaryOutcome::Failed => crate::event::CompactionKind::PruneAndFailedSummary,
+        SummaryOutcome::Skipped => crate::event::CompactionKind::PruneOnly,
+    };
+
     let new_id = compression::rotate_session_id();
     let _ = emit
         .send(LoopEvent::ContextCompacted {
@@ -375,6 +383,10 @@ async fn run_compaction_pass_with_focus(
             tokens_after: after_summary,
             summary: applied_summary,
             first_kept_index: applied_first_kept,
+            compaction_kind,
+            // The summarizer model name isn't threaded through the opaque
+            // SummarizeFn closure yet (follow-up).
+            summary_model: None,
         })
         .await;
 
