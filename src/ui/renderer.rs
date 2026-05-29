@@ -463,9 +463,27 @@ impl Renderer {
                 lines: lines.as_slice(),
             }
         } else {
+            // dirge-5w9v: scroll the editor so the cursor's wrapped row
+            // stays visible once the content exceeds the capped box
+            // height. The painter draws from row 0 and `.take()`s the
+            // window, so without this the newest/cursor lines fell off
+            // the bottom and the user's typing appeared to vanish.
+            let completion_extra = if cached_completion_preview.is_empty() {
+                0
+            } else {
+                1
+            };
+            let window = (*input_rows as usize)
+                .saturating_sub(completion_extra)
+                .max(1);
+            let offset = editor_scroll_offset(
+                cached_input_rows.len(),
+                *cached_input_cursor_row as usize,
+                window,
+            );
             BottomBody::Editor {
-                rows: cached_input_rows.as_slice(),
-                cursor_row: *cached_input_cursor_row,
+                rows: &cached_input_rows[offset..],
+                cursor_row: cached_input_cursor_row.saturating_sub(offset as u16),
                 cursor_col: *cached_input_cursor_col,
                 is_running: *cached_is_running,
                 completion_preview: cached_completion_preview.as_str(),
@@ -902,6 +920,14 @@ impl Renderer {
     /// chat overflowed the documented content area on wide terminals.
     fn max_line_width(&self) -> usize {
         self.content_width()
+    }
+
+    /// The display width the compose buffer is soft-wrapped to in the
+    /// input box (content width minus the 3-col prompt prefix). Mirrors
+    /// the `wrap_w` computed in `draw_bottom`; pushed into the editor so
+    /// Up/Down can move by wrapped display rows (dirge-5w9v).
+    pub fn input_wrap_w(&self) -> usize {
+        self.content_width().saturating_sub(3).max(1)
     }
 
     /// Raw width of the chat band (terminal width minus 2 cols for
@@ -1620,6 +1646,23 @@ pub(crate) fn wrap_editor(
         rows.push(String::new());
     }
     (rows, cursor_row, cursor_col)
+}
+
+/// Top scroll offset for the editor box so the cursor's wrapped row
+/// stays visible within a `window`-row viewport (dirge-5w9v). Returns
+/// the index of the first row to paint. `0` when everything fits.
+///
+/// Pre-fix the painter always drew from row 0 and `.take(window)`'d, so
+/// once the wrapped content exceeded the capped box height the newest /
+/// cursor lines fell off the bottom and the user's typing "vanished".
+pub(crate) fn editor_scroll_offset(total_rows: usize, cursor_row: usize, window: usize) -> usize {
+    if window == 0 || total_rows <= window {
+        return 0;
+    }
+    let max_offset = total_rows - window;
+    // Scroll just enough to land the cursor on the last visible row when
+    // it's past the window; clamp so we never scroll past the end.
+    cursor_row.saturating_sub(window - 1).min(max_offset)
 }
 
 // Used by the legacy modified-files panel; the new SubPanel widget

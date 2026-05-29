@@ -69,6 +69,26 @@ fn wrap_editor_long_buffer_tail_on_last_row() {
     );
 }
 
+/// dirge-5w9v: editor_scroll_offset keeps the cursor row inside the
+/// window once wrapped content exceeds the capped box height.
+#[test]
+fn editor_scroll_offset_keeps_cursor_visible() {
+    // Everything fits → no scroll.
+    assert_eq!(editor_scroll_offset(5, 4, 8), 0);
+    assert_eq!(editor_scroll_offset(8, 7, 8), 0);
+    // Content exceeds window; cursor near the end → scroll so the
+    // cursor lands on the last visible row.
+    assert_eq!(editor_scroll_offset(20, 19, 8), 12); // 19 - (8-1)
+    assert_eq!(editor_scroll_offset(20, 10, 8), 3); // 10 - 7
+    // Cursor still within the first window → no scroll.
+    assert_eq!(editor_scroll_offset(20, 5, 8), 0);
+    // Never scroll past the end.
+    assert_eq!(editor_scroll_offset(10, 9, 8), 2); // max_offset = 10-8
+    // Degenerate windows.
+    assert_eq!(editor_scroll_offset(10, 9, 0), 0);
+    assert_eq!(editor_scroll_offset(0, 0, 8), 0);
+}
+
 /// dirge-ov2 Phase A: chat switching saves the prior chat's
 /// buffer and selection, then loads the target chat's snapshot.
 /// Round-trip preserves content.
