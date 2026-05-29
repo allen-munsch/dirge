@@ -159,6 +159,7 @@ pass openai-key | dirge --provider openai --api-key-stdin
 | Meta+Y | Yank-pop (cycle kill ring after yank) |
 | Ctrl+N / Down | History next (multi-line: next logical line, history at boundary) |
 | Ctrl+P / Up | History previous (multi-line: previous logical line, history at boundary) |
+| Ctrl+R | Reverse-i-search through history (Enter accepts, Ctrl+R cycles, Esc/Ctrl+C cancels) |
 | Shift+Enter / Meta+Enter / Ctrl+J | Insert newline (input box expands; Ctrl+J works in any terminal) |
 | Tab | Insert 2 spaces |
 | `@<query>` | File picker (Tab/Enter select, Esc cancel) |
@@ -173,7 +174,7 @@ pass openai-key | dirge --provider openai --api-key-stdin
 | Ctrl+X | Drop the most-recently-queued interjection |
 | Esc-Esc (idle) | Open rewind picker (truncate history) |
 | Ctrl+F | Search chat buffer |
-| Ctrl+R | Toggle reasoning visibility |
+| Ctrl+T | Toggle reasoning visibility |
 | PgUp/PgDn | Scroll chat history |
 | Home/End | Jump to top/bottom |
 | `! cmd` | Run shell command (visible, injected into chat) |

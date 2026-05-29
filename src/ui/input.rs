@@ -188,6 +188,14 @@ pub struct InputEditor {
     pastes: Vec<Option<CompactString>>,
     /// Current slash-command completion state, for rendering a preview.
     pub completion: Option<CompletionResult>,
+    /// Whether Ctrl+R reverse-i-search mode is active.
+    search_mode: bool,
+    /// Accumulated search query during reverse-i-search.
+    search_query: CompactString,
+    /// Index into `history` of the currently displayed match.
+    search_match_idx: Option<usize>,
+    /// Buffer + cursor stashed when entering search mode. Restored on cancel.
+    search_draft: Option<(CompactString, usize)>,
 }
 
 /// Find the marker block `\x01<digits>\x01` containing or starting at
@@ -340,6 +348,10 @@ impl InputEditor {
             yank_state: None,
             pastes: Vec::new(),
             completion: None,
+            search_mode: false,
+            search_query: CompactString::new(""),
+            search_match_idx: None,
+            search_draft: None,
         }
     }
 
@@ -762,6 +774,13 @@ impl InputEditor {
             return None;
         }
 
+        // ── search-mode dispatch ───────────────────────────
+        // When reverse-i-search is active, most keys are intercepted
+        // and fed to the search mini-buffer instead of the editor buffer.
+        if self.search_mode {
+            return self.handle_search_key(key);
+        }
+
         match key.code {
             KeyCode::Enter => {
                 if self.picker.as_ref().is_some_and(|p| p.active) {
@@ -927,6 +946,12 @@ impl InputEditor {
             KeyCode::Char('p') if ctrl => {
                 self.history_up();
                 self.reset_kill_accumulation();
+                None
+            }
+
+            // Ctrl+R → reverse-i-search
+            KeyCode::Char('r') if ctrl => {
+                self.enter_search();
                 None
             }
 
@@ -1200,6 +1225,227 @@ impl InputEditor {
                 }
             }
             None => {}
+        }
+    }
+
+    // ── Ctrl+R reverse-i-search ─────────────────────────────
+
+    pub fn is_in_search(&self) -> bool {
+        self.search_mode
+    }
+
+    #[allow(dead_code)]
+    pub fn search_query(&self) -> &str {
+        self.search_query.as_str()
+    }
+
+    pub fn search_match_text(&self) -> &str {
+        match self.search_match_idx {
+            Some(idx) => self.history.get(idx).map(|s| s.as_str()).unwrap_or(""),
+            None => "",
+        }
+    }
+
+    pub fn search_display(&self) -> (String, usize) {
+        let matched = self.search_match_text();
+        let prefix = format!("(reverse-i-search)`{}': ", self.search_query);
+        let full = format!("{}{}", prefix, matched);
+        // cursor after the prefix + match
+        (full, prefix.len() + matched.len())
+    }
+
+    fn enter_search(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        // Stash current buffer so we can restore on cancel.
+        self.search_draft = Some((self.buffer.clone(), self.cursor));
+        self.search_mode = true;
+        self.search_query.clear();
+        // Start with the most recent history entry.
+        self.search_match_idx = Some(self.history.len() - 1);
+        self.buffer = self.history[self.history.len() - 1].clone();
+        self.cursor = self.buffer.len();
+    }
+
+    /// Search history for `query` (case-insensitive substring), newest first.
+    /// Returns the index or None.
+    fn search_find(&self, query: &str) -> Option<usize> {
+        if query.is_empty() {
+            return Some(self.history.len().saturating_sub(1));
+        }
+        let lower = query.to_lowercase();
+        for (i, entry) in self.history.iter().enumerate().rev() {
+            let entry_lower = entry.to_lowercase();
+            if entry_lower.contains(lower.as_str()) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Cycle to the next older match for the current query.
+    fn search_cycle_next(&mut self) {
+        let query = self.search_query.clone();
+        let start = self.search_match_idx.unwrap_or(self.history.len());
+        let lower = query.to_lowercase();
+        // Search from one position older, wrapping around.
+        let next = if start == 0 {
+            // Wrap: search from end
+            self.history
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, entry)| {
+                    if query.is_empty() {
+                        true
+                    } else {
+                        entry.to_lowercase().contains(lower.as_str())
+                    }
+                })
+                .map(|(i, _)| i)
+        } else {
+            let range = &self.history[..start];
+            range
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, entry)| {
+                    if query.is_empty() {
+                        true
+                    } else {
+                        entry.to_lowercase().contains(lower.as_str())
+                    }
+                })
+                .map(|(i, _)| i)
+                .or_else(|| {
+                    // Wrap: search from end
+                    self.history
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, entry)| {
+                            if query.is_empty() {
+                                true
+                            } else {
+                                entry.to_lowercase().contains(lower.as_str())
+                            }
+                        })
+                        .map(|(i, _)| i)
+                })
+        };
+        if let Some(idx) = next {
+            self.search_match_idx = Some(idx);
+            self.buffer = self.history[idx].clone();
+            self.cursor = self.buffer.len();
+        }
+    }
+
+    fn exit_search_accept(&mut self) {
+        self.search_mode = false;
+        self.search_query.clear();
+        self.search_match_idx = None;
+        self.search_draft = None;
+    }
+
+    fn exit_search_cancel(&mut self) {
+        self.search_mode = false;
+        self.search_query.clear();
+        self.search_match_idx = None;
+        if let Some((draft, cursor)) = self.search_draft.take() {
+            self.buffer = draft;
+            self.cursor = cursor.min(self.buffer.len());
+        } else {
+            self.buffer.clear();
+            self.cursor = 0;
+        }
+    }
+
+    /// Cancel search from outside the editor (e.g. Ctrl+C handled by the
+    /// event loop before the key reaches `handle_key`).
+    pub fn cancel_search(&mut self) {
+        self.exit_search_cancel();
+    }
+
+    /// Seed the editor's history from a session on startup, so Up/Down
+    /// arrow navigation and Ctrl+R search work across restarts.
+    /// Only user messages are included; empty messages are skipped.
+    /// Dedups consecutive identical entries (matching the Enter-submit
+    /// behaviour in `handle_key`).
+    pub fn load_history_entry(&mut self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        let is_dupe = self
+            .history
+            .last()
+            .map(|prev| prev.as_str() == content)
+            .unwrap_or(false);
+        if !is_dupe {
+            self.history.push(CompactString::new(content));
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        match key.code {
+            // Ctrl+R again → cycle to next older match
+            KeyCode::Char('r') if ctrl => {
+                self.search_cycle_next();
+                None
+            }
+
+            // Ctrl+C or Esc → cancel search
+            KeyCode::Char('c') if ctrl => {
+                self.exit_search_cancel();
+                None
+            }
+            KeyCode::Esc => {
+                self.exit_search_cancel();
+                None
+            }
+
+            // Enter → accept match
+            KeyCode::Enter => {
+                self.exit_search_accept();
+                None
+            }
+
+            // Backspace → remove last query char
+            KeyCode::Backspace => {
+                if !self.search_query.is_empty() {
+                    self.search_query.pop();
+                }
+                if let Some(idx) = self.search_find(&self.search_query) {
+                    self.search_match_idx = Some(idx);
+                    self.buffer = self.history[idx].clone();
+                    self.cursor = self.buffer.len();
+                } else {
+                    self.search_match_idx = None;
+                    self.buffer.clear();
+                    self.cursor = 0;
+                }
+                None
+            }
+
+            // Plain char → append to query
+            KeyCode::Char(c) if !ctrl => {
+                self.search_query.push(c);
+                if let Some(idx) = self.search_find(&self.search_query) {
+                    self.search_match_idx = Some(idx);
+                    self.buffer = self.history[idx].clone();
+                    self.cursor = self.buffer.len();
+                } else {
+                    self.search_match_idx = None;
+                    self.buffer.clear();
+                    self.cursor = 0;
+                }
+                None
+            }
+
+            // Any other key: ignore in search mode
+            _ => None,
         }
     }
 }
