@@ -956,6 +956,18 @@ pub async fn build_loop_tools(
         );
     }
 
+    // DAP debug tool — self-contained, no external manager needed.
+    #[cfg(feature = "dap")]
+    {
+        tools.push(
+            wrap(
+                tools::DebugTool::new(permission.clone(), ask_tx.clone()),
+                None,
+            )
+            .await,
+        );
+    }
+
     // MCP tools — variable per-server semantics. Default
     // Parallel; future work can let an MCP server declare
     // execution_mode in its definition. Same name-collision
