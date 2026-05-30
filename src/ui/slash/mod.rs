@@ -349,6 +349,17 @@ pub async fn handle_compress(
     Ok(CompressOutcome::Compacted)
 }
 
+/// Split a slash-command line into whitespace-separated parts
+/// (`parts[0]` = command, `parts[1]` = first arg, …). Runs of
+/// whitespace collapse to a single separator, so `/sessions  <id>`
+/// (extra spaces) parses identically to `/sessions <id>` — previously
+/// a stray double space produced an empty middle token and broke the
+/// arg. `parts[1..].join(" ")` still recovers the remainder for the
+/// commands that want it.
+fn split_command_parts(text: &str) -> SmallVec<[&str; 3]> {
+    text.split_whitespace().collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_slash(
     text: &str,
@@ -384,7 +395,7 @@ pub async fn handle_slash(
     // command. Thread the actual manager through.
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
 ) -> anyhow::Result<()> {
-    let parts: SmallVec<[&str; 3]> = text.trim().splitn(3, ' ').collect();
+    let parts: SmallVec<[&str; 3]> = split_command_parts(text);
     let mut ctx = SlashCtx {
         agent,
         client,
@@ -731,6 +742,28 @@ pub fn format_completion_preview(cr: Option<&CompletionResult>, avail_w: usize) 
 mod tests {
     use super::*;
     use crate::session::{Session, SessionMessage};
+
+    #[test]
+    fn split_command_parts_collapses_extra_whitespace() {
+        // Single and multiple spaces parse identically.
+        assert_eq!(
+            split_command_parts("/sessions delete abc123").as_slice(),
+            ["/sessions", "delete", "abc123"]
+        );
+        assert_eq!(
+            split_command_parts("/sessions  delete   abc123").as_slice(),
+            ["/sessions", "delete", "abc123"]
+        );
+        // Leading/trailing whitespace is ignored.
+        assert_eq!(
+            split_command_parts("  /toggle thinking on  ").as_slice(),
+            ["/toggle", "thinking", "on"]
+        );
+        // The remainder is still recoverable for multi-word args.
+        let p = split_command_parts("/compress  keep   the auth flow");
+        assert_eq!(p[0], "/compress");
+        assert_eq!(p[1..].join(" "), "keep the auth flow");
+    }
 
     fn msg(role: MessageRole, content: &str) -> SessionMessage {
         // Re-use Session::add_message to get a real msg with id/timestamp.
