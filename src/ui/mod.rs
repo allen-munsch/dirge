@@ -463,8 +463,9 @@ pub async fn run_interactive(
     #[cfg(feature = "dap")]
     {
         let debug_data = crate::dap::session::DAP_MANAGER
-            .get()
-            .and_then(|mgr| mgr.debug_snapshot());
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.debug_snapshot()));
         renderer.set_debug_panel_data(debug_data);
     }
 
@@ -652,8 +653,9 @@ pub async fn run_interactive(
         #[cfg(feature = "dap")]
         {
             let debug_data = crate::dap::session::DAP_MANAGER
-                .get()
-                .and_then(|mgr| mgr.debug_snapshot());
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|m| m.debug_snapshot()));
             renderer.set_debug_panel_data(debug_data);
         }
         // Refresh the left-panel vitals (context gauge, activity ticker,
