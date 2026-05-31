@@ -168,6 +168,9 @@ pub enum PanelMode {
     On,
     /// Force panel off regardless of width.
     Off,
+    /// Show debug panel instead of system info (gated on ≥100 cols).
+    /// Only meaningful when a DAP session is active.
+    Debug,
 }
 
 /// Which side panels a `/display` spec (or the `display` config value)
@@ -325,6 +328,10 @@ pub struct Renderer {
     /// ui-redesign: idle-state info for the left panel. Painted when
     /// `subagent_status` is empty so the gutter never looks dead.
     left_panel_info: LeftPanelInfo,
+    /// DAP debug panel snapshot — updated each UI tick when a
+    /// DAP session is active and panel mode is Debug.
+    #[cfg(feature = "dap")]
+    debug_panel_data: Option<crate::dap::types::DebugPanelData>,
     /// ui-redesign Phase 6: when set, `draw_bottom` paints these
     /// lines inside the bottom frame INSTEAD of the input editor.
     /// Used by permission prompts and questionnaire prompts so the
@@ -438,6 +445,8 @@ impl Renderer {
             panel_data: PanelData::default(),
             subagent_status: Vec::new(),
             left_panel_info: LeftPanelInfo::default(),
+            #[cfg(feature = "dap")]
+            debug_panel_data: None,
             alert_overlay: None,
             alert_title: String::new(),
             avatar_state: crate::ui::avatar::AvatarState::Idle,
@@ -523,6 +532,7 @@ impl Renderer {
             selection_active,
             selection_start,
             selection_end,
+            right_panel_mode,
             ..
         } = self;
 
@@ -667,6 +677,9 @@ impl Renderer {
             show_left_panel,
             show_right_panel,
             frame_color,
+            panel_mode: *right_panel_mode,
+            #[cfg(feature = "dap")]
+            debug_panel_data: self.debug_panel_data.as_ref(),
         };
 
         // Wrap the draw in Begin/EndSynchronizedUpdate. Modern
@@ -938,6 +951,13 @@ impl Renderer {
         self.left_panel_info = info;
     }
 
+    /// Update the DAP debug panel snapshot. Called each UI tick
+    /// when the DAP feature is enabled.
+    #[cfg(feature = "dap")]
+    pub fn set_debug_panel_data(&mut self, data: Option<crate::dap::types::DebugPanelData>) {
+        self.debug_panel_data = data;
+    }
+
     /// ui-redesign Phase 6: set the alert overlay. While `Some`, the
     /// `[ALERT]` frame contains the supplied lines instead of the
     /// input editor. The ask handler builds the lines, pushes them
@@ -1013,6 +1033,7 @@ impl Renderer {
             PanelMode::Off => false,
             PanelMode::On => self.content_indent() >= 15,
             PanelMode::Auto => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
+            PanelMode::Debug => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
         }
     }
 

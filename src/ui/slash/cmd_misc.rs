@@ -199,9 +199,10 @@ pub(super) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         "on" => Some(PanelMode::On),
         "off" => Some(PanelMode::Off),
         "auto" => Some(PanelMode::Auto),
+        "debug" => Some(PanelMode::Debug),
         other => {
             ctx.renderer.write_line(
-                &format!("unknown /panel mode '{}' (use on|off|auto)", other),
+                &format!("unknown /panel mode '{}' (use on|off|auto|debug)", other),
                 c_error(),
             )?;
             return Ok(());
@@ -618,7 +619,7 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         c_result(),
     )?;
     renderer.write_line(
-        "  /panel [on|off|auto]   toggle both side panels together",
+        "  /panel [on|off|auto|debug]   toggle right-hand info panel",
         c_result(),
     )?;
     renderer.write_line(

@@ -629,6 +629,191 @@ impl<'a> Widget for RightPanel<'a> {
     }
 }
 
+#[cfg(feature = "dap")]
+pub mod debug {
+    //! Debug panel widget — renders DAP session state.
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color as RColor, Style};
+    use ratatui::widgets::Widget;
+
+    use crate::dap::types::*;
+
+    use super::SubPanel;
+
+    const AMBER: RColor = RColor::Rgb(255, 191, 0);
+    const RIGHT_PANEL_TOP_PAD: u16 = 1;
+    const RIGHT_PANEL_TRAILING_PAD: u16 = 1;
+
+    /// Right panel widget that shows DAP debug session state.
+    pub struct DebugRightPanel<'a> {
+        data: &'a DebugPanelData,
+        style: Style,
+    }
+
+    impl<'a> DebugRightPanel<'a> {
+        pub fn new(data: &'a DebugPanelData) -> Self {
+            Self {
+                data,
+                style: Style::default().fg(RColor::Green),
+            }
+        }
+    }
+
+    impl<'a> Widget for DebugRightPanel<'a> {
+        fn render(self, area: Rect, buf: &mut Buffer) {
+            if area.width == 0 || area.height == 0 {
+                return;
+            }
+
+            let dim = RColor::DarkGray;
+            let body_color = AMBER;
+
+            let mut y = area.y + RIGHT_PANEL_TOP_PAD;
+            let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
+
+            let summary = self.data.session_summary.as_ref();
+
+            // [DEBUG] — session status
+            let debug_panel = {
+                let mut p = SubPanel::new("DEBUG").border_style(self.style);
+                if let Some(s) = summary {
+                    p = p.line(format!("status: {:?}", s.status), body_color);
+                    p = p.line(format!("adapter: {}", s.adapter_name), body_color);
+                    if let Some(ref reason) = s.stop_reason {
+                        p = p.line(format!("reason: {}", reason), body_color);
+                    }
+                    if let Some(tid) = s.thread_id {
+                        p = p.line(format!("thread: {}", tid), body_color);
+                    }
+                } else {
+                    p = p.line("· (no session)", dim);
+                }
+                p
+            };
+            let h = debug_panel.height();
+            if y + h <= area.y + area.height {
+                debug_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [THREADS]
+            let threads_panel = {
+                let mut p = SubPanel::new("THREADS").border_style(self.style);
+                if self.data.threads.is_empty() {
+                    p = p.line("· (pending)", dim);
+                } else {
+                    for t in &self.data.threads {
+                        p = p.line(format!("{} {}", t.id, t.name), body_color);
+                    }
+                }
+                p
+            };
+            let h = threads_panel.height();
+            if y + h <= area.y + area.height {
+                threads_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [FRAMES]
+            let frames_panel = {
+                let mut p = SubPanel::new("FRAMES").border_style(self.style);
+                if self.data.frames.is_empty() {
+                    p = p.line("· (pending)", dim);
+                } else {
+                    for f in &self.data.frames {
+                        let src = f
+                            .source
+                            .as_ref()
+                            .and_then(|s| s.name.as_deref())
+                            .unwrap_or("??");
+                        p = p.line(
+                            format!("{} {}:{} {}", f.id, src, f.line, f.name),
+                            body_color,
+                        );
+                    }
+                }
+                p
+            };
+            let h = frames_panel.height();
+            if y + h <= area.y + area.height {
+                frames_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [VARIABLES]
+            let variables_panel = {
+                let mut p = SubPanel::new("VARIABLES").border_style(self.style);
+                if self.data.variables.is_empty() {
+                    p = p.line("· (pending)", dim);
+                } else {
+                    for v in &self.data.variables {
+                        let val = &v.value;
+                        let type_hint = v
+                            .var_type
+                            .as_deref()
+                            .map(|t| format!(": {t}"))
+                            .unwrap_or_default();
+                        p = p.line(
+                            format!("{} = {}{}", v.name, val, type_hint),
+                            body_color,
+                        );
+                    }
+                }
+                p
+            };
+            let h = variables_panel.height();
+            if y + h <= area.y + area.height {
+                variables_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [BREAKPOINTS]
+            let bp_count = summary.map(|s| s.breakpoint_count).unwrap_or(0);
+            let fbp_count = summary.map(|s| s.function_breakpoint_count).unwrap_or(0);
+            let bp_panel = SubPanel::new("BREAKPOINTS")
+                .line(format!("source: {}  func: {}", bp_count, fbp_count), body_color)
+                .border_style(self.style);
+            let h = bp_panel.height();
+            if y + h <= area.y + area.height {
+                bp_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [OUTPUT] — grow to fill remaining vertical space.
+            let remaining = (area.y + area.height).saturating_sub(y);
+            if remaining >= 3 {
+                let rect = Rect::new(area.x, y, inner_w, remaining);
+                let inner_rows = (remaining as usize).saturating_sub(2);
+                let mut p = SubPanel::new("OUTPUT").border_style(self.style);
+                let output = &self.data.output;
+                if output.is_empty() {
+                    p = p.line("· (none)", dim);
+                } else {
+                    let lines: Vec<&str> = output.lines().collect();
+                    let total = lines.len();
+                    if total <= inner_rows {
+                        for line in &lines {
+                            p = p.line(*line, body_color);
+                        }
+                    } else {
+                        for line in lines.iter().take(inner_rows.saturating_sub(1)) {
+                            p = p.line(*line, body_color);
+                        }
+                        let footer = if self.data.output_truncated {
+                            format!("+{} more (truncated)", total.saturating_sub(inner_rows - 1))
+                        } else {
+                            format!("+{} more", total.saturating_sub(inner_rows - 1))
+                        };
+                        p = p.line(footer, dim);
+                    }
+                }
+                p.render(rect, buf);
+            }
+        }
+    }
+}
+
 /// Render `LABEL: [####....] NN%` of fixed width.
 fn format_bar(label: &str, pct: f32) -> String {
     let bar_w = 10;

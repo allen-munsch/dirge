@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -12,8 +13,15 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::agent::agent_loop::tool::AbortSignal;
 use crate::agent::tools::ToolError;
-use crate::dap::client::{DapClient, DapRpc, RpcError};
+use crate::dap::client::{DapClient, RpcError};
+
+#[cfg(test)]
+use crate::dap::client::DapRpc;
 use crate::dap::types::*;
+
+/// Global DAP session manager — set during `DebugTool` construction,
+/// read by the UI loop for debug panel snapshots.
+pub static DAP_MANAGER: OnceLock<std::sync::Arc<DapSessionManager>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Output cap
@@ -105,6 +113,12 @@ struct DapSession {
     output_truncated: bool,
     exit_code: Option<u32>,
     events: EventReceivers,
+    /// Cached for TUI debug panel snapshots.
+    cached_threads: Vec<Thread>,
+    /// Cached for TUI debug panel snapshots.
+    cached_frames: Vec<StackFrame>,
+    /// Cached for TUI debug panel snapshots (last variables request).
+    cached_variables: Vec<Variable>,
 }
 
 impl DapSession {
@@ -292,6 +306,9 @@ impl DapSessionManager {
             exit_code: None,
             events,
             client,
+            cached_threads: Vec::new(),
+            cached_frames: Vec::new(),
+            cached_variables: Vec::new(),
         };
         session.drain_output();
 
@@ -378,6 +395,9 @@ impl DapSessionManager {
             exit_code: None,
             events,
             client,
+            cached_threads: Vec::new(),
+            cached_frames: Vec::new(),
+            cached_variables: Vec::new(),
         };
         session.drain_output();
 
@@ -617,9 +637,9 @@ impl DapSessionManager {
         levels: Option<u32>,
         timeout: Duration,
     ) -> Result<Vec<StackFrame>, ToolError> {
-        let active = self.active.lock().await;
+        let mut active = self.active.lock().await;
         let session = active
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
         let args = StackTraceArgs {
@@ -635,6 +655,7 @@ impl DapSessionManager {
             .await
             .map_err(rpc_to_tool_error)?;
 
+        session.cached_frames = response.stack_frames.clone();
         Ok(response.stack_frames)
     }
 
@@ -665,9 +686,9 @@ impl DapSessionManager {
         variables_reference: u32,
         timeout: Duration,
     ) -> Result<Vec<Variable>, ToolError> {
-        let active = self.active.lock().await;
+        let mut active = self.active.lock().await;
         let session = active
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
         let args = VariablesArgs {
@@ -684,6 +705,7 @@ impl DapSessionManager {
             .await
             .map_err(rpc_to_tool_error)?;
 
+        session.cached_variables = response.variables.clone();
         Ok(response.variables)
     }
 
@@ -718,9 +740,9 @@ impl DapSessionManager {
 
     /// List threads.
     pub async fn threads(&self, timeout: Duration) -> Result<Vec<Thread>, ToolError> {
-        let active = self.active.lock().await;
+        let mut active = self.active.lock().await;
         let session = active
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
         let response: ThreadsResponse = session
@@ -729,6 +751,7 @@ impl DapSessionManager {
             .await
             .map_err(rpc_to_tool_error)?;
 
+        session.cached_threads = response.threads.clone();
         Ok(response.threads)
     }
 
@@ -776,10 +799,49 @@ impl DapSessionManager {
         Ok(())
     }
 
+    /// Restart a stack frame — re-execute from the beginning of the frame.
+    /// Useful for edit-and-continue workflows after modifying source code.
+    pub async fn restart_frame(
+        &self,
+        frame_id: u32,
+        timeout: Duration,
+    ) -> Result<(), ToolError> {
+        let active = self.active.lock().await;
+        let session = active
+            .as_ref()
+            .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
+
+        let args = RestartFrameArgs { frame_id };
+        session
+            .client
+            .request::<_, Value>("restartFrame", &args, timeout)
+            .await
+            .map_err(rpc_to_tool_error)?;
+
+        Ok(())
+    }
+
     /// Return a summary of the active session, if any.
     pub async fn active_summary(&self) -> Option<SessionSummary> {
         let active = self.active.lock().await;
         active.as_ref().map(|s| s.summary())
+    }
+
+    /// Build a `DebugPanelData` snapshot from the active session's
+    /// cached state. Non-async — uses `try_lock` so the UI loop
+    /// never blocks waiting for a DAP tool call. Returns `None`
+    /// when no session is active or the lock is held by a tool.
+    pub fn debug_snapshot(&self) -> Option<DebugPanelData> {
+        let active = self.active.try_lock().ok()?;
+        let session = active.as_ref()?;
+        Some(DebugPanelData {
+            session_summary: Some(session.summary()),
+            threads: session.cached_threads.clone(),
+            frames: session.cached_frames.clone(),
+            variables: session.cached_variables.clone(),
+            output: session.output.clone(),
+            output_truncated: session.output_truncated,
+        })
     }
 
     /// Force-terminate the active session (drop = kill_on_drop).

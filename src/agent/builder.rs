@@ -1023,16 +1023,23 @@ pub async fn build_loop_tools(
         );
     }
 
-    // DAP debug tool — self-contained, no external manager needed.
+    // DAP debug tool — with optional LSP bridge when both features are enabled.
     #[cfg(feature = "dap")]
     {
-        tools.push(
-            wrap(
-                tools::DebugTool::new(permission.clone(), ask_tx.clone()),
-                None,
+        #[cfg(feature = "lsp")]
+        let debug_tool = if let Some(manager) = &lsp_manager {
+            tools::DebugTool::new_with_lsp(
+                permission.clone(),
+                ask_tx.clone(),
+                manager.clone(),
             )
-            .await,
-        );
+        } else {
+            tools::DebugTool::new(permission.clone(), ask_tx.clone())
+        };
+        #[cfg(not(feature = "lsp"))]
+        let debug_tool = tools::DebugTool::new(permission.clone(), ask_tx.clone());
+
+        tools.push(wrap(debug_tool, None).await);
     }
 
     // MCP tools — variable per-server semantics. Default

@@ -3,6 +3,10 @@
 //! Dispatches to [`crate::dap::session::DapSessionManager`] and uses
 //! [`crate::dap::config`] for adapter resolution. One tool, one `action`
 //! parameter; the agent picks which debug operation to invoke.
+//!
+//! When the LSP feature is also enabled, this tool gains DAP↔LSP bridge
+//! actions (`run_to_cursor`, `restart_frame`, `backtrace_diagnostics`,
+//! `error_analysis`) that coordinate the debugger with LSP code intelligence.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +19,11 @@ use serde_json::json;
 use crate::agent::agent_loop::tool::AbortSignal;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm, head_cap, required_nonblank};
 use crate::dap::config::{self, ResolvedAdapter};
-use crate::dap::session::DapSessionManager;
+use crate::dap::session::{DAP_MANAGER, DapSessionManager};
 use crate::dap::types::SourceBreakpoint;
+
+#[cfg(feature = "lsp")]
+use crate::lsp::manager::LspManager;
 
 const DESCRIPTION: &str = "\
 Debug a program using the Debug Adapter Protocol (DAP). \
@@ -45,8 +52,12 @@ Actions:\n\
 - variables: get variables within a scope\n\
 - terminate: terminate the debuggee\n\
 - sessions: show active debug session info\n\
+- run_to_cursor: set breakpoint at cursor, continue, and show LSP hover info at the stop location\n\
+- restart_frame: re-execute the current stack frame (edit-and-continue)\n\
+- backtrace_diagnostics: get stack trace with LSP diagnostics for each frame\n\
+- error_analysis: get stack trace with LSP error diagnostics and suggested breakpoints\n\
 \n\
-Timeout in seconds (default 30, min 5, max 300).";
+Timeouts in seconds (default 30, min 5, max 300).";
 
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 
@@ -54,6 +65,8 @@ pub struct DebugTool {
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     session: Arc<DapSessionManager>,
+    #[cfg(feature = "lsp")]
+    lsp_manager: Option<Arc<LspManager>>,
 }
 
 impl DebugTool {
@@ -61,10 +74,30 @@ impl DebugTool {
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
     ) -> Self {
+        let session = Arc::new(DapSessionManager::new());
+        let _ = DAP_MANAGER.set(session.clone());
         Self {
             permission,
             ask_tx,
-            session: Arc::new(DapSessionManager::new()),
+            session,
+            #[cfg(feature = "lsp")]
+            lsp_manager: None,
+        }
+    }
+
+    #[cfg(feature = "lsp")]
+    pub fn new_with_lsp(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        lsp_manager: Arc<LspManager>,
+    ) -> Self {
+        let session = Arc::new(DapSessionManager::new());
+        let _ = DAP_MANAGER.set(session.clone());
+        Self {
+            permission,
+            ask_tx,
+            session,
+            lsp_manager: Some(lsp_manager),
         }
     }
 }
@@ -133,6 +166,14 @@ enum Action {
     Variables,
     Terminate,
     Sessions,
+    #[cfg(feature = "lsp")]
+    RunToCursor,
+    #[cfg(feature = "lsp")]
+    RestartFrame,
+    #[cfg(feature = "lsp")]
+    BacktraceDiagnostics,
+    #[cfg(feature = "lsp")]
+    ErrorAnalysis,
 }
 
 impl Action {
@@ -154,6 +195,14 @@ impl Action {
             "variables" => Some(Action::Variables),
             "terminate" => Some(Action::Terminate),
             "sessions" => Some(Action::Sessions),
+            #[cfg(feature = "lsp")]
+            "run_to_cursor" => Some(Action::RunToCursor),
+            #[cfg(feature = "lsp")]
+            "restart_frame" => Some(Action::RestartFrame),
+            #[cfg(feature = "lsp")]
+            "backtrace_diagnostics" => Some(Action::BacktraceDiagnostics),
+            #[cfg(feature = "lsp")]
+            "error_analysis" => Some(Action::ErrorAnalysis),
             _ => None,
         }
     }
@@ -227,7 +276,9 @@ impl Tool for DebugTool {
                             "launch", "attach", "set_breakpoints", "remove_breakpoints",
                             "continue", "step_over", "step_in", "step_out",
                             "pause", "evaluate", "stack_trace", "threads",
-                            "scopes", "variables", "terminate", "sessions"
+                            "scopes", "variables", "terminate", "sessions",
+                            "run_to_cursor", "restart_frame",
+                            "backtrace_diagnostics", "error_analysis"
                         ]
                     },
                     "program": { "type": "string", "description": "Path to the program to debug (launch)" },
@@ -472,6 +523,52 @@ impl Tool for DebugTool {
                     None => Ok("No active debug session.".into()),
                 }
             }
+
+            #[cfg(feature = "lsp")]
+            Action::RunToCursor => {
+                let file = required_nonblank(args.file.as_deref(), "file", "run_to_cursor")?;
+                let line = args
+                    .line
+                    .ok_or_else(|| ToolError::Msg("`line` is required for run_to_cursor".into()))?;
+                let lsp = self.lsp_manager.as_ref().ok_or_else(|| {
+                    ToolError::Msg("LSP not available for run_to_cursor".into())
+                })?;
+
+                run_to_cursor(mgr, lsp, file, line, args.thread_id, &signal, timeout).await
+            }
+
+            #[cfg(feature = "lsp")]
+            Action::RestartFrame => {
+                let frame_id = args
+                    .frame_id
+                    .ok_or_else(|| ToolError::Msg("`frame_id` is required for restart_frame".into()))?;
+                mgr.restart_frame(frame_id, timeout).await?;
+                Ok(format!("Restarted frame {frame_id}. Re-executing from frame start."))
+            }
+
+            #[cfg(feature = "lsp")]
+            Action::BacktraceDiagnostics => {
+                let thread_id = args
+                    .thread_id
+                    .ok_or_else(|| ToolError::Msg("`thread_id` is required for backtrace_diagnostics".into()))?;
+                let lsp = self.lsp_manager.as_ref().ok_or_else(|| {
+                    ToolError::Msg("LSP not available for backtrace_diagnostics".into())
+                })?;
+
+                backtrace_diagnostics(mgr, lsp, thread_id, timeout).await
+            }
+
+            #[cfg(feature = "lsp")]
+            Action::ErrorAnalysis => {
+                let thread_id = args
+                    .thread_id
+                    .ok_or_else(|| ToolError::Msg("`thread_id` is required for error_analysis".into()))?;
+                let lsp = self.lsp_manager.as_ref().ok_or_else(|| {
+                    ToolError::Msg("LSP not available for error_analysis".into())
+                })?;
+
+                error_analysis(mgr, lsp, thread_id, timeout).await
+            }
         }
     }
 }
@@ -571,6 +668,165 @@ fn format_sessions(s: &crate::dap::types::SessionSummary) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// DAP↔LSP bridge helpers (available when both features are enabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "lsp")]
+use std::path::Path;
+
+/// Set a breakpoint at `file:line`, continue, then get LSP hover info
+/// at the stopped location. Returns the stop location + hover results.
+#[cfg(feature = "lsp")]
+async fn run_to_cursor(
+    mgr: &DapSessionManager,
+    lsp: &LspManager,
+    file: &str,
+    line: u32,
+    thread_id: Option<u32>,
+    signal: &AbortSignal,
+    timeout: Duration,
+) -> Result<String, ToolError> {
+    // Set a breakpoint at the target line.
+    let bp = SourceBreakpoint { line, column: None, condition: None, log_message: None, hit_condition: None };
+    mgr.set_breakpoints(file, vec![bp], timeout).await?;
+
+    // Continue to the breakpoint.
+    let outcome = mgr.continue_(thread_id.unwrap_or(0), signal, timeout).await?;
+
+    // Get hover info from LSP at the stopped location.
+    let mut result = format_continue_outcome(&outcome);
+    if let Some(ref reason) = outcome.stop_reason {
+        if reason != "terminated" {
+            let path = Path::new(file);
+            let hover_results = lsp.hover(path, line.saturating_sub(1), 0).await;
+            if !hover_results.is_empty() {
+                let hover_json =
+                    serde_json::to_string_pretty(&hover_results).unwrap_or_default();
+                result.push_str(&format!("\n\nHover info at {file}:{line}:\n{hover_json}"));
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Get a stack trace, then fetch LSP diagnostics for each source file in the frames.
+#[cfg(feature = "lsp")]
+async fn backtrace_diagnostics(
+    mgr: &DapSessionManager,
+    lsp: &LspManager,
+    thread_id: u32,
+    timeout: Duration,
+) -> Result<String, ToolError> {
+    let frames = mgr.stack_trace(thread_id, None, timeout).await?;
+
+    let all_diags = lsp.all_diagnostics();
+    let mut out = format!("Backtrace diagnostics for thread {thread_id}:\n\n");
+
+    let mut seen_files = std::collections::HashSet::new();
+    for (i, frame) in frames.iter().enumerate() {
+        if let Some(ref source) = frame.source {
+            if let Some(ref path) = source.path {
+                if seen_files.insert(path.clone()) {
+                    let frame_loc = match source.name.as_deref() {
+                        Some(name) => format!("{name}:{}", frame.line),
+                        None => path.clone(),
+                    };
+
+                    let p = std::path::PathBuf::from(path);
+                    // Touch file to ensure LSP server is aware of it.
+                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify).await;
+
+                    let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
+                    if diags.is_empty() {
+                        out.push_str(&format!("  [{i}] {frame_loc} — no diagnostics\n"));
+                    } else {
+                        out.push_str(&format!("  [{i}] {frame_loc} — {} diagnostics:\n", diags.len()));
+                        for d in diags.iter().take(5) {
+                            let severity = format!("{:?}", d.severity);
+                            out.push_str(&format!(
+                                "      L{} — {severity}: {}\n",
+                                d.range.start.line + 1,
+                                d.message
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Get a stack trace, then for each frame fetch LSP diagnostics and
+/// document symbols. Identify error-prone locations and suggest breakpoints.
+#[cfg(feature = "lsp")]
+async fn error_analysis(
+    mgr: &DapSessionManager,
+    lsp: &LspManager,
+    thread_id: u32,
+    timeout: Duration,
+) -> Result<String, ToolError> {
+    let frames = mgr.stack_trace(thread_id, None, timeout).await?;
+
+    let all_diags = lsp.all_diagnostics();
+    let mut out = format!("Error analysis for thread {thread_id}:\n\n");
+    out.push_str("Stack frames with diagnostics and suggested breakpoints:\n\n");
+
+    let mut seen_files = std::collections::HashSet::new();
+    for (i, frame) in frames.iter().enumerate() {
+        if let Some(ref source) = frame.source {
+            if let Some(ref path) = source.path {
+                if seen_files.insert(path.clone()) {
+                    let p = std::path::PathBuf::from(path);
+                    lsp.touch_file(&p, crate::lsp::manager::TouchMode::Notify).await;
+
+                    let frame_loc = match source.name.as_deref() {
+                        Some(name) => format!("{name}:{}", frame.line),
+                        None => path.clone(),
+                    };
+
+                    out.push_str(&format!("Frame [{i}]: {frame_loc}\n"));
+
+                    let diags = all_diags.get(&p).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let error_diags: Vec<_> = diags.iter().filter(|d| {
+                        matches!(d.severity, Some(lsp_types::DiagnosticSeverity::ERROR))
+                    }).collect();
+
+                    if error_diags.is_empty() {
+                        out.push_str("  No error diagnostics in this file.\n");
+                    } else {
+                        for d in error_diags.iter().take(5) {
+                            let bp_line = d.range.start.line + 1;
+                            out.push_str(&format!(
+                                "  Error at line {bp_line}: {}\n",
+                                d.message
+                            ));
+                            out.push_str(&format!(
+                                "    → debug set_breakpoints file={path} line={bp_line}\n"
+                            ));
+                        }
+                    }
+
+                    // Show document symbols for context.
+                    let symbols = lsp.document_symbol(&p).await;
+                    if !symbols.is_empty() {
+                        let sym_json = serde_json::to_string_pretty(&symbols).unwrap_or_default();
+                        let capped = head_cap(sym_json, 2048, "document symbols");
+                        out.push_str(&format!("  Top-level symbols:\n{capped}\n"));
+                    }
+                    out.push('\n');
+                }
+            }
+        }
+    }
+
+    if frames.is_empty() {
+        out.push_str("(no stack frames available)\n");
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -598,6 +854,14 @@ mod tests {
         assert!(Action::parse("variables").is_some());
         assert!(Action::parse("terminate").is_some());
         assert!(Action::parse("sessions").is_some());
+
+        #[cfg(feature = "lsp")]
+        {
+            assert!(Action::parse("run_to_cursor").is_some());
+            assert!(Action::parse("restart_frame").is_some());
+            assert!(Action::parse("backtrace_diagnostics").is_some());
+            assert!(Action::parse("error_analysis").is_some());
+        }
     }
 
     #[test]
@@ -605,6 +869,15 @@ mod tests {
         assert!(Action::parse("disassemble").is_none());
         assert!(Action::parse("").is_none());
         assert!(Action::parse("unknown_action").is_none());
+
+        #[cfg(not(feature = "lsp"))]
+        {
+            // Bridge actions require the lsp feature.
+            assert!(Action::parse("run_to_cursor").is_none());
+            assert!(Action::parse("restart_frame").is_none());
+            assert!(Action::parse("backtrace_diagnostics").is_none());
+            assert!(Action::parse("error_analysis").is_none());
+        }
     }
 
     #[test]
@@ -674,6 +947,10 @@ mod tests {
             "variables",
             "terminate",
             "sessions",
+            "run_to_cursor",
+            "restart_frame",
+            "backtrace_diagnostics",
+            "error_analysis",
         ] {
             assert!(
                 actions.contains(expected),
