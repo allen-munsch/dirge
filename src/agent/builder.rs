@@ -1028,11 +1028,7 @@ pub async fn build_loop_tools(
     {
         #[cfg(feature = "lsp")]
         let debug_tool = if let Some(manager) = &lsp_manager {
-            tools::DebugTool::new_with_lsp(
-                permission.clone(),
-                ask_tx.clone(),
-                manager.clone(),
-            )
+            tools::DebugTool::new_with_lsp(permission.clone(), ask_tx.clone(), manager.clone())
         } else {
             tools::DebugTool::new(permission.clone(), ask_tx.clone())
         };
