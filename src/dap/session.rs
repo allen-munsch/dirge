@@ -9,7 +9,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::agent::agent_loop::tool::AbortSignal;
 use crate::agent::tools::ToolError;
@@ -107,7 +107,6 @@ async fn register_event_channels(client: &DapClient) -> EventReceivers {
 struct DapSession {
     id: String,
     client: DapClient,
-    adapter_name: String,
     status: SessionStatus,
     breakpoints: HashMap<PathBuf, Vec<BreakpointRecord>>,
     function_breakpoints: Vec<FunctionBreakpoint>,
@@ -121,19 +120,30 @@ struct DapSession {
     cached_frames: Vec<StackFrame>,
     /// Cached for TUI debug panel snapshots (last variables request).
     cached_variables: Vec<Variable>,
+    languages: Vec<String>,
 }
 
 impl DapSession {
     fn summary(&self) -> SessionSummary {
         SessionSummary {
             id: self.id.clone(),
-            adapter_name: self.adapter_name.clone(),
+            adapter_name: self.client.adapter_name.clone(),
             program: None,
             status: self.status.clone(),
             breakpoint_count: self.breakpoints.values().map(|v| v.len()).sum(),
             function_breakpoint_count: self.function_breakpoints.len(),
             stop_reason: None,
             thread_id: None,
+            output: String::new(),
+            output_truncated: false,
+            exit_code: None,
+            capabilities: self
+                .client
+                .capabilities
+                .try_lock()
+                .ok()
+                .and_then(|g| g.clone()),
+            languages: self.languages.clone(),
         }
     }
 
@@ -154,7 +164,7 @@ impl DapSession {
             self.status = SessionStatus::Terminated;
         }
         if let Ok(evt) = self.events.exited.try_recv() {
-            self.exit_code = Some(evt.exit_code);
+            self.exit_code = Some(evt.exit_code as u32);
         }
     }
 
@@ -198,6 +208,7 @@ impl DapSessionManager {
     ///
     /// Terminates any existing active session first.
     /// Returns a summary once the program is stopped (on entry or breakpoint).
+    #[allow(clippy::too_many_arguments)]
     pub async fn launch(
         &self,
         adapter_name: &str,
@@ -210,6 +221,7 @@ impl DapSessionManager {
         launch_extra: Option<serde_json::Value>,
         signal: &AbortSignal,
         timeout: Duration,
+        languages: Vec<String>,
     ) -> Result<SessionSummary, ToolError> {
         self.terminate_active().await;
 
@@ -222,10 +234,23 @@ impl DapSessionManager {
         .await
         .map_err(|e| ToolError::Msg(format!("failed to spawn adapter: {e}")))?;
 
-        self.launch_with_client(adapter_name, cwd, program, program_args, stop_on_entry, launch_extra, signal, client, timeout).await
+        self.launch_with_client(
+            adapter_name,
+            cwd,
+            program,
+            program_args,
+            stop_on_entry,
+            launch_extra,
+            signal,
+            client,
+            timeout,
+            languages,
+        )
+        .await
     }
 
     /// Core launch logic — used by both public launch and tests.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn launch_with_client(
         &self,
         adapter_name: &str,
@@ -237,48 +262,49 @@ impl DapSessionManager {
         _signal: &AbortSignal,
         client: DapClient,
         timeout: Duration,
+        languages: Vec<String>,
     ) -> Result<SessionSummary, ToolError> {
-
         // Register event handlers.
         let mut events = register_event_channels(&client).await;
 
         // Initialize handshake.
-        let mut init_args = InitializeArgs::default();
-        init_args.adapter_id = adapter_name.to_string();
+        let init_args = InitializeArgs {
+            adapter_id: adapter_name.to_string(),
+            ..Default::default()
+        };
 
         let caps: Capabilities = client
             .request("initialize", &init_args, timeout)
             .await
             .map_err(rpc_to_tool_error)?;
 
+        *client.capabilities.lock().await = Some(caps.clone());
+
         // Build launch arguments.
-        let mut launch_args = LaunchArgs::default();
-        launch_args.program = Some(program.to_string());
-        launch_args.cwd = Some(cwd.to_string());
-        launch_args.args = Some(program_args.to_vec());
-        launch_args.stop_on_entry = stop_on_entry;
+        let mut launch_args = LaunchArgs {
+            program: Some(program.to_string()),
+            cwd: Some(cwd.to_string()),
+            args: Some(program_args.to_vec()),
+            stop_on_entry,
+            ..Default::default()
+        };
 
         if let Some(extra) = launch_extra {
             launch_args.extra = extra;
         }
 
-        // Send launch request.
+        // Send launch request as fire-and-forget — some adapters (debugpy)
+        // won't respond to launch until configurationDone is received. We must
+        // send configurationDone immediately to avoid a deadlock.
         client
-            .request::<_, Value>("launch", &launch_args, timeout)
+            .notify("launch", &launch_args)
             .await
             .map_err(rpc_to_tool_error)?;
 
         // Send configurationDone if adapter supports it.
-        if caps
-            .supports_configuration_done_request
-            .unwrap_or(false)
-        {
+        if caps.supports_configuration_done_request.unwrap_or(false) {
             client
-                .request::<_, Value>(
-                    "configurationDone",
-                    &ConfigurationDoneArgs::default(),
-                    timeout,
-                )
+                .notify("configurationDone", &ConfigurationDoneArgs::default())
                 .await
                 .map_err(rpc_to_tool_error)?;
         }
@@ -299,7 +325,6 @@ impl DapSessionManager {
         let id = self.next_id();
         let mut session = DapSession {
             id: id.clone(),
-            adapter_name: adapter_name.to_string(),
             status: SessionStatus::Stopped,
             breakpoints: HashMap::new(),
             function_breakpoints: Vec::new(),
@@ -311,19 +336,20 @@ impl DapSessionManager {
             cached_threads: Vec::new(),
             cached_frames: Vec::new(),
             cached_variables: Vec::new(),
+            languages,
         };
         session.drain_output();
 
         let mut summary = session.summary();
-        summary.stop_reason = Some(stopped.reason.clone());
-        summary.thread_id = stopped.thread_id;
-
+        summary.stop_reason = Some(stopped.reason.as_str().to_string());
+        summary.thread_id = stopped.thread_id.map(|id| id as u32);
         *self.active.lock().await = Some(session);
 
         Ok(summary)
     }
 
     /// Attach to a running process.
+    #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         &self,
         adapter_name: &str,
@@ -332,8 +358,11 @@ impl DapSessionManager {
         cwd: &str,
         pid: Option<u32>,
         port: Option<u16>,
+        host: Option<String>,
+        attach_extra: Option<serde_json::Value>,
         _signal: &AbortSignal,
         timeout: Duration,
+        languages: Vec<String>,
     ) -> Result<SessionSummary, ToolError> {
         self.terminate_active().await;
 
@@ -348,33 +377,37 @@ impl DapSessionManager {
 
         let mut events = register_event_channels(&client).await;
 
-        let mut init_args = InitializeArgs::default();
-        init_args.adapter_id = adapter_name.to_string();
+        let init_args = InitializeArgs {
+            adapter_id: adapter_name.to_string(),
+            ..Default::default()
+        };
         let caps: Capabilities = client
             .request("initialize", &init_args, timeout)
             .await
             .map_err(rpc_to_tool_error)?;
 
-        let mut attach_args = AttachArgs::default();
-        attach_args.pid = pid;
-        attach_args.port = port;
-        attach_args.cwd = Some(cwd.to_string());
+        *client.capabilities.lock().await = Some(caps.clone());
+
+        let mut attach_args = AttachArgs {
+            pid,
+            port,
+            host,
+            cwd: Some(cwd.to_string()),
+            ..Default::default()
+        };
+
+        if let Some(extra) = attach_extra {
+            attach_args.extra = extra;
+        }
 
         client
             .request::<_, Value>("attach", &attach_args, timeout)
             .await
             .map_err(rpc_to_tool_error)?;
 
-        if caps
-            .supports_configuration_done_request
-            .unwrap_or(false)
-        {
+        if caps.supports_configuration_done_request.unwrap_or(false) {
             client
-                .request::<_, Value>(
-                    "configurationDone",
-                    &ConfigurationDoneArgs::default(),
-                    timeout,
-                )
+                .notify("configurationDone", &ConfigurationDoneArgs::default())
                 .await
                 .map_err(rpc_to_tool_error)?;
         }
@@ -388,7 +421,6 @@ impl DapSessionManager {
         let id = self.next_id();
         let mut session = DapSession {
             id: id.clone(),
-            adapter_name: adapter_name.to_string(),
             status: SessionStatus::Stopped,
             breakpoints: HashMap::new(),
             function_breakpoints: Vec::new(),
@@ -400,13 +432,14 @@ impl DapSessionManager {
             cached_threads: Vec::new(),
             cached_frames: Vec::new(),
             cached_variables: Vec::new(),
+            languages,
         };
         session.drain_output();
 
         let mut summary = session.summary();
         if let Some(stopped) = stopped {
-            summary.stop_reason = Some(stopped.reason);
-            summary.thread_id = stopped.thread_id;
+            summary.stop_reason = Some(stopped.reason.as_str().to_string());
+            summary.thread_id = stopped.thread_id.map(|id| id as u32);
         }
 
         *self.active.lock().await = Some(session);
@@ -507,25 +540,23 @@ impl DapSessionManager {
         session.status = SessionStatus::Running;
 
         // Wait for stopped or terminated.
-        let (stop_reason, stop_thread_id) = loop {
-            tokio::select! {
-                s = session.events.stopped.recv() => {
-                    if let Some(stopped) = s {
-                        session.status = SessionStatus::Stopped;
-                        break (Some(stopped.reason), stopped.thread_id);
-                    } else {
-                        return Err(ToolError::Msg("debug adapter disconnected".into()));
-                    }
+        let (stop_reason, stop_thread_id) = tokio::select! {
+            s = session.events.stopped.recv() => {
+                if let Some(stopped) = s {
+                    session.status = SessionStatus::Stopped;
+                    (Some(stopped.reason.as_str().to_string()), stopped.thread_id.map(|id| id as u32))
+                } else {
+                    return Err(ToolError::Msg("debug adapter disconnected".into()));
                 }
-                _ = session.events.terminated.recv() => {
-                    session.status = SessionStatus::Terminated;
-                    break (Some("terminated".into()), None);
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    return Err(ToolError::Msg(format!(
-                        "timed out after {timeout:?} waiting for stop after continue"
-                    )));
-                }
+            }
+            _ = session.events.terminated.recv() => {
+                session.status = SessionStatus::Terminated;
+                (Some("terminated".into()), None)
+            }
+            _ = tokio::time::sleep(timeout) => {
+                return Err(ToolError::Msg(format!(
+                    "timed out after {timeout:?} waiting for stop after continue"
+                )));
             }
         };
 
@@ -583,7 +614,28 @@ impl DapSessionManager {
             .as_mut()
             .ok_or_else(|| ToolError::Msg("no active debug session".into()))?;
 
-        let args = serde_json::json!({ "threadId": thread_id });
+        let args = match command {
+            "next" => serde_json::to_value(NextArgs {
+                thread_id,
+                single_thread: None,
+                granularity: None,
+            })
+            .unwrap(),
+            "stepIn" => serde_json::to_value(StepInArgs {
+                thread_id,
+                single_thread: None,
+                granularity: None,
+                target_id: None,
+            })
+            .unwrap(),
+            "stepOut" => serde_json::to_value(StepOutArgs {
+                thread_id,
+                single_thread: None,
+                granularity: None,
+            })
+            .unwrap(),
+            _ => return Err(ToolError::Msg(format!("unknown step command: {command}"))),
+        };
         session
             .client
             .request::<_, Value>(command, &args, timeout)
@@ -598,8 +650,8 @@ impl DapSessionManager {
         session.drain_termination();
 
         let mut summary = session.summary();
-        summary.stop_reason = Some(stopped.reason);
-        summary.thread_id = stopped.thread_id;
+        summary.stop_reason = Some(stopped.reason.as_str().to_string());
+        summary.thread_id = stopped.thread_id.map(|id| id as u32);
         Ok(summary)
     }
 
@@ -627,8 +679,8 @@ impl DapSessionManager {
         session.drain_termination();
 
         let mut summary = session.summary();
-        summary.stop_reason = Some(stopped.reason);
-        summary.thread_id = stopped.thread_id;
+        summary.stop_reason = Some(stopped.reason.as_str().to_string());
+        summary.thread_id = stopped.thread_id.map(|id| id as u32);
         Ok(summary)
     }
 
@@ -662,11 +714,7 @@ impl DapSessionManager {
     }
 
     /// Get scopes for a frame.
-    pub async fn scopes(
-        &self,
-        frame_id: u32,
-        timeout: Duration,
-    ) -> Result<Vec<Scope>, ToolError> {
+    pub async fn scopes(&self, frame_id: u32, timeout: Duration) -> Result<Vec<Scope>, ToolError> {
         let active = self.active.lock().await;
         let session = active
             .as_ref()
@@ -778,11 +826,7 @@ impl DapSessionManager {
     }
 
     /// Disconnect from the debug adapter.
-    pub async fn disconnect(
-        &self,
-        restart: bool,
-        timeout: Duration,
-    ) -> Result<(), ToolError> {
+    pub async fn disconnect(&self, restart: bool, timeout: Duration) -> Result<(), ToolError> {
         let mut active = self.active.lock().await;
         if let Some(session) = active.as_mut() {
             let args = DisconnectArgs {
@@ -803,11 +847,7 @@ impl DapSessionManager {
 
     /// Restart a stack frame — re-execute from the beginning of the frame.
     /// Useful for edit-and-continue workflows after modifying source code.
-    pub async fn restart_frame(
-        &self,
-        frame_id: u32,
-        timeout: Duration,
-    ) -> Result<(), ToolError> {
+    pub async fn restart_frame(&self, frame_id: u32, timeout: Duration) -> Result<(), ToolError> {
         let active = self.active.lock().await;
         let session = active
             .as_ref()
@@ -837,12 +877,17 @@ impl DapSessionManager {
         let active = self.active.try_lock().ok()?;
         let session = active.as_ref()?;
         Some(DebugPanelData {
+            adapter: session.client.adapter_name.clone(),
+            status: session.status.clone(),
             session_summary: Some(session.summary()),
             threads: session.cached_threads.clone(),
             frames: session.cached_frames.clone(),
             variables: session.cached_variables.clone(),
+            scopes: Vec::new(),
+            breakpoints: session.breakpoints.values().flatten().cloned().collect(),
             output: session.output.clone(),
             output_truncated: session.output_truncated,
+            exit_code: session.exit_code,
         })
     }
 
@@ -1040,11 +1085,7 @@ mod tests {
         let (rpc, _read_task) = DapRpc::new(client_reader, client_write);
 
         tokio::spawn(async move {
-            fake_launch_adapter(
-                tokio::io::BufReader::new(server_read),
-                server_write,
-            )
-            .await;
+            fake_launch_adapter(tokio::io::BufReader::new(server_read), server_write).await;
         });
 
         DapClient::from_rpc(rpc, "fake-adapter")
@@ -1068,6 +1109,7 @@ mod tests {
                 &signal,
                 client,
                 Duration::from_secs(5),
+                vec![],
             )
             .await
             .unwrap();
@@ -1128,6 +1170,7 @@ mod tests {
                 &signal,
                 client,
                 Duration::from_secs(5),
+                vec![],
             )
             .await
             .unwrap();
@@ -1157,6 +1200,7 @@ mod tests {
                 &signal,
                 client,
                 Duration::from_secs(5),
+                vec![],
             )
             .await
             .unwrap();
@@ -1170,5 +1214,67 @@ mod tests {
         // Manually clear to verify terminate_active works
         mgr.terminate_active().await;
         assert!(mgr.active_summary().await.is_none());
+    }
+
+    /// E2E: DapSessionManager::launch_with_client against real debugpy.
+    /// Reproduces dirge-go4b timeout bug.
+    #[tokio::test]
+    async fn e2e_debugpy_launch_with_client() {
+        if std::process::Command::new("python3")
+            .args(["-c", "import debugpy"])
+            .output()
+            .map_or(true, |o| !o.status.success())
+        {
+            eprintln!("SKIP: debugpy not installed");
+            return;
+        }
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tests")
+            .join("dap")
+            .join("fixtures")
+            .join("test_program.py");
+        assert!(fixture.exists(), "test_program.py must exist");
+
+        let client = DapClient::spawn_stdio(
+            "debugpy",
+            std::path::Path::new("python3"),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("debugpy adapter should spawn");
+
+        let mgr = DapSessionManager::new();
+        let signal = AbortSignal::new();
+
+        let summary = mgr
+            .launch_with_client(
+                "debugpy",
+                ".",
+                fixture.to_str().unwrap(),
+                &[],
+                Some(true),
+                None,
+                &signal,
+                client,
+                std::time::Duration::from_secs(15),
+                vec!["python".into()],
+            )
+            .await
+            .expect("launch_with_client should succeed");
+
+        assert_eq!(summary.status, SessionStatus::Stopped);
+        assert!(summary.stop_reason.is_some(), "should have stop reason");
+
+        // Terminate and disconnect.
+        mgr.terminate(std::time::Duration::from_secs(10))
+            .await
+            .expect("terminate should succeed");
+
+        mgr.disconnect(false, std::time::Duration::from_secs(10))
+            .await
+            .expect("disconnect should succeed");
     }
 } // mod tests
