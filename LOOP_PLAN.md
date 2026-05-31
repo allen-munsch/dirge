@@ -8,7 +8,9 @@
 - ✅ Phase 3: dirge-knk0 (debug tool), dirge-6gf8 (prompt — covered inline), dirge-1thn (first-pass scope)
 - ✅ Phase 4: dirge-vckb (docs), dirge-vlh6 (CI — feature gate verified, CI infrastructure TBD)
 - ✅ Phase 4: dirge-f9x1 (integration tests — mock adapter smoke + 13 new adapter-resolution tests)
-- ⬜ Phase 4: dirge-9h8r (smoke tests — blocked on adapters), dirge-x5hr (DAP↔LSP bridge), dirge-jjul (TUI panel)
+- ✅ Phase 4: dirge-x5hr (DAP↔LSP bridge — run_to_cursor, restart_frame, backtrace_diagnostics, error_analysis actions added to debug tool)
+- ✅ Phase 4: dirge-jjul (TUI debug panel — right sidebar with DEBUG/THREADS/FRAMES/VARIABLES/BREAKPOINTS/OUTPUT, gated on ≥100 cols, toggle via /panel debug)
+- ⬜ Phase 4: dirge-9h8r (smoke tests — blocked on adapters)
 
 Known issues:
 - Integration tests use a Python mock adapter. Real-adapter smoke (dirge-9h8r) still needs debugpy/lldb-dap/dlv on PATH.

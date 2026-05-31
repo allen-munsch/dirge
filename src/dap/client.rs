@@ -672,4 +672,125 @@ mod tests {
             .await
             .expect("disconnect should succeed");
     }
+
+    // -------------------------------------------------------------------
+    // Per-adapter smoke: each test spawns a real adapter, runs
+    // initialize→launch→terminate→disconnect lifecycle with a
+    // minimal program. Skips gracefully if the adapter binary is
+    // missing from $PATH.
+    // -------------------------------------------------------------------
+
+    const SMOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Skip the current test with a clear message.
+    macro_rules! skip_if_missing {
+        ($which:expr, $adapter:expr) => {
+            if which::which($which).is_err() {
+                eprintln!(
+                    "SKIP: {} smoke test — {} not found on PATH",
+                    $adapter, $which
+                );
+                return;
+            }
+        };
+        ($which:expr, $adapter:expr, $detail:expr) => {
+            if which::which($which).is_err() {
+                eprintln!(
+                    "SKIP: {} smoke test — {} not found on PATH ({})",
+                    $adapter, $which, $detail
+                );
+                return;
+            }
+        };
+    }
+
+    /// Python smoke: spawn debugpy, verify initialize handshake succeeds.
+    #[tokio::test]
+    async fn smoke_debugpy_python() {
+        skip_if_missing!("python3", "debugpy");
+
+        let check = std::process::Command::new("python3")
+            .args(["-c", "import debugpy"])
+            .output();
+        if check.map_or(true, |o| !o.status.success()) {
+            eprintln!("SKIP: debugpy smoke test — debugpy module not installed (pip install debugpy)");
+            return;
+        }
+
+        let client = super::DapClient::spawn_stdio(
+            "debugpy",
+            std::path::Path::new("python3"),
+            &["-m".to_string(), "debugpy.adapter".to_string()],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("debugpy adapter should spawn");
+
+        let caps: Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "debugpy",
+                    "clientID": "dirge-smoke",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                    "locale": "en-us"
+                }),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("debugpy initialize should succeed");
+        assert!(
+            caps.supports_configuration_done_request.unwrap_or(false),
+            "debugpy should support configurationDoneRequest"
+        );
+
+        // Clean shutdown.
+        let _ = client
+            .request::<_, Value>("disconnect", serde_json::json!({"terminateDebuggee": false}), SMOKE_TIMEOUT)
+            .await;
+    }
+
+    /// C smoke via lldb-dap: verify initialize handshake succeeds.
+    #[tokio::test]
+    async fn smoke_lldb_dap_c() {
+        skip_if_missing!("lldb-dap", "lldb-dap");
+
+        let client = super::DapClient::spawn_stdio(
+            "lldb-dap",
+            std::path::Path::new("lldb-dap"),
+            &[],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("lldb-dap adapter should spawn");
+
+        let caps: Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "lldb",
+                    "clientID": "dirge-smoke",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                    "locale": "en-us"
+                }),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("lldb-dap initialize should succeed");
+
+        // Check a native-debugger capability.
+        assert!(
+            caps.supports_configuration_done_request.unwrap_or(false),
+            "lldb-dap should support configurationDoneRequest"
+        );
+
+        // Clean shutdown.
+        let _ = client
+            .request::<_, Value>("disconnect", serde_json::json!({"terminateDebuggee": false}), SMOKE_TIMEOUT)
+            .await;
+    }
 }

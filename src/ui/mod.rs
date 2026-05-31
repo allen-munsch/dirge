@@ -463,6 +463,13 @@ pub async fn run_interactive(
         #[cfg(feature = "lsp")]
         lsp_manager.as_ref(),
     ));
+    #[cfg(feature = "dap")]
+    {
+        let debug_data = crate::dap::session::DAP_MANAGER
+            .get()
+            .and_then(|mgr| mgr.debug_snapshot());
+        renderer.set_debug_panel_data(debug_data);
+    }
 
     // ui-redesign: seed the left-panel [AGENT STATUS] card with the
     // current session's metadata so the idle state has a real
@@ -570,6 +577,13 @@ pub async fn run_interactive(
             #[cfg(feature = "lsp")]
             lsp_manager.as_ref(),
         ));
+        #[cfg(feature = "dap")]
+        {
+            let debug_data = crate::dap::session::DAP_MANAGER
+                .get()
+                .and_then(|mgr| mgr.debug_snapshot());
+            renderer.set_debug_panel_data(debug_data);
+        }
         // Refresh the left-panel vitals (context gauge, activity ticker,
         // git snapshot) alongside the right panel.
         {

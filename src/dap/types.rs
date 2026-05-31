@@ -346,6 +346,13 @@ pub struct TerminateArgs {
     pub restart: Option<bool>,
 }
 
+/// Arguments for `restartFrame` — re-execute the current stack frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartFrameArgs {
+    #[serde(rename = "frameId")]
+    pub frame_id: u32,
+}
+
 // ---------------------------------------------------------------------------
 // DAP model types
 // ---------------------------------------------------------------------------
@@ -850,6 +857,18 @@ pub struct SessionSummary {
     #[serde(rename = "threadId")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<u32>,
+}
+
+/// Snapshot of debug session state for the TUI panel. Built
+/// synchronously from cached session data — no async DAP calls.
+#[derive(Debug, Clone, Default)]
+pub struct DebugPanelData {
+    pub session_summary: Option<SessionSummary>,
+    pub threads: Vec<Thread>,
+    pub frames: Vec<StackFrame>,
+    pub variables: Vec<Variable>,
+    pub output: String,
+    pub output_truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
