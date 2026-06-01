@@ -22,6 +22,28 @@ system prompt:
 The independent reviewer is always a **`task` subagent that did not write the
 code** — your own re-read shares the blind spots you wrote with.
 
+## Install
+
+dirge auto-discovers plugins from two directories at startup. Copy this
+directory into one of them (it loads as a multi-file plugin — its `*.janet`
+files share one Janet env):
+
+```
+~/.config/dirge/plugins/backpressured/     # global — every project
+<project>/.dirge/plugins/backpressured/    # per-project — wins on collision
+```
+
+For example, from a checkout of the dirge repo:
+
+```bash
+cp -r plugins/backpressured ~/.config/dirge/plugins/
+```
+
+Requires building with the `plugin` feature (on by default). Confirm it
+loaded with `dirge --verbose` (prints `loading plugin: …/backpressured`) or
+by running `/backpressured-status`. The plugin stays dormant until you
+engage it (see Usage).
+
 ## Usage
 
 Engage it by mentioning **backpressure** in your prompt:
