@@ -580,8 +580,8 @@ mod tests {
         assert!(rdbg.file_types.contains(&".rb".to_string()));
         assert!(rdbg.languages.contains(&"ruby".to_string()));
 
-        // JS/TS → js-debug-adapter
-        let js_dap = &defaults["js-debug-adapter"];
+        // JS/TS → node-dap
+        let js_dap = &defaults["node-dap"];
         assert!(js_dap.file_types.contains(&".js".to_string()));
         assert!(js_dap.file_types.contains(&".ts".to_string()));
         assert!(js_dap.languages.contains(&"javascript".to_string()));
@@ -754,9 +754,6 @@ mod tests {
         assert_eq!(defaults["gdb"].connect_mode, ConnectMode::Stdio);
         assert_eq!(defaults["lldb-dap"].connect_mode, ConnectMode::Stdio);
         assert_eq!(defaults["rdbg"].connect_mode, ConnectMode::Stdio);
-        assert_eq!(
-            defaults["js-debug-adapter"].connect_mode,
-            ConnectMode::Stdio
-        );
+        assert_eq!(defaults["node-dap"].connect_mode, ConnectMode::Stdio);
     }
 }

@@ -53,7 +53,7 @@ Install the debug adapter for your language:
 | C/C++/Rust | gdb | `apt install gdb` (usually pre-installed) |
 | C/C++/Swift/Rust/Zig | lldb-dap | `apt install lldb` or Xcode CLT |
 | Go | dlv | `go install github.com/go-delve/delve/cmd/dlv@latest` |
-| JS/TS | js-debug-adapter | `npm install -g js-debug-adapter` |
+| JS/TS | node-dap | bundled in `tests/dap_node_adapter.js` (Node.js only) |
 | Ruby | rdbg | bundled with Ruby 3.1+ |
 
 ## The `/debug` slash command
@@ -214,7 +214,7 @@ debug stack_trace { thread_id: 1 }
 | `codelldb` | `codelldb --port 0` | C, C++, Rust, Zig | `.c`, `.cc`, `.cpp`, `.cxx`, `.rs`, `.zig` |
 | `debugpy` | `python -m debugpy.adapter` | Python | `.py` |
 | `dlv` | `dlv dap` | Go | `.go` |
-| `js-debug-adapter` | `js-debug-adapter` | JavaScript, TypeScript | `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs` |
+| `node-dap` | `node tests/dap_node_adapter.js` | JavaScript, TypeScript | `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs` |
 | `rdbg` | `rdbg --open --command --` | Ruby | `.rb`, `.rake`, `.gemspec` |
 | `elixir-ls-debugger` | `elixir-ls-debugger` | Elixir | `.ex`, `.exs`, `.heex`, `.eex` |
 | `jdtls-debug` | `jdtls` | Java | `.java` |
@@ -229,7 +229,7 @@ program's file extension:
 - `.py` -> `debugpy`
 - `.go` -> `dlv`
 - `.rs` -> `lldb-dap` (falls back to `gdb` if lldb-dap not found)
-- `.js`/`.ts` -> `js-debug-adapter`
+- `.js`/`.ts` -> `node-dap`
 - `.rb` -> `rdbg`
 - `.java` -> `jdtls-debug`
 - Extensionless binaries -> `lldb-dap` > `gdb` > `codelldb`

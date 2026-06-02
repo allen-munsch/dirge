@@ -1216,4 +1216,110 @@ mod tests {
             )
             .await;
     }
+
+    /// Launch JS fixture via bundled node DAP adapter: initialize, launch,
+    /// stop-on-entry, continue, terminate.
+    #[tokio::test]
+    async fn smoke_node_dap_js() {
+        skip_if_missing!("node", "node");
+
+        let adapter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("dap_node_adapter.js");
+        assert!(adapter.exists(), "dap_node_adapter.js must exist");
+
+        let client = super::DapClient::spawn_stdio(
+            "node-dap",
+            std::path::Path::new("node"),
+            &[adapter.to_string_lossy().to_string()],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("node dap adapter should spawn");
+
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .on_event(
+                "stopped",
+                Box::new(move |body: serde_json::Value| {
+                    let _ = evt_tx.send(body);
+                }),
+            )
+            .await;
+        client
+            .on_event("output", Box::new(|_: serde_json::Value| {}))
+            .await;
+
+        // 1. initialize
+        let caps: crate::dap::types::Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "node-dap",
+                    "clientID": "dirge-smoke",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                    "locale": "en-us"
+                }),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("initialize should succeed");
+        assert!(caps.supports_configuration_done_request.unwrap_or(false));
+
+        // 2. launch with stopOnEntry
+        client
+            .notify(
+                "launch",
+                &serde_json::json!({
+                    "program": "test_fixture.js",
+                    "stopOnEntry": true
+                }),
+            )
+            .await
+            .expect("launch notify should succeed");
+
+        // 3. configurationDone
+        client
+            .request::<_, serde_json::Value>(
+                "configurationDone",
+                serde_json::json!({}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("configurationDone should succeed");
+
+        // 4. Wait for stopped event (stopOnEntry)
+        let stopped = tokio::time::timeout(SMOKE_TIMEOUT, evt_rx.recv())
+            .await
+            .expect("timed out waiting for stopped event")
+            .expect("adapter disconnected before stopped event");
+
+        // 5. continue
+        client
+            .request::<_, serde_json::Value>(
+                "continue",
+                serde_json::json!({"threadId": stopped["threadId"]}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("continue should succeed");
+
+        // 6. terminate
+        client
+            .request::<_, serde_json::Value>("terminate", serde_json::json!({}), SMOKE_TIMEOUT)
+            .await
+            .expect("terminate should succeed");
+
+        // 7. disconnect
+        client
+            .request::<_, serde_json::Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": true}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("disconnect should succeed");
+    }
 }

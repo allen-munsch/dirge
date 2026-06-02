@@ -80,21 +80,21 @@
             "mode": "local"
         }
     },
-    "js-debug-adapter": {
-        "command": "js-debug-adapter",
-        "args": [],
+    "node-dap": {
+        "command": "node",
+        "args": ["tests/dap_node_adapter.js"],
         "languages": ["javascript", "typescript"],
         "file_types": [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"],
         "root_markers": ["package.json", "tsconfig.json", "jsconfig.json"],
         "connect_mode": "stdio",
         "launch_defaults": {
             "request": "launch",
-            "type": "pwa-node",
+            "type": "node",
             "stopOnEntry": true
         },
         "attach_defaults": {
             "request": "attach",
-            "type": "pwa-node"
+            "type": "node"
         }
     },
     "rdbg": {
