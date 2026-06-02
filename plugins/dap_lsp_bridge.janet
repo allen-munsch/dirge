@@ -1,28 +1,27 @@
-# dap_lsp_bridge.janet — shared DAP→LSP state cache
+# dap_lsp_bridge.janet — shared DAP↔LSP state cache
 #
-# Caches DAP session state and LSP diagnostic data in a shared Janet
-# table. Other plugins (dap_breakpoint_advisor, dap_crash_triage,
-# dap_profiler_crossref) read from this cache instead of making
-# redundant FFI calls.
+# Caches DAP session state in a shared Janet table. Other plugins
+# (dap_breakpoint_advisor, dap_crash_triage, dap_profiler_crossref)
+# read from this cache instead of making redundant FFI calls.
+#
+# This plugin is DAP-only — it does NOT call harness/lsp directly.
+# LSP-aware plugins that consume this cache must do their own
+# (harness/lsp?) guard. See project memory:
+#   "Always guard LSP-dependent plugin code with
+#    (when (dyn :lsp-available) ...)"
 #
 # Architecture:
 #   on-tool-end → if session active:
 #     (dap/sessions) → parse stop_reason, thread_id →
 #     cache in dap_lsp_cache table
-#   on-tool-end → if LSP handles exist:
-#     (harness/lsp diagnostics) on recently-touched files →
-#     cache diagnostic line:message pairs
 #
-# Provides two helpers for other plugins:
+# Provides:
 #   (dap-lsp/last-stop-reason)  → :entry | :breakpoint | :step | :exception
-#   (dap-lsp/diagnostics file)  → cached diagnostic string or nil
+#   (dap-lsp/last-thread-id)    → integer or 1
 
 (def hooks ["on-tool-end"])
 
 # ── shared cache ─────────────────────────────────────────────────────
-
-# Exported via Janet's dynamic binding machinery so other plugins
-# that load after this one can access these values.
 (dyn :dap-lsp-cache @{})
 
 # ── hook: refresh cache after every tool call ────────────────────────
@@ -51,7 +50,7 @@
 
       (put cache :stop-reason :unknown)))
 
-  # Cache thread ID (integer extraction from JSON)
+  # Cache thread ID
   (when s-str
     (def tid-start (string/find "\"thread_id\": " s-str))
     (when tid-start

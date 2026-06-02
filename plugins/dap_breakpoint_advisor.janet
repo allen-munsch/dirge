@@ -1,26 +1,20 @@
 # dap_breakpoint_advisor.janet — LSP-powered breakpoint suggestions
 #
 # Hooks on-prompt. When the user asks the model to debug a file and
-# mentions a file path, this plugin calls (harness/lsp diagnostics)
-# on the file, extracts lines with errors/warnings, and injects
-# "Suggested breakpoints: line X (ErrorType)" into the prompt.
+# mentions a file path, this plugin calls (harness/lsp-diagnostics file)
+# and injects "suggested breakpoint targets exist at error/warning lines"
+# into the prompt so the model doesn't need to scan for errors.
 #
-# Token savings: the model doesn't need to scan for errors or guess
-# breakpoint locations. It gets a pre-computed list threaded into
-# the prompt before the model even sees it.
+# Uses the typed LSP wrapper `harness/lsp-diagnostics` which takes a
+# single file-path argument and returns the diagnostic JSON from the
+# language server. Guarded by `(harness/lsp?)` — returns nil silently
+# when LSP is unavailable (not compiled, no server, disabled at runtime).
 #
 # Architecture:
 #   Plugin → on-prompt → parse file path from user input →
-#   (harness/lsp diagnostics <file>) → parse diagnostic lines →
-#   string-slide diagnostic text to extract line:message patterns →
-#   harness/inject-prompt-hint (prepends "Suggested breakpoints: ...")
-#
-# The `harness/inject-prompt-hint` call prepends to the prompt —
-# the model sees the suggestion inline in its context.
-#
-# Uses the LSP harness FFI bridge (src/lsp/harness.rs → LspWorker →
-# harness-lsp-worker → tokio channel → true LSP server) and the
-# existing plugin `harness/lsp` Janet function.
+#   (harness/lsp-diagnostics file) [guarded] →
+#   if diagnostics found → harness/request-prompt with hint →
+#   else nil (silent pass-through)
 
 (def hooks ["on-prompt"])
 
@@ -34,7 +28,6 @@
   found)
 
 (defn- find-file [prompt]
-  # Look for a file path in the prompt by extension
   (var file nil)
   (each ext [".py" ".rs" ".c" ".cpp" ".go" ".js" ".ts" ".rb" ".java"]
     (when (not file)
@@ -60,27 +53,25 @@
   (when (not file)
     (break nil))
 
-  # Call LSP diagnostics through the existing harness bridge.
-  # Format: (harness/lsp method params-json-string)
-  (def lsp-query "{ \"method\": \"textDocument/diagnostic\", \"textDocument\": { \"uri\": \""
-                  file "\" } }")
-  (def diagnostics (harness/lsp lsp-query))
+  # Guard: only call LSP if the bridge is live AND wired to a real
+  # language server. Without this guard the C function segfaults
+  # because it reads from Janet's argv expecting 5 separate args
+  # and our call path doesn't match.
+  (when (not (harness/lsp?))
+    (break nil))
+
+  (def diagnostics (harness/lsp-diagnostics file))
   (when (not diagnostics)
     (break nil))
 
-  # LSP diagnostics return JSON. Janet has no JSON parser, so we
-  # do string matching to extract line:message pairs.
-  # Typical diag: "line":42,"message":"cannot find value..."
-  # For now we just note that diagnostics exist — a future version
-  # can do structured extraction.
-
-  (when (string/find "error" diagnostics)
+  # LSP diagnostics return JSON. Check for error/warning presence
+  # via string matching (Janet has no JSON decoder).
+  (when (or (string/find "error" diagnostics)
+            (string/find "warning" diagnostics))
     (harness/notify
       (string "LSP diagnostics found for " file
-              " — suggested breakpoint targets exist. Use /dap-repl or"
-              " the debug tool to set breakpoints at error locations.")
+              " — suggested breakpoint targets exist")
       :info)
-    # Inject a hint into the prompt the model will process
     (harness/request-prompt
       (string prompt "\n\n[HINT: " file
               " has LSP diagnostics with potential breakpoint targets."
