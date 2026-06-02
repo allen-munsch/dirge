@@ -1082,7 +1082,13 @@ mod tests {
             .expect("timed out waiting for stopped event")
             .expect("adapter disconnected before stopped event");
 
-        // 5. continue — let the program run to completion
+        // 5. continue — native programs exit fast, so listen for the
+        // terminated event and skip the explicit terminate request
+        // (lldb-dap disconnects when the debuggee exits).
+        client
+            .on_event("terminated", Box::new(|_: serde_json::Value| {}))
+            .await;
+
         client
             .request::<_, serde_json::Value>(
                 "continue",
@@ -1092,21 +1098,14 @@ mod tests {
             .await
             .expect("continue should succeed");
 
-        // 6. terminate
-        client
-            .request::<_, serde_json::Value>("terminate", serde_json::json!({}), SMOKE_TIMEOUT)
-            .await
-            .expect("terminate should succeed");
-
-        // 7. disconnect
-        client
-            .request::<_, serde_json::Value>(
+        // 6. disconnect — debuggee already terminated
+        let _ = client
+            .request::<_, Value>(
                 "disconnect",
-                serde_json::json!({"terminateDebuggee": true}),
+                serde_json::json!({"terminateDebuggee": false}),
                 SMOKE_TIMEOUT,
             )
-            .await
-            .expect("disconnect should succeed");
+            .await;
     }
 
     /// Launch Rust fixture via lldb-dap: initialize, launch, stop-on-entry,
@@ -1147,6 +1146,9 @@ mod tests {
             .await;
         client
             .on_event("output", Box::new(|_: serde_json::Value| {}))
+            .await;
+        client
+            .on_event("terminated", Box::new(|_: serde_json::Value| {}))
             .await;
 
         // 1. initialize
@@ -1195,7 +1197,7 @@ mod tests {
             .expect("timed out waiting for stopped event")
             .expect("adapter disconnected before stopped event");
 
-        // 5. continue — let the program run to completion
+        // 5. continue — native programs exit fast
         client
             .request::<_, serde_json::Value>(
                 "continue",
@@ -1205,20 +1207,13 @@ mod tests {
             .await
             .expect("continue should succeed");
 
-        // 6. terminate
-        client
-            .request::<_, serde_json::Value>("terminate", serde_json::json!({}), SMOKE_TIMEOUT)
-            .await
-            .expect("terminate should succeed");
-
-        // 7. disconnect
-        client
-            .request::<_, serde_json::Value>(
+        // 6. disconnect — debuggee already terminated
+        let _ = client
+            .request::<_, Value>(
                 "disconnect",
-                serde_json::json!({"terminateDebuggee": true}),
+                serde_json::json!({"terminateDebuggee": false}),
                 SMOKE_TIMEOUT,
             )
-            .await
-            .expect("disconnect should succeed");
+            .await;
     }
 }

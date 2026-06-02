@@ -644,9 +644,7 @@ async fn handle_dap_command(cmd: DapCommand) {
             }
         }
         DapCommand::Attach {
-            pid,
-            ref adapter,
-            ..
+            pid, ref adapter, ..
         } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
@@ -675,7 +673,9 @@ async fn handle_dap_command(cmd: DapCommand) {
                     .await
                     .map(|s| serde_json::to_string_pretty(&s).unwrap_or_else(|_| format!("{s:?}")))
                 }
-                None => Err(ToolError::Msg("no debug adapter available for attach".to_string())),
+                None => Err(ToolError::Msg(
+                    "no debug adapter available for attach".to_string(),
+                )),
             }
         }
         DapCommand::StepOver { .. } => mgr
