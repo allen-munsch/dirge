@@ -1035,9 +1035,10 @@ fn worker_loop(
     #[cfg(feature = "dap")]
     {
         // Note: the DAP bridge is already spawned by spawn_dap_responder()
-        // in main.rs (from a tokio runtime). We just take the pre-stored
-        // sender — calling spawn_dap_bridge() here would panic because
-        // the Janet worker is a std::thread with no tokio runtime.
+        // in main.rs (from a tokio runtime). In test context there is no
+        // main.rs, so the bridge was never spawned and take_dap_tx_for_worker
+        // returns None. In that case we skip the Janet prelude and bridge
+        // install — plugins will see (dap/available?) == false.
         // Run Janet init that binds dap/ C fns.
         // Must run AFTER harness-sandbox so overridden fns that touch
         // DAP internals can't be shadowed.
@@ -1049,9 +1050,9 @@ fn worker_loop(
         // reach the tokio worker. Must happen here, inside the worker,
         // because `store_dap_tx` already primed the channel from the
         // plugin-manager side.
-        crate::dap::janet_bindings::install_dap_tx(
-            crate::dap::janet_bindings::take_dap_tx_for_worker(),
-        );
+        if let Some(dap_tx) = crate::dap::janet_bindings::take_dap_tx_for_worker() {
+            crate::dap::janet_bindings::install_dap_tx(dap_tx);
+        }
     }
 
     let _ = init_tx.send(Ok(()));

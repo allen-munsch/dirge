@@ -113,13 +113,14 @@ pub fn store_dap_tx(tx: tmpsc::UnboundedSender<DapCommand>) {
 }
 
 /// Called by the worker thread during init. Takes ownership of the
-/// pre-stored sender.
-pub fn take_dap_tx_for_worker() -> tmpsc::UnboundedSender<DapCommand> {
+/// pre-stored sender. Returns None when no bridge was spawned (test
+/// context or non-plugin builds) — in that case the worker skips
+/// DAP Janet init and plugins that call (dap/available?) get false.
+pub fn take_dap_tx_for_worker() -> Option<tmpsc::UnboundedSender<DapCommand>> {
     PENDING_DAP_TX
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
-        .expect("DAP bridge sender must be stored before worker starts")
 }
 
 /// Install the command sender on this thread. Must be called once before
