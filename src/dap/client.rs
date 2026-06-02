@@ -995,4 +995,230 @@ mod tests {
             .await
             .expect("disconnect should succeed");
     }
+
+    /// Launch C fixture via lldb-dap: initialize, launch, stop-on-entry,
+    /// continue, terminate.
+    #[tokio::test]
+    async fn smoke_lldb_dap_launch_c() {
+        skip_if_missing!("lldb-dap", "lldb-dap");
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tests")
+            .join("dap")
+            .join("fixtures")
+            .join("test_program_c");
+        assert!(
+            fixture.exists(),
+            "test_program_c must exist at {} — compile with: gcc -g src/tests/dap/fixtures/test_program.c -o src/tests/dap/fixtures/test_program_c",
+            fixture.display()
+        );
+
+        let client = super::DapClient::spawn_stdio(
+            "lldb-dap",
+            std::path::Path::new("lldb-dap"),
+            &[],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("lldb-dap adapter should spawn");
+
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .on_event(
+                "stopped",
+                Box::new(move |body: serde_json::Value| {
+                    let _ = evt_tx.send(body);
+                }),
+            )
+            .await;
+        client
+            .on_event("output", Box::new(|_: serde_json::Value| {}))
+            .await;
+
+        // 1. initialize
+        let caps: crate::dap::types::Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "lldb",
+                    "clientID": "dirge-smoke",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                    "locale": "en-us"
+                }),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("initialize should succeed");
+        assert!(caps.supports_configuration_done_request.unwrap_or(false));
+
+        // 2. launch with stopOnEntry
+        client
+            .notify(
+                "launch",
+                &serde_json::json!({
+                    "program": fixture.to_string_lossy(),
+                    "stopOnEntry": true
+                }),
+            )
+            .await
+            .expect("launch notify should succeed");
+
+        // 3. configurationDone
+        client
+            .request::<_, serde_json::Value>(
+                "configurationDone",
+                serde_json::json!({}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("configurationDone should succeed");
+
+        // 4. Wait for stopped event (stopOnEntry)
+        let stopped = tokio::time::timeout(SMOKE_TIMEOUT, evt_rx.recv())
+            .await
+            .expect("timed out waiting for stopped event")
+            .expect("adapter disconnected before stopped event");
+
+        // 5. continue — let the program run to completion
+        client
+            .request::<_, serde_json::Value>(
+                "continue",
+                serde_json::json!({"threadId": stopped["threadId"]}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("continue should succeed");
+
+        // 6. terminate
+        client
+            .request::<_, serde_json::Value>("terminate", serde_json::json!({}), SMOKE_TIMEOUT)
+            .await
+            .expect("terminate should succeed");
+
+        // 7. disconnect
+        client
+            .request::<_, serde_json::Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": true}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("disconnect should succeed");
+    }
+
+    /// Launch Rust fixture via lldb-dap: initialize, launch, stop-on-entry,
+    /// continue, terminate.
+    #[tokio::test]
+    async fn smoke_lldb_dap_launch_rs() {
+        skip_if_missing!("lldb-dap", "lldb-dap");
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tests")
+            .join("dap")
+            .join("fixtures")
+            .join("test_program_rs");
+        assert!(
+            fixture.exists(),
+            "test_program_rs must exist at {} — compile with: rustc -g src/tests/dap/fixtures/test_program.rs -o src/tests/dap/fixtures/test_program_rs",
+            fixture.display()
+        );
+
+        let client = super::DapClient::spawn_stdio(
+            "lldb-dap",
+            std::path::Path::new("lldb-dap"),
+            &[],
+            std::path::Path::new("."),
+        )
+        .await
+        .expect("lldb-dap adapter should spawn");
+
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        client
+            .on_event(
+                "stopped",
+                Box::new(move |body: serde_json::Value| {
+                    let _ = evt_tx.send(body);
+                }),
+            )
+            .await;
+        client
+            .on_event("output", Box::new(|_: serde_json::Value| {}))
+            .await;
+
+        // 1. initialize
+        let caps: crate::dap::types::Capabilities = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "adapterID": "lldb",
+                    "clientID": "dirge-smoke",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                    "locale": "en-us"
+                }),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("initialize should succeed");
+        assert!(caps.supports_configuration_done_request.unwrap_or(false));
+
+        // 2. launch with stopOnEntry
+        client
+            .notify(
+                "launch",
+                &serde_json::json!({
+                    "program": fixture.to_string_lossy(),
+                    "stopOnEntry": true
+                }),
+            )
+            .await
+            .expect("launch notify should succeed");
+
+        // 3. configurationDone
+        client
+            .request::<_, serde_json::Value>(
+                "configurationDone",
+                serde_json::json!({}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("configurationDone should succeed");
+
+        // 4. Wait for stopped event (stopOnEntry)
+        let stopped = tokio::time::timeout(SMOKE_TIMEOUT, evt_rx.recv())
+            .await
+            .expect("timed out waiting for stopped event")
+            .expect("adapter disconnected before stopped event");
+
+        // 5. continue — let the program run to completion
+        client
+            .request::<_, serde_json::Value>(
+                "continue",
+                serde_json::json!({"threadId": stopped["threadId"]}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("continue should succeed");
+
+        // 6. terminate
+        client
+            .request::<_, serde_json::Value>("terminate", serde_json::json!({}), SMOKE_TIMEOUT)
+            .await
+            .expect("terminate should succeed");
+
+        // 7. disconnect
+        client
+            .request::<_, serde_json::Value>(
+                "disconnect",
+                serde_json::json!({"terminateDebuggee": true}),
+                SMOKE_TIMEOUT,
+            )
+            .await
+            .expect("disconnect should succeed");
+    }
 }
