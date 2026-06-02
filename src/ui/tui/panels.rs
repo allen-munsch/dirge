@@ -47,6 +47,7 @@ impl<'a> SubPanel<'a> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn border_style(mut self, style: Style) -> Self {
         self.border_style = style;
         self
