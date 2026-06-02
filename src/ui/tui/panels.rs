@@ -445,6 +445,7 @@ impl<'a> RightPanel<'a> {
     /// main chat frame's color (the theme header tone). Default is
     /// green to match the phosphor preset. Body text keeps its own
     /// semantic colors (amber SYSTEM data, dim placeholders).
+    #[allow(dead_code)]
     pub fn border_style(mut self, style: Style) -> Self {
         self.style = style;
         self
