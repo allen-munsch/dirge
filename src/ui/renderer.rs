@@ -961,10 +961,17 @@ impl Renderer {
     }
 
     /// Update the DAP debug panel snapshot. Called each UI tick
-    /// when the DAP feature is enabled.
+    /// when the DAP feature is enabled. When a debug session becomes
+    /// active (data transitions from None to Some), auto-switches
+    /// the right panel to Debug mode so the user sees the session
+    /// state without needing /panel debug or /debug panel.
     #[cfg(feature = "dap")]
     pub fn set_debug_panel_data(&mut self, data: Option<crate::dap::types::DebugPanelData>) {
+        let was_active = self.debug_panel_data.is_some();
         self.debug_panel_data = data;
+        if !was_active && self.debug_panel_data.is_some() {
+            self.right_panel_mode = PanelMode::Debug;
+        }
     }
 
     /// ui-redesign Phase 6: set the alert overlay. While `Some`, the
