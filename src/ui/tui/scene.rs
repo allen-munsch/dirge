@@ -108,6 +108,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
 
     // Right panel — stacked sub-panels. Skip on narrow terminals.
     if scene.show_right_panel && layout.right_panel.width >= 16 {
+        #[allow(unused_variables)]
         let is_debug = scene.right_panel_mode == PanelMode::Debug;
         #[cfg(feature = "dap")]
         if is_debug {
