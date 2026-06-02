@@ -235,10 +235,11 @@ async fn dispatch(inner: &Arc<Inner>, msg: Value) {
 /// sends SIGKILL to the adapter's entire process group, not just the
 /// direct child. Mirrors [`crate::agent::tools::bash::PgKillGuard`].
 ///
-/// On Unix, `process_group(0)` puts the adapter in its own process
-/// group. `kill_on_drop(true)` only reaps the direct child; this guard
-/// ensures the adapter's descendants (the debuggee and its children)
-/// are also terminated.
+/// On Unix, `setsid()` in `spawn_stdio` isolates the adapter in its
+/// own session with no controlling terminal. The adapter's PGID equals
+/// its PID. `kill_on_drop(true)` only reaps the direct child; this guard
+/// sends SIGKILL to `-pgid`, which kills the adapter and its descendants
+/// (the debuggee and its children).
 #[cfg(unix)]
 struct DapProcessGuard {
     pgid: u32,

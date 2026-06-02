@@ -96,10 +96,7 @@ async fn print_usage(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 }
 
 fn get_manager() -> Option<std::sync::Arc<DapSessionManager>> {
-    DAP_MANAGER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    DAP_MANAGER.lock().ok().and_then(|g| g.clone())
 }
 
 // ── launch ──────────────────────────────────────────────────────────
@@ -193,7 +190,11 @@ async fn cmd_launch(ctx: &mut SlashCtx<'_>, args: &[&str]) -> anyhow::Result<()>
         {
             Ok(_) => {} // session stored in DAP_MANAGER, visible in debug panel
             Err(e) => {
-                tracing::error!(%e, "background /debug launch failed");
+                let msg = format!("/debug launch failed: {e}");
+                tracing::error!("{msg}");
+                crate::ui::notifications::notify_send(
+                    crate::ui::notifications::Notification::Error(msg),
+                );
             }
         }
     });
@@ -286,7 +287,11 @@ async fn cmd_attach(ctx: &mut SlashCtx<'_>, args: &[&str]) -> anyhow::Result<()>
         {
             Ok(_) => {}
             Err(e) => {
-                tracing::error!(%e, "background /debug attach failed");
+                let msg = format!("/debug attach failed: {e}");
+                tracing::error!("{msg}");
+                crate::ui::notifications::notify_send(
+                    crate::ui::notifications::Notification::Error(msg),
+                );
             }
         }
     });
@@ -552,9 +557,12 @@ async fn print_stop(
 }
 
 /// Parse a flag value like `--adapter debugpy` from a positional args slice.
+/// Returns `None` if the flag isn't found or if the "value" looks like another
+/// flag (starts with `--`), guarding against `--adapter --other-flag` being
+/// silently interpreted as adapter `--other-flag`.
 fn parse_flag<'a>(args: &[&'a str], flag: &str) -> Option<&'a str> {
     for i in 0..args.len().saturating_sub(1) {
-        if args[i] == flag {
+        if args[i] == flag && !args[i + 1].starts_with("--") {
             return Some(args[i + 1]);
         }
     }

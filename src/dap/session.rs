@@ -250,6 +250,10 @@ impl DapSessionManager {
     }
 
     /// Core launch logic — used by both public launch and tests.
+    ///
+    /// `_signal` is reserved for future cancellation integration — when wired,
+    /// a `tokio::select!` on `signal.received()` will abort the initial-stop
+    /// wait so a user can cancel a hung launch.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn launch_with_client(
         &self,
@@ -296,6 +300,12 @@ impl DapSessionManager {
         // Send launch request as fire-and-forget — some adapters (debugpy)
         // won't respond to launch until configurationDone is received. We must
         // send configurationDone immediately to avoid a deadlock.
+        //
+        // Tradeoff: launch errors (bad program path, permissions) from adapters
+        // that don't reply to launch-notify surface only as a stopped-event
+        // timeout rather than a direct failure response. This is a protocol
+        // limitation — the adapter won't respond to launch until we signal
+        // configurationDone, and by then the launch is already in flight.
         client
             .notify("launch", &launch_args)
             .await
@@ -349,6 +359,8 @@ impl DapSessionManager {
     }
 
     /// Attach to a running process.
+    ///
+    /// `_signal` is reserved for future cancellation integration.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         &self,
@@ -490,6 +502,7 @@ impl DapSessionManager {
     }
 
     /// Set function breakpoints.
+    #[allow(dead_code)] // reserved for future agent tool action
     pub async fn set_function_breakpoints(
         &self,
         breakpoints: Vec<FunctionBreakpoint>,

@@ -22,7 +22,7 @@ use crate::agent::tools::{
 };
 use crate::dap::config::{self, ConnectMode, ResolvedAdapter};
 use crate::dap::session::{DAP_MANAGER, DapSessionManager};
-use crate::dap::types::{FunctionBreakpoint, SourceBreakpoint};
+use crate::dap::types::SourceBreakpoint;
 
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
@@ -118,9 +118,6 @@ pub struct DebugArgs {
     pub file: Option<String>,
     #[serde(default)]
     pub line: Option<u32>,
-    // DEAD CODE: function breakpoints not yet exposed as a debug-tool action.
-    #[serde(default)]
-    pub function: Option<String>,
     #[serde(default)]
     pub condition: Option<String>,
     #[serde(default)]
@@ -167,7 +164,6 @@ enum Action {
     Variables,
     Terminate,
     Sessions,
-    FunctionBreakpoints,
     #[cfg(feature = "lsp")]
     RunToCursor,
     #[cfg(feature = "lsp")]
@@ -197,7 +193,6 @@ impl Action {
             "variables" => Some(Action::Variables),
             "terminate" => Some(Action::Terminate),
             "sessions" => Some(Action::Sessions),
-            "function_breakpoints" | "function_breakpoint" => Some(Action::FunctionBreakpoints),
             #[cfg(feature = "lsp")]
             "run_to_cursor" => Some(Action::RunToCursor),
             #[cfg(feature = "lsp")]
@@ -288,7 +283,6 @@ impl Tool for DebugTool {
                     "cwd": { "type": "string", "description": "Working directory for the debug session" },
                     "file": { "type": "string", "description": "Source file path (set_breakpoints, remove_breakpoints)" },
                     "line": { "type": "integer", "description": "Line number (set_breakpoints)" },
-                    "function": { "type": "string", "description": "Function name (set_breakpoints function breakpoint)" },
                     "condition": { "type": "string", "description": "Conditional breakpoint expression" },
                     "expression": { "type": "string", "description": "Expression to evaluate" },
                     "frame_id": { "type": "integer", "description": "Stack frame ID (scopes, evaluate)" },
@@ -543,27 +537,6 @@ impl Tool for DebugTool {
                     Some(s) => Ok(format_sessions(&s)),
                     None => Ok("No active debug session.".into()),
                 }
-            }
-
-            Action::FunctionBreakpoints => {
-                let function_name = required_nonblank(
-                    args.function.as_deref(),
-                    "function",
-                    "function_breakpoints",
-                )?;
-                let fb = FunctionBreakpoint {
-                    name: function_name.to_string(),
-                    condition: args.condition,
-                    ..Default::default()
-                };
-
-                let results = mgr.set_function_breakpoints(vec![fb], timeout).await?;
-
-                Ok(format!(
-                    "Function breakpoint set on {} ({} breakpoints in adapter)",
-                    function_name,
-                    results.len()
-                ))
             }
 
             #[cfg(feature = "lsp")]

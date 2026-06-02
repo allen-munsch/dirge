@@ -87,11 +87,10 @@ def next_seq():
 stopped_thread_id = 1
 frame_id_counter = 1000
 variable_ref_counter = 2000
-breakpoints_set = False
 
 
 def main():
-    global breakpoints_set, frame_id_counter, variable_ref_counter
+    global frame_id_counter, variable_ref_counter
 
     log("mock DAP adapter starting")
 
@@ -128,7 +127,6 @@ def main():
     msg = read_frame()
     assert msg["command"] == "setBreakpoints", f"expected setBreakpoints, got {msg}"
     bps = msg.get("arguments", {}).get("breakpoints", [])
-    breakpoints_set = len(bps) > 0
     send_response(
         msg["seq"],
         "setBreakpoints",

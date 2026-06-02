@@ -197,6 +197,7 @@ pub struct SetBreakpointsArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // reserved for future agent tool action
 pub struct SetFunctionBreakpointsArgs {
     pub breakpoints: Vec<FunctionBreakpoint>,
 }
