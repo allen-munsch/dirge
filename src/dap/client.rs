@@ -231,11 +231,36 @@ async fn dispatch(inner: &Arc<Inner>, msg: Value) {
 // DAP client — wraps DapRpc with process lifecycle
 // ---------------------------------------------------------------------------
 
+/// Process-group cleanup guard. When the DapClient is dropped, this
+/// sends SIGKILL to the adapter's entire process group, not just the
+/// direct child. Mirrors [`crate::agent::tools::bash::PgKillGuard`].
+///
+/// On Unix, `process_group(0)` puts the adapter in its own process
+/// group. `kill_on_drop(true)` only reaps the direct child; this guard
+/// ensures the adapter's descendants (the debuggee and its children)
+/// are also terminated.
+#[cfg(unix)]
+struct DapProcessGuard {
+    pgid: u32,
+}
+
+#[cfg(unix)]
+impl Drop for DapProcessGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::kill(-(self.pgid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+}
+
 /// Handle to a running debug adapter process.
 pub struct DapClient {
     /// Held so `kill_on_drop` works when the client goes out of scope.
     /// `None` only in tests (where RPC runs over duplex channels).
     _child: Option<tokio::process::Child>,
+    /// Process-group cleanup guard. Not armed in tests.
+    #[cfg(unix)]
+    _pg_guard: Option<DapProcessGuard>,
     pub(crate) rpc: DapRpc,
     /// Task draining adapter stderr to tracing.
     _stderr_task: JoinHandle<()>,
@@ -260,7 +285,32 @@ impl DapClient {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
+        // Isolate the adapter in its own session so it has no
+        // controlling terminal. process_group(0) alone only creates
+        // a new process group — the adapter still shares dirge's
+        // session and can call tcsetpgrp() to steal the foreground,
+        // which stops dirge with SIGTTOU and corrupts the TUI.
+        //
+        // setsid() creates a new session with no controlling terminal.
+        // /dev/tty opens fail with ENXIO; tcsetpgrp() fails; the
+        // adapter cannot interfere with dirge's terminal at all.
+        // It also creates a new process group (PGID = PID), so
+        // the DapProcessGuard kill(-pgid, SIGKILL) still works.
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
         let mut child = cmd.spawn()?;
+
+        #[cfg(unix)]
+        let pg_guard = child.id().map(|pid| DapProcessGuard { pgid: pid });
 
         let stdin = child
             .stdin
@@ -295,6 +345,8 @@ impl DapClient {
 
         Ok(Self {
             _child: Some(child),
+            #[cfg(unix)]
+            _pg_guard: pg_guard,
             rpc,
             _stderr_task: stderr_task,
             capabilities: Mutex::new(None),
@@ -335,6 +387,8 @@ impl DapClient {
     pub(crate) fn from_rpc(rpc: DapRpc, adapter_name: &str) -> Self {
         Self {
             _child: None,
+            #[cfg(unix)]
+            _pg_guard: None,
             rpc,
             _stderr_task: tokio::spawn(std::future::ready(())),
             capabilities: Mutex::new(None),

@@ -1,8 +1,8 @@
 # DAP — Debug Adapter Protocol
 
 When built with the `dap` feature (opt-in), dirge attaches Debug Adapter Protocol
-clients to your programs and provides a `debug` agent tool for launch, attach,
-breakpoints, stepping, expression evaluation, and stack/variable inspection.
+clients to your programs. Two interfaces are available: the `debug` agent tool
+(the model drives it) and the `/debug` slash command (you drive it from the TUI).
 
 Enable it in `Cargo.toml` or at build time:
 
@@ -10,10 +10,108 @@ Enable it in `Cargo.toml` or at build time:
 cargo build --features dap
 ```
 
-## The `debug` tool
+## Quick start
 
-The agent gets one `debug` tool with 20 actions. Each action maps to standard
-DAP requests — the agent selects the right action for the job.
+```
+# 1. Start a conversation (initializes the debug session manager)
+> hello
+
+# 2. Launch a Python program
+/debug launch src/tests/dap/fixtures/test_program.py
+
+# 3. The right panel automatically switches to debug view (adapter, thread, stop reason)
+# 4. Step through code
+/debug step
+/debug step_in
+/debug evaluate "counter.value"
+
+# 5. Continue to the next breakpoint
+/debug continue
+
+# 6. End the session
+/debug terminate
+```
+
+## Prerequisites
+
+Install the debug adapter for your language:
+
+| Language | Adapter | Install |
+|----------|---------|---------|
+| Python | debugpy | `pip install debugpy` |
+| C/C++/Rust | gdb | `apt install gdb` (usually pre-installed) |
+| C/C++/Swift/Rust/Zig | lldb-dap | `apt install lldb` or Xcode CLT |
+| Go | dlv | `go install github.com/go-delve/delve/cmd/dlv@latest` |
+| JS/TS | js-debug-adapter | `npm install -g js-debug-adapter` |
+| Ruby | rdbg | bundled with Ruby 3.1+ |
+
+## The `/debug` slash command
+
+You control the debugger directly from the TUI. All subcommands are
+tab-completable after `/debug `.
+
+### Lifecycle
+
+| Subcommand | What it does |
+|------------|-------------|
+| `/debug launch <file> [--adapter <name>]` | Start debugging a program. Adapter is auto-detected from extension. Stops on entry. |
+| `/debug attach <pid> [--adapter <name>]` | Attach to a running process |
+| `/debug terminate` | End the debug session |
+
+### Execution control
+
+| Subcommand | What it does |
+|------------|-------------|
+| `/debug continue` | Resume execution until next breakpoint or exit |
+| `/debug step` | Step over current line (next) |
+| `/debug step_in` | Step into function call |
+| `/debug step_out` | Step out of current function |
+
+### Inspection
+
+| Subcommand | What it does |
+|------------|-------------|
+| `/debug sessions` | Show active session status, stop reason, thread ID |
+| `/debug evaluate <expression>` | Evaluate an expression in the debuggee |
+| `/debug bp <file> <line>` | Set a breakpoint |
+
+### UI
+
+| Subcommand | What it does |
+|------------|-------------|
+| `/debug panel` | Show the debug panel on the right (or use `/panel debug`) |
+
+### Help
+
+Type `/debug` with no subcommand to see the full usage summary.
+
+### Breakpoints: two approaches
+
+**Method 1 — `/debug bp` (DAP breakpoints, no file editing):**
+
+```
+/debug launch src/tests/dap/fixtures/test_program.py
+/debug bp src/tests/dap/fixtures/test_program.py 99
+/debug bp src/tests/dap/fixtures/test_program.py 107
+/debug continue          → stops at line 99
+/debug evaluate "number" → 42
+/debug continue          → stops at line 107
+/debug evaluate "doubled[:3]" → [2, 4, 6]
+```
+
+**Method 2 — `breakpoint()` in source:**
+
+Add `breakpoint()` calls to your Python file. When the program hits them,
+debugpy intercepts them as DAP stopped events — no raw pdb, no terminal
+stealing. The program stops and you can inspect with `/debug evaluate`.
+
+The test fixture at `src/tests/dap/fixtures/test_program.py` has five
+numbered `breakpoint()` calls ready for step-through.
+
+## The `debug` agent tool
+
+The agent also gets a `debug` tool with 20 actions. Each action maps to
+standard DAP requests — the agent selects the right action for the job.
 
 | Action | Required args | What it does |
 |--------|--------------|--------------|
@@ -33,18 +131,68 @@ DAP requests — the agent selects the right action for the job.
 | `variables` | `variable_ref` | Get variables within a scope |
 | `terminate` | — | Terminate the debuggee |
 | `sessions` | — | Show active debug session info |
-| `run_to_cursor` | `file`, `line` | Set bp at line, continue, show LSP hover at stop ⚡ |
-| `restart_frame` | `frame_id` | Re-execute current frame (edit-and-continue) ⚡ |
-| `backtrace_diagnostics` | `thread_id` | Stack trace with LSP diagnostics per frame ⚡ |
-| `error_analysis` | `thread_id` | Stack trace with error diagnostics + suggested breakpoints ⚡ |
+| `run_to_cursor` | `file`, `line` | Set bp at line, continue, show LSP hover at stop :zap: |
+| `restart_frame` | `frame_id` | Re-execute current frame (edit-and-continue) :zap: |
+| `backtrace_diagnostics` | `thread_id` | Stack trace with LSP diagnostics per frame :zap: |
+| `error_analysis` | `thread_id` | Stack trace with error diagnostics + suggested breakpoints :zap: |
 
-Optional args: `condition` (conditional breakpoints), `context` (eval context: watch/repl/hover),
-`levels` (stack frame count), `timeout` (5–300s, default 30), `stop_on_entry`
-(launch), `restart` (disconnect with restart).
+Optional args: `condition` (conditional breakpoints), `context` (eval context:
+watch/repl/hover), `levels` (stack frame count), `timeout` (5–300s, default
+30), `stop_on_entry` (launch), `restart` (disconnect with restart).
 
-⚡ Actions with ⚡ require both `dap` and `lsp` features. They coordinate the
-debugger with LSP code intelligence for integrated run-to-cursor, diagnostic
-inspection, and error-location workflows.
+:zap: requires both `dap` and `lsp` features.
+
+### Agent usage examples
+
+**Crash investigation:**
+
+```
+debug launch { program: "./buggy_binary" }
+→ stopped at entry
+
+debug set_breakpoints { file: "src/main.rs", line: 42 }
+debug continue
+→ stopped at breakpoint (thread 1)
+
+debug stack_trace { thread_id: 1 }
+→ 5 frames, exception at frame 0
+
+debug variables { variable_ref: 1000 }
+→ local variables at crash site
+```
+
+**Run to cursor (DAP:LSP bridge):**
+
+```
+debug run_to_cursor { file: "src/auth.py", line: 87 }
+→ stopped at src/auth.py:87
+→ Hover info at src/auth.py:87: { "type": "str", ... }
+```
+
+**Conditional breakpoints:**
+
+```
+debug set_breakpoints {
+  file: "src/loop.rs",
+  line: 128,
+  condition: "i > 1000"
+}
+debug continue
+→ stops only when i > 1000
+```
+
+**Attach to running process:**
+
+```
+debug attach { pid: 89342 }
+→ attached to pid 89342
+
+debug threads
+→ list of threads
+
+debug stack_trace { thread_id: 1 }
+→ current call stack
+```
 
 ## Built-in adapter set
 
@@ -63,18 +211,19 @@ inspection, and error-location workflows.
 
 ### Adapter auto-detection
 
-When the agent calls `debug launch` without an explicit `adapter` argument,
-dirge auto-detects the right adapter from the program's file extension:
+When the agent calls `debug launch` (or you use `/debug launch`) without an
+explicit `adapter` argument, dirge auto-detects the right adapter from the
+program's file extension:
 
-- `.py` → `debugpy`
-- `.go` → `dlv`
-- `.rs` → `lldb-dap` (falls back to `gdb` if lldb-dap not found)
-- `.js`/`.ts` → `js-debug-adapter`
-- `.rb` → `rdbg`
-- `.java` → `jdtls-debug`
-- Extensionless binaries → `lldb-dap` > `gdb` > `codelldb`
+- `.py` -> `debugpy`
+- `.go` -> `dlv`
+- `.rs` -> `lldb-dap` (falls back to `gdb` if lldb-dap not found)
+- `.js`/`.ts` -> `js-debug-adapter`
+- `.rb` -> `rdbg`
+- `.java` -> `jdtls-debug`
+- Extensionless binaries -> `lldb-dap` > `gdb` > `codelldb`
 
-Explicit adapter selection: `{ "adapter": "gdb" }` bypasses auto-detection.
+Explicit adapter selection: `/debug launch foo.py --adapter debugpy`.
 
 ### Root marker detection
 
@@ -89,13 +238,51 @@ dirge checks the working directory for root markers:
 | Go / dlv | `go.mod`, `go.sum` |
 | JS/TS | `package.json`, `tsconfig.json` |
 
-Missing binaries are surfaced as a clear error ("adapter not found on PATH")
-rather than a cryptic spawn failure.
+## Implementation details
+
+### Terminal isolation
+
+The debug adapter (and its debuggee) runs in its own session with no
+controlling terminal. This prevents the adapter from calling `tcsetpgrp()`
+to steal the foreground, which would SIGTTOU-stop dirge and corrupt the TUI.
+The isolation is done via `setsid()` in `spawn_stdio` — `/dev/tty` opens
+fail with ENXIO and `tcsetpgrp()` is rejected.
+
+Additionally, `"console": "internalConsole"` is set in debugpy's launch
+defaults to tell debugpy not to try setting up a TTY for the debuggee.
+
+### Launch runs in background
+
+`/debug launch` spawns the adapter handshake + initial stop on a
+`tokio::spawn` task. The slash command returns immediately after printing
+"launching..." and switching the right panel to debug mode. This keeps the
+TUI responsive even if the adapter takes seconds to initialize.
+
+### Session model
+
+- **Single active session**: launching a new debug session terminates any
+  existing one. Attach behaves the same way.
+- **Breakpoint cache**: dirge tracks breakpoints per file locally so the
+  agent can query "what breakpoints do I have?" without a DAP round-trip.
+- **Output capture**: program stdout/stderr from DAP `output` events is
+  accumulated (up to 128 KB) and surfaced in `continue` outcomes.
+- **Timeout**: every operation has a configurable timeout (5–300s, default
+  30s). Operations that race against stop events (continue, step) use the
+  timeout as a ceiling.
+- **DAP manager lifetime**: `DAP_MANAGER` is initialized when the first
+  conversation starts (the `debug` tool constructor creates the singleton).
+  Before that, `/debug` subcommands that need a session return "start a
+  conversation first".
+
+### TUI debug panel
+
+The right panel shows live session state (adapter name, status, stop reason,
+thread ID) updated each UI tick from `DAP_MANAGER.debug_snapshot()`. Switch
+to it with `/panel debug` or `/debug panel`. It auto-shows on `/debug launch`.
 
 ## Configuration
 
-Adapter commands are resolved via `which` (PATH lookup). Override the command
-or add arguments per adapter in `config.json`:
+Override adapter commands per adapter in `config.json`:
 
 ```json
 {
@@ -111,203 +298,58 @@ or add arguments per adapter in `config.json`:
 }
 ```
 
-Adapter config keys must match the adapter names in the defaults table above.
-When an adapter config is present, its `command` + `args` replace the built-in
-defaults entirely. `cwd` resolution and `launch_defaults`/`attach_defaults`
-merging still applies.
-
-Disable DAP entirely: omit `dap` from the feature flags (it's opt-in).
-
-## Adapter defaults
-
-Each adapter ships with `launch_defaults` and `attach_defaults` that are
-merged into the DAP request arguments. Examples:
-
-- **debugpy**: `justMyCode: false` (always show library frames), `stopOnEntry: true`
-- **gdb**: `stopAtBeginningOfMainSubprogram: true`
-- **dlv**: `mode: "debug"` for launch, `mode: "local"` for attach
-- **elixir-ls-debugger**: `type: "mix_task"`, `task: "run"`
-
-The agent can override any default by passing the corresponding argument in
-the tool call — agent-supplied values always win over defaults.
-
-## Session model
-
-- **Single active session**: launching a new debug session terminates any
-existing one. Attach behaves the same way.
-- **Breakpoint cache**: dirge tracks breakpoints per file locally so the
-agent can query "what breakpoints do I have?" without a DAP round-trip.
-- **Output capture**: program stdout/stderr from DAP `output` events is
-accumulated (up to 128 KB) and surfaced in `continue` outcomes.
-- **Timeout**: every operation has a configurable timeout (5–300s, default
-30s). Operations that race against stop events (continue, step) use the
-timeout as a ceiling.
-
-## Agent usage patterns
-
-### Crash investigation
-
-```
-debug launch { program: "./buggy_binary" }
-→ stopped at entry
-
-debug set_breakpoints { file: "src/main.rs", line: 42 }
-debug continue
-→ stopped at breakpoint (thread 1)
-
-debug stack_trace { thread_id: 1 }
-→ 5 frames, exception at frame 0
-
-debug variables { variable_ref: 1000 }
-→ local variables at crash site
-```
-
-### Run to cursor (DAP↔LSP bridge)
-
-```
-debug run_to_cursor { file: "src/auth.py", line: 87 }
-→ stopped at src/auth.py:87
-→ Hover info at src/auth.py:87: { "type": "str", ... }
-```
-
-Or step-by-step (equivalent to what `run_to_cursor` does internally):
-
-```
-debug launch { program: "test.py" }
-debug set_breakpoints { file: "src/auth.py", line: 87 }
-debug continue
-→ stopped at src/auth.py:87
-
-# LSP provides diagnostics on the current file
-lsp hover { file: "src/auth.py", line: 87, character: 5 }
-→ type info at cursor
-```
-
-### Conditional breakpoints
-
-```
-debug set_breakpoints {
-  file: "src/loop.rs",
-  line: 128,
-  condition: "i > 1000"
-}
-debug continue
-→ stops only when i > 1000
-```
-
-### Attach to running process
-
-```
-debug attach { pid: 89342 }
-→ attached to pid 89342
-
-debug threads
-→ list of threads
-
-debug stack_trace { thread_id: 1 }
-→ current call stack
-```
-
-### Edit and continue
-
-```
-debug launch { program: "server.py" }
-→ stopped at entry
-
-debug set_breakpoints { file: "src/handler.py", line: 55 }
-debug continue
-→ stopped at src/handler.py:55 (exception)
-
-# Agent fixes the bug with edit tool
-edit { file: "src/handler.py", ... }
-
-debug terminate { restart: true }
-→ disconnect with restart
-
-debug launch { program: "server.py" }
-debug continue
-→ runs with fix applied
-```
-
-### Backtrace with diagnostics (DAP↔LSP bridge)
-
-```
-debug backtrace_diagnostics { thread_id: 1 }
-→ Backtrace diagnostics for thread 1:
-  [0] src/parser.rs:87 — 3 diagnostics:
-    L42 — Error: expected ';', found '}'
-    L87 — Warning: unused variable 'x'
-    L102 — Error: type mismatch
-  [1] src/main.rs:15 — no diagnostics
-```
-
-### Error analysis with breakpoint suggestions
-
-```
-debug error_analysis { thread_id: 1 }
-→ Error analysis for thread 1:
-  Frame [0]: src/parser.rs:87
-    Error at line 42: expected ';', found '}'
-      → debug set_breakpoints file=src/parser.rs line=42
-    Error at line 102: type mismatch
-      → debug set_breakpoints file=src/parser.rs line=102
-```
-
-## Interactive features
-
-- **TUI debug panel**: when a DAP session is active, toggle
-`/panel debug` to see threads, frames, variables, breakpoints, and program
-output in a right-side panel. `/panel auto` switches back to the system panel.
-
-- **DAP↔LSP bridge**: the `debug` tool includes `run_to_cursor`,
-`restart_frame`, `backtrace_diagnostics`, and `error_analysis` actions
-(when both `dap` and `lsp` features are enabled).
-
 ## Limitations
 
-- **Socket-mode adapters**: `dlv` and `codelldb` ship with `connect_mode: "socket"`
-in the defaults but socket-mode transport is not implemented yet. These
-adapters fail with a clear error. Use `lldb-dap` or `gdb` for Go/C/C++ for now.
-- **No disassemble / memory read/write**: advanced DAP surface deferred to v2.
-- **No data/instruction breakpoints**: source breakpoints only in v1.
-- **Janet, Bash**: no built-in adapters exist for these languages. The agent
-can still attach via `adapter: "custom-adapter"` if one is available on PATH.
+- **Socket-mode adapters**: `dlv` and `codelldb` ship with `connect_mode:
+  "socket"` in the defaults but socket-mode transport is not implemented
+  yet. These adapters fail with a clear error. Use `lldb-dap` or `gdb` for
+  Go/C/C++ for now.
+- **No disassemble / memory read/write**: not implemented in the DAP types yet.
+- **Single session only**: only one debug session can be active at a time.
+  Launching a new session terminates the previous one.
+- **No inline variable display in editor**: the DAP panel shows variables
+  in a table but there's no source-level data view (VS Code-style hover or
+  inline values) in the TUI.
 
-## Example session transcript
+## Full worked example (Python)
 
 ```
-User: debug this segfault in ./target/debug/parser
+# Terminal 1: start dirge
+$ cargo run --features dap
 
-Agent: I'll launch the debugger and investigate.
+# In the TUI:
+> hello, I need to debug test_program.py
 
-[Tool: debug launch { program: "./target/debug/parser", args: ["input.txt"] }]
+/debug launch src/tests/dap/fixtures/test_program.py
+# → "launching src/tests/dap/fixtures/test_program.py with adapter debugpy..."
+# → "  (launch runs in background — use /debug sessions to check result)"
+# → right panel switches to debug view
+# → "Session dap-1 (debugpy) — Stopped, Stop reason: entry (thread 1)"
 
-Launched with lldb-dap (session parser-1).
-Program stopped: entry (thread 1)
+/debug evaluate "mapping"
+# → mapping = {"key_a": 100, "key_b": 200}
 
-[Tool: debug continue]
+/debug bp src/tests/dap/fixtures/test_program.py 107
+# → set 1 breakpoint(s), line 107 — verified: true
 
-Execution stopped: signal SIGSEGV (thread 1)
-Program output:
-Reading input.txt...
-Segmentation fault
+/debug continue
+# → continue → Stopped (stop reason: breakpoint)
+# → Program output: text = Hello, DAP!\nnumber = 42\nHello, World!\n
 
-[Tool: debug stack_trace { thread_id: 1, levels: 5 }]
+/debug evaluate "doubled[:5]"
+# → doubled[:5] = [2, 4, 6, 8, 10]
 
-Stack trace for thread 1 (5 frames):
-[
-  { "id": 0, "name": "parse_token", "source": { "path": "src/lexer.rs", "line": 234 } },
-  { "id": 1, "name": "lex_next", "source": { "path": "src/lexer.rs", "line": 112 } },
-  { "id": 2, "name": "parse_expr", "source": { "path": "src/parser.rs", "line": 87 } },
-  { "id": 3, "name": "parse_file", "source": { "path": "src/parser.rs", "line": 42 } },
-  { "id": 4, "name": "main", "source": { "path": "src/main.rs", "line": 15 } }
-]
+/debug step
+# → stopped — reason: step, thread: 1
 
-[Tool: debug evaluate { expression: "*token_ptr", frame_id: 0 }]
+/debug evaluate "fact"
+# → fact = 120
 
-{ "result": "0x0", "type": "pointer", "variablesReference": 0 }
+/debug continue    # hits the next breakpoint()
 
-Agent: The crash is in `parse_token` at `src/lexer.rs:234`. The expression
-`*token_ptr` evaluates to `0x0` — a null pointer dereference. The fix is
-a null check before dereferencing `token_ptr`.
+/debug evaluate "counter.value"
+# → counter.value = 12
+
+/debug terminate
+# → debug session terminated. exit code: none
 ```

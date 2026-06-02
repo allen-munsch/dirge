@@ -723,6 +723,34 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     renderer.write_line("  /quit                  exit dirge", c_result())?;
     renderer.write_line("  /help                  show this message", c_result())?;
     renderer.write_line("", c_agent())?;
+    #[cfg(feature = "dap")]
+    {
+        let _ = renderer.write_line("debug commands:", c_agent());
+        let _ = renderer.write_line(
+            "  /debug launch <file>   start debugging a program",
+            c_result(),
+        );
+        let _ = renderer.write_line(
+            "  /debug attach <pid>    attach to a running process",
+            c_result(),
+        );
+        let _ = renderer.write_line("  /debug bp <file> <ln>  set a breakpoint", c_result());
+        let _ = renderer.write_line("  /debug step | step_in | step_out | continue", c_result());
+        let _ = renderer.write_line(
+            "  /debug evaluate <expr> evaluate an expression",
+            c_result(),
+        );
+        let _ = renderer.write_line(
+            "  /debug sessions        show active debug session",
+            c_result(),
+        );
+        let _ = renderer.write_line("  /debug terminate       end debug session", c_result());
+        let _ = renderer.write_line(
+            "  /debug panel           show debug panel on right",
+            c_result(),
+        );
+        let _ = renderer.write_line("", c_agent());
+    }
     renderer.write_line("keys:", c_agent())?;
     renderer.write_line("  PgUp/PgDn / wheel      scroll chat history", c_result())?;
     renderer.write_line("  Home/End               jump to top/bottom", c_result())?;

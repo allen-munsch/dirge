@@ -54,6 +54,7 @@
         "connect_mode": "stdio",
         "launch_defaults": {
             "request": "launch",
+            "console": "internalConsole",
             "justMyCode": false,
             "stopOnEntry": true
         },

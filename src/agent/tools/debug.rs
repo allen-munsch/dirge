@@ -72,6 +72,7 @@ pub struct DebugTool {
 }
 
 impl DebugTool {
+    #[allow(dead_code)] // used only via cfg path in loop_tools.rs
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         let session = Arc::new(DapSessionManager::new());
         *DAP_MANAGER.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.clone());

@@ -92,19 +92,25 @@ def main():
     mapping = {"key_a": 100, "key_b": 200}
     counter = Counter(start=10)
 
+    breakpoint()  # [1] inspect locals: text, number, pi, flag, mapping, counter
+
     print(f"text = {text}")
     print(f"number = {number}")
 
     # --- function call: exercise step_in ---
-    greeting = greet("World")        # bp: line 86 (step_in friendly)
+    greeting = greet("World")
     print(greeting)
 
+    breakpoint()  # [2] after greet() — try /debug step_in on greet, /debug evaluate text
+
     # --- loop: exercise step_over within loop + conditional bp ---
-    doubled = process_items(items)   # bp: line 89
+    doubled = process_items(items)
     print(f"doubled = {doubled}")
 
+    breakpoint()  # [3] after process_items — inspect doubled, try /debug evaluate "doubled[:3]"
+
     # --- recursion: deeper stack ---
-    fact = factorial(5)              # bp: line 93
+    fact = factorial(5)
     print(f"factorial(5) = {fact}")
 
     # --- object inspection ---
@@ -112,16 +118,20 @@ def main():
     counter.increment()
     print(f"counter.value = {counter.value}")
 
+    breakpoint()  # [4] after counter ops — try /debug evaluate "counter.value"
+
     # --- dict/list inspection ---
-    stats = compute_stats(doubled)   # bp: line 101
+    stats = compute_stats(doubled)
     print(f"stats = {stats}")
 
     # --- nested calls: step_in → step_out ---
-    outer_result = outer()           # bp: line 105
+    outer_result = outer()
     print(f"outer_result = {outer_result}")
 
+    breakpoint()  # [5] near end — try /debug evaluate "x + y + outer_result"
+
     # --- direct expression evaluation targets ---
-    x = 10                           # bp: line 109
+    x = 10
     y = 20
     z = x + y
     s = f"sum: {z}"

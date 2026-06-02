@@ -419,6 +419,25 @@ pub async fn build_loop_tools(
         );
     }
 
+    // DAP debugger tool — spawns adapters, steps debuggees.
+    // Sequential: launch/attach mutate session state and spawn
+    // subprocesses; concurrent step/continue/evaluate would race.
+    #[cfg(feature = "dap")]
+    {
+        #[cfg(feature = "lsp")]
+        let dap_tool = tools::DebugTool::new_with_lsp(
+            permission.clone(),
+            ask_tx.clone(),
+            lsp_manager
+                .clone()
+                .expect("lsp_manager required for dap+lsp"),
+        );
+        #[cfg(not(feature = "lsp"))]
+        let dap_tool = tools::DebugTool::new(permission.clone(), ask_tx.clone());
+
+        tools.push(wrap(dap_tool, Some(ToolExecutionMode::Sequential)).await);
+    }
+
     // MCP tools — variable per-server semantics. Default
     // Parallel; future work can let an MCP server declare
     // execution_mode in its definition. Same name-collision
