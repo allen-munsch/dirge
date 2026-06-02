@@ -1,110 +1,146 @@
 // Test program for DAP integration tests — Rust variant.
 //
-// Exercises: launch with stopOnEntry, line breakpoints, continue,
-// step over/into, stack trace, variable inspection, expression
-// evaluation.  Intended to be run with lldb-dap or gdb.
+// Exercises DAP variable inspection across Rust-specific types:
+//   - Scalars: i32, i64, f32, f64, bool, char, &str, String
+//   - Collections: Vec<T>, HashMap<K,V>, [T; N], slices
+//   - Structs: named fields, tuple structs, generic structs
+//   - Enums: Option<T>, Result<T,E>, custom enum with data
+//   - Smart pointers: Box<T>, Rc<T>, raw *const T
+//   - Traits: Debug-printable objects
+//   - Lifetimes: &'static str, borrowed references
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
-/// Simple struct for object inspection.
+// ── structs ───────────────────────────────────────────────────────────
+
+#[derive(Debug)]
 struct Counter {
     value: i32,
-    label: &'static str,
+    threshold: f64,
+    label: String,
 }
 
 impl Counter {
-    fn new(start: i32) -> Self {
-        Counter { value: start, label: "counter" }
+    fn new(start: i32, label: &str) -> Self {
+        Counter { value: start, threshold: 0.5, label: label.to_string() }
     }
+    fn increment(&mut self) -> i32 { self.value += 1; self.value }
+}
 
-    fn increment(&mut self) -> i32 {
-        self.value += 1;
-        self.value
+#[derive(Debug)]
+struct AdapterInfo {
+    name: String,
+    version: (u32, u32, u32),          // tuple field
+    connected: bool,
+}
+
+// ── enums ─────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum ErrorKind {
+    None,
+    Timeout(u32),                        // variant with data
+    Disconnected { reason: String },     // variant with named fields
+    Invalid,
+}
+
+// ── custom trait object ──────────────────────────────────────────────
+
+trait Describable {
+    fn describe(&self) -> String;
+}
+
+impl Describable for Counter {
+    fn describe(&self) -> String {
+        format!("Counter(value={}, threshold={})", self.value, self.threshold)
     }
 }
 
-/// Recursive function for deeper stack traces.
+// ── functions ────────────────────────────────────────────────────────
+
 fn factorial(n: u64) -> u64 {
-    if n <= 1 {
-        1
-    } else {
-        n * factorial(n - 1)
-    }
+    if n <= 1 { 1 } else { n * factorial(n - 1) }
 }
 
-/// Process a vec — exercise iteration.
 fn process_items(items: &[i32]) -> Vec<i32> {
-    let mut results = Vec::new();
-    for &item in items {
-        let doubled = item * 2; // conditional bp: item > 10
-        results.push(doubled);
-    }
-    results
+    items.iter().map(|&item| item * 2).collect()
 }
 
-/// Nested calls for step_in / step_out.
-fn inner(x: i32) -> i32 {
-    let square = x * x;
-    square
-}
+fn inner(x: i32) -> i32 { x * x }
+fn middle(x: i32) -> i32 { let y = x + 3; let z = inner(y); z + 1 }
+fn outer() -> i32 { let result = middle(5); result * 2 }
 
-fn middle(x: i32) -> i32 {
-    let y = x + 3;
-    let z = inner(y);
-    z + 1
-}
-
-fn outer() -> i32 {
-    let result = middle(5);
-    result * 2
-}
+// ── main ─────────────────────────────────────────────────────────────
 
 fn main() {
-    // Basic types to inspect.
-    let text = "Hello, DAP!";
+    // scalars
+    let text = "Hello, DAP!";            // &str
+    let owned = String::from("owned");  // String
     let number: i32 = 42;
-    let pi: f64 = 3.14159;
+    let big: i64 = 9_223_372_036_854_775_807;
+    let pi: f64 = 3.141592653589793;
     let flag = true;
+    let ch = '🦀';
 
+    // collections
     let items = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20];
     let mut mapping = HashMap::new();
     mapping.insert("key_a", 100);
-    mapping.insert("key_b", 200);
+    mapping.insert("key_b", 200_i32);
+    let fixed: [i32; 5] = [10, 20, 30, 40, 50];
 
-    let mut counter = Counter::new(10);
+    // structs + enums
+    let mut counter = Counter::new(10, "main-counter");
+    let adapter = AdapterInfo {
+        name: "debugpy".into(),
+        version: (1, 8, 13),
+        connected: true,
+    };
+    let last_error = ErrorKind::Timeout(30);
+    let desc: &dyn Describable = &counter;
 
-    // [bp-1] inspect locals.
-    println!("text = {text}");
+    // smart pointers
+    let heap_int = Box::new(999);
+    let raw_ptr: *const i32 = heap_int.as_ref() as *const i32;  // lint: allow
+    let _ = raw_ptr;
+    let shared = Rc::new(42);
+
+    let mut option_val = Some("present");
+    let result_val: Result<i32, &str> = Ok(100);
+
+    // [bp-1] inspect: text, number, pi, ch, items.len(), mapping["key_a"],
+    //   counter.value, adapter.name, adapter.version.0, last_error,
+    //   *heap_int, shared, option_val, result_val, Rc::strong_count(&shared)
+
+    println!("text   = {text}");
     println!("number = {number}");
-    println!("pi = {pi}");
-    println!("flag = {flag}");
-    println!("items len = {}", items.len());
+    println!("pi     = {pi}");
+    println!("flag   = {flag}");
+    println!("items  = {}", items.len());
 
-    // Loop: step_over friendly.
     let doubled = process_items(&items);
-    println!("doubled[0] = {}, doubled[last] = {}", doubled[0], doubled.last().unwrap());
+    println!("doubled[0] = {}, size = {}", doubled[0], doubled.len());
 
-    // [bp-2] after loop — try 'p doubled'.
+    println!("desc   = {}", desc.describe());
 
-    // Recursion.
-    let fact = factorial(5);
-    println!("factorial(5) = {fact}");
-
-    // Object mutation.
+    // Move the mutable ops below the immutable borrow's last use.
     counter.increment();
     counter.increment();
-    println!("counter.value = {}", counter.value);
+    println!("counter = {}", counter.value);
 
-    // [bp-3] after counter ops — try 'p counter.value'.
+    // [bp-3] after counter ops
 
-    // Nested calls.
     let outer_result = outer();
-    println!("outer_result = {outer_result}");
+    println!("outer = {outer_result}");
 
-    // [bp-4] near end.
+    // [bp-4] near end
 
     let x = 10i32;
     let y = 20i32;
     let z = x + y;
     println!("z = {z}");
+
+    option_val = None;
+    println!("option = {option_val:?}");
 }
