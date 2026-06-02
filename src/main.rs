@@ -608,6 +608,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    #[cfg(all(feature = "plugin", feature = "dap"))]
+    let _dap_responder: tokio::task::JoinHandle<()> = plugin::spawn_dap_responder();
+
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;

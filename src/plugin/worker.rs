@@ -999,6 +999,11 @@ fn worker_loop(
             env.add_c_fn(CFunOptions::new(c"__lsp", janet_lsp_cfn).namespace(c"harness"));
             env.add_c_fn(CFunOptions::new(c"__lsp-live", janet_lsp_live_cfn).namespace(c"harness"));
         }
+        // Register DAP C functions when both features are enabled.
+        #[cfg(feature = "dap")]
+        {
+            crate::dap::janet_bindings::register_dap_cfns(&mut client);
+        }
     }
 
     if let Err(e) = client.run(HARNESS_INIT) {
@@ -1019,6 +1024,23 @@ fn worker_loop(
     if let Err(e) = client.run(HARNESS_SANDBOX) {
         let _ = init_tx.send(Err(format!("harness sandbox init failed: {e}")));
         return;
+    }
+    // Run the DAP Janet bindings prelude when the dap feature is enabled.
+    // This defines (dap/launch ...), (dap/step), etc. as wrappers over
+    // the C functions registered above. Plugins can call these directly.
+    #[cfg(feature = "dap")]
+    {
+        if let Err(e) = client.run(crate::dap::janet_bindings::HARNESS_DAP_INIT) {
+            let _ = init_tx.send(Err(format!("dap init failed: {e}")));
+            return;
+        }
+        // Install the DAP bridge sender on this thread BEFORE any plugin
+        // code runs — plugins that call (dap/launch) during load need the
+        // bridge to be live. The bridge receiver is spawned by the plugin
+        // manager right after worker init.
+        crate::dap::janet_bindings::install_dap_tx(
+            crate::dap::janet_bindings::take_dap_tx_for_worker(),
+        );
     }
 
     let _ = init_tx.send(Ok(()));
