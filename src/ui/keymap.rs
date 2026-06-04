@@ -34,6 +34,10 @@ pub enum KeyAction {
     PrevChat,
     CloseChat,
     KillSubagent,
+    /// Drop all queued mid-execution interjections without cancelling the
+    /// running agent (dirge-e59d). Distinct from Ctrl+C, which cancels the
+    /// run AND clears the queue.
+    DropQueue,
 }
 
 impl KeyAction {
@@ -94,6 +98,13 @@ impl KeyAction {
             KeyAction::KillSubagent,
             "kill_subagent",
             &[(KeyCode::Char('k'), KeyModifiers::CONTROL)],
+        ),
+        (
+            // Alt+X, not Ctrl+X: Ctrl+X is `close_chat`. Matches the
+            // on-screen hint printed when a message is queued.
+            KeyAction::DropQueue,
+            "drop_queue",
+            &[(KeyCode::Char('x'), KeyModifiers::ALT)],
         ),
     ];
 
@@ -256,6 +267,26 @@ mod tests {
         assert_eq!(
             km.resolve(&ev(KeyCode::Char('a'), KeyModifiers::NONE)),
             None
+        );
+    }
+
+    /// dirge-e59d: Alt+X drops queued interjections (Ctrl+X stays
+    /// `close_chat`). Pin the binding so the on-screen "Alt+X drops" hint
+    /// can't drift from the actual chord.
+    #[test]
+    fn alt_x_drops_queue_ctrl_x_closes_chat() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Char('x'), KeyModifiers::ALT)),
+            Some(KeyAction::DropQueue)
+        );
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Some(KeyAction::CloseChat)
+        );
+        assert_eq!(
+            KeyAction::from_command("drop_queue"),
+            Some(KeyAction::DropQueue)
         );
     }
 

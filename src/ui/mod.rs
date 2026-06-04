@@ -1102,6 +1102,48 @@ pub async fn run_interactive(
                             continue;
                         }
 
+                        // dirge-e59d: Alt+X drops queued mid-execution
+                        // interjections WITHOUT cancelling the running agent
+                        // (Ctrl+C does both). Honors the "Alt+X drops" hint
+                        // printed when a message is queued.
+                        if action == Some(KeyAction::DropQueue) {
+                            let dropped = {
+                                let mut q = interjection_queue.lock().unwrap();
+                                let n = q.len();
+                                q.clear();
+                                n
+                            };
+                            let msg = if dropped == 0 {
+                                "no queued messages to drop".to_string()
+                            } else {
+                                format!(
+                                    "dropped {} queued message{}",
+                                    dropped,
+                                    if dropped == 1 { "" } else { "s" }
+                                )
+                            };
+                            renderer.write_line(&msg, theme::dim())?;
+                            renderer.render_viewport()?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(
+                                    StatusLine::render(
+                                        session,
+                                        is_running,
+                                        0,
+                                        loop_label.as_deref(),
+                                        context.current_prompt_name.as_deref(),
+                                        perm_mode().as_deref(),
+                                        bg_store.as_ref(),
+                                        shell_store.as_ref(),
+                                    ),
+                                    interjection_queue.lock().unwrap().len(),
+                                ),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+
                         let ctrl_p = action == Some(KeyAction::PrevChat);
                         let ctrl_x = action == Some(KeyAction::CloseChat);
                         if matches!(
