@@ -83,6 +83,13 @@ pub struct AnyAgent {
     /// time when `ConfigRole::Critic` resolves (i.e. `critic_provider`
     /// is configured). Forwarded to `LoopConfig.critic_fn`. `None` = off.
     critic_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+    /// dirge-008x: in-loop LLM compaction summarizer. Built at
+    /// `build_agent` time from the main model and forwarded to
+    /// `LoopSpawnConfig.summarize_fn`, so the proactive folds in
+    /// `run_agent_loop` actually call a model instead of degrading to a
+    /// prune-only pass. `None` only in test agents built without it. (A
+    /// dedicated `summarization_provider` route is dirge-nw25.)
+    summarize_fn: Option<crate::agent::compression::SummarizeFn>,
     /// Phase 4 part 2: optional context-depth reminder threshold.
     /// Forwarded to `spawn_runner`, which constructs a fresh
     /// `FileTouchTracker` for each session because the tracker is
@@ -154,6 +161,7 @@ impl AnyAgent {
             escalation_stream_fn: None,
             escalation_provider_name: None,
             critic_fn: None,
+            summarize_fn: None,
             context_depth_reminder_threshold: None,
             max_turns: None,
             review_stream_fn: None,
@@ -280,6 +288,14 @@ impl AnyAgent {
     /// only when `ConfigRole::Critic` resolves (`critic_provider` set).
     pub fn with_critic(mut self, critic_fn: crate::agent::agent_loop::critic::CriticFn) -> Self {
         self.critic_fn = Some(critic_fn);
+        self
+    }
+
+    /// dirge-008x: attach the in-loop compaction summarizer. Called by
+    /// `build_agent` so the proactive folds can run LLM summarization
+    /// instead of degrading to a prune-only pass.
+    pub fn with_summarizer(mut self, summarize_fn: crate::agent::compression::SummarizeFn) -> Self {
+        self.summarize_fn = Some(summarize_fn);
         self
     }
 

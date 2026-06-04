@@ -173,6 +173,9 @@ impl AnyAgent {
         // F6 tier 3: thread the bounded critic (only Some when
         // critic_provider is configured). `None` → no critic.
         cfg.critic_fn = self.critic_fn.clone();
+        // dirge-008x: thread the in-loop compaction summarizer so the
+        // proactive folds run LLM summarization (built in `build_agent`).
+        cfg.summarize_fn = self.summarize_fn.clone();
         // dirge-nqr: forward the per-run turn cap. `None` keeps the
         // legacy unlimited behavior.
         cfg.max_turns = self.max_turns;

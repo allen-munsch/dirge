@@ -172,6 +172,24 @@ pub async fn build_agent(
         AnyModel::Custom(m) => build_inner!(m, Custom),
     };
 
+    // dirge-008x: wire the in-loop LLM compaction summarizer. The
+    // proactive folds in `run_agent_loop` need a `SummarizeFn` to call a
+    // model; without one they degrade to a prune-only pass (the bug:
+    // `summarize_fn` was declared and threaded but never set, so
+    // automatic structured-summary compaction never happened). Built from
+    // the main model — a dedicated `summarization_provider` route is the
+    // separate dirge-nw25. The closure adapts `summarize_with_model`
+    // (AnyModel + prompt → summary) to the `SummarizeFn` shape.
+    {
+        let summ_model = parent_model.clone();
+        let summarize_fn: crate::agent::compression::SummarizeFn =
+            std::sync::Arc::new(move |prompt: String| {
+                let m = summ_model.clone();
+                Box::pin(async move { summarize::summarize_with_model(m, prompt).await })
+            });
+        agent = agent.with_summarizer(summarize_fn);
+    }
+
     // Phase 4 part 1 — dual-client escalation wiring.
     //
     // When the user has configured `escalation_provider` AND it

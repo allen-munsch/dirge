@@ -413,6 +413,33 @@ fn with_review_route_stashes_alternate_route_dirge_z73i() {
     assert_eq!(agent.review_model_name.as_deref(), Some("glm-4.6"));
 }
 
+/// dirge-008x: `with_summarizer` stashes the in-loop compaction
+/// summarizer on AnyAgent (default `None`) so `spawn_runner` can forward
+/// it to `LoopSpawnConfig.summarize_fn`. Setter-level fixture test — same
+/// rationale as `with_review_route` above (firing the real fold needs a
+/// live client; the loop-side consumption is covered by run_tests).
+#[tokio::test]
+async fn with_summarizer_stashes_summarize_fn_dirge_008x() {
+    use std::sync::Arc;
+
+    let agent = build_openai_any_agent();
+    assert!(
+        agent.summarize_fn.is_none(),
+        "fresh AnyAgent::new agent has no summarizer by default"
+    );
+
+    let dummy: crate::agent::compression::SummarizeFn =
+        Arc::new(|prompt: String| Box::pin(async move { Ok(format!("summary of: {prompt}")) }));
+    let agent = agent.with_summarizer(dummy);
+    let stashed = agent
+        .summarize_fn
+        .as_ref()
+        .expect("summarizer stashed after with_summarizer");
+    // The stashed fn is invocable and returns the summary text.
+    let out = stashed("hello".to_string()).await.unwrap();
+    assert_eq!(out, "summary of: hello");
+}
+
 // --- C6/C7: compaction prefix is full + includes tool calls -----
 
 use super::summarize;
