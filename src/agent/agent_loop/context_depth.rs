@@ -1,11 +1,16 @@
 //! Phase 4 part 2 — context-depth reminder tracker.
 //!
-//! Long agentic sessions drift: the model can spend dozens of turns
-//! re-editing the same file without ever stepping back to the
+//! Long agentic sessions drift: the model can make many file-touching
+//! tool calls re-editing the same file without ever stepping back to the
 //! user's original task. `FileTouchTracker` watches tool calls for
-//! file-path arguments and, when the agent has touched the SAME
-//! file(s) for `threshold` consecutive turns, emits a one-shot
-//! reminder restating the active task + the files being touched.
+//! file-path arguments and, when the agent has touched the SAME file(s)
+//! across `threshold` consecutive file-touching tool calls, emits a
+//! one-shot reminder restating the active task + the files being touched.
+//!
+//! NOTE: the unit is consecutive *tool calls* (the tracker is fed once
+//! per tool call), not assistant turns — a single turn with several edits
+//! to one file advances the count by several. The threshold is tuned
+//! against that granularity.
 //!
 //! The tracker is self-contained — no rig types, no LLM state. It
 //! lives behind `LoopConfig.file_touch_tracker`; when `None`, the
@@ -31,11 +36,11 @@ pub struct FileTouchTracker {
 
 #[derive(Debug)]
 struct Inner {
-    /// Files touched in the most recent tool-call turn. Empty
+    /// Files touched by the most recent file-touching tool call. Empty
     /// before any tool has been recorded.
     last_files: HashSet<PathBuf>,
-    /// Count of consecutive turns that all touched a non-empty
-    /// subset of `last_files`.
+    /// Count of consecutive file-touching tool calls that all touched a
+    /// non-empty subset of `last_files`.
     consecutive: usize,
     /// The most recent user-prompted task. Used in the reminder
     /// body. Updated by `record_user_message`.
@@ -205,7 +210,7 @@ fn format_reminder(consecutive: usize, files: &HashSet<PathBuf>, active_task: &s
     let mut sorted: Vec<&PathBuf> = files.iter().collect();
     sorted.sort();
     let mut s = format!(
-        "[Context-depth reminder] You've spent {} consecutive turns on the same files:\n",
+        "[Context-depth reminder] You've made {} consecutive tool calls on the same files:\n",
         consecutive,
     );
     for f in sorted {
@@ -317,7 +322,7 @@ mod tests {
         assert!(content.contains("Context-depth reminder"));
         assert!(content.contains("parser.rs"));
         assert!(content.contains("refactor parser"));
-        assert!(content.contains("2 consecutive turns"));
+        assert!(content.contains("2 consecutive tool calls"));
     }
 
     #[test]
