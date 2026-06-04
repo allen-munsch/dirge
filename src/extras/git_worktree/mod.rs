@@ -156,8 +156,240 @@ pub fn create(name: &str) -> Result<(PathBuf, WorktreeInfo), String> {
     ))
 }
 
+/// Run a git subcommand in `repo`, returning trimmed stdout on success
+/// or a trimmed-stderr error on failure. Always inserts `-C <repo>`.
+fn git_in(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// True if `repo`'s working tree has uncommitted changes (staged,
+/// unstaged, or untracked).
+fn is_dirty(repo: &Path) -> Result<bool, String> {
+    Ok(!git_in(repo, &["status", "--porcelain"])?.is_empty())
+}
+
+/// Merge the worktree's branch into `target` in the main repo —
+/// programmatically and conflict-safe (dirge-2qke). Replaces the prior
+/// design that handed the whole merge (including "push and delete the
+/// worktree") to an unconstrained LLM prompt.
+///
+/// Guarantees:
+///   - Refuses if the worktree OR the main repo has uncommitted changes
+///     (a conflicting merge against a dirty tree risks losing work).
+///   - On a merge conflict the merge is **aborted** (`git merge --abort`)
+///     so the repo is left exactly as it was — nothing half-merged.
+///   - Never pushes and never deletes the worktree; the caller decides
+///     what to do after a clean merge. So a failure can't strand work.
+///
+/// Returns `Ok(())` only when `target` cleanly contains the branch.
+pub fn merge_worktree(info: &WorktreeInfo, target: &str) -> Result<(), String> {
+    validate_branch_name(target)?;
+    validate_branch_name(&info.branch)?;
+    let main = info.main_repo_path.as_path();
+
+    if is_dirty(&info.worktree_path)? {
+        return Err(format!(
+            "worktree '{}' has uncommitted changes — commit or discard them before merging",
+            info.branch
+        ));
+    }
+    if is_dirty(main)? {
+        return Err(format!(
+            "main repo at {} has uncommitted changes — commit or stash them before merging",
+            main.display()
+        ));
+    }
+
+    // Switch the main repo to the target branch (prefer `switch`, fall
+    // back to `checkout` on older git). `--` guards the ref name.
+    git_in(main, &["switch", "--", target])
+        .or_else(|_| git_in(main, &["checkout", "--", target]))
+        .map_err(|e| format!("failed to switch main repo to '{target}': {e}"))?;
+
+    // --no-ff keeps the worktree's history explicit. On any failure
+    // (conflict or otherwise) abort so the index/working tree are
+    // restored to the pre-merge state.
+    if let Err(e) = git_in(main, &["merge", "--no-ff", "--", &info.branch]) {
+        let _ = git_in(main, &["merge", "--abort"]);
+        return Err(format!(
+            "merge of '{}' into '{target}' could not complete cleanly and was aborted — \
+             nothing was changed. Resolve it manually in {} (git merge {}). Details: {e}",
+            info.branch,
+            main.display(),
+            info.branch
+        ));
+    }
+    Ok(())
+}
+
+/// Remove a (merged) worktree from the main repo. Best-effort: callers
+/// treat failure as non-fatal since the merge already succeeded. Must be
+/// invoked with the cwd OUTSIDE the worktree being removed.
+pub fn remove_worktree(main_repo: &Path, worktree_path: &Path) -> Result<(), String> {
+    git_in(
+        main_repo,
+        &["worktree", "remove", "--", &worktree_path.to_string_lossy()],
+    )
+    .map(|_| ())
+}
+
 pub fn repo_name(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod merge_tests {
+    //! dirge-2qke: `merge_worktree` is conflict-safe and never strands work.
+    use super::*;
+
+    /// Run git in `dir` with a fixed identity (so commits work without a
+    /// global git config), panicking on failure with stderr.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let mut full = vec![
+            "-c",
+            "user.email=test@dirge",
+            "-c",
+            "user.name=dirge",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ];
+        full.extend_from_slice(args);
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(&full)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write(p: &Path, contents: &str) {
+        std::fs::write(p, contents).unwrap();
+    }
+
+    /// A main repo on `main` with one commit, plus a sibling worktree on
+    /// branch `feature`. Returns (info, tmp_root) — tmp_root is removed by
+    /// the caller.
+    fn setup() -> (WorktreeInfo, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "dirge-wt-merge-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("repo");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init"]);
+        write(&main.join("file.txt"), "base\n");
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-m", "base"]);
+        // Worktree on a new branch `feature`.
+        let wt = root.join("feature");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                "--",
+                wt.to_str().unwrap(),
+            ],
+        );
+        let info = WorktreeInfo {
+            branch: "feature".to_string(),
+            worktree_path: wt,
+            main_repo_path: main,
+        };
+        (info, root)
+    }
+
+    #[test]
+    fn clean_merge_lands_feature_in_main() {
+        let (info, root) = setup();
+        // Distinct, non-conflicting change committed on the worktree.
+        write(&info.worktree_path.join("new.txt"), "from feature\n");
+        git(&info.worktree_path, &["add", "."]);
+        git(&info.worktree_path, &["commit", "-m", "feature work"]);
+
+        merge_worktree(&info, "main").expect("clean merge should succeed");
+
+        // The feature file is now present in the main repo on `main`.
+        assert_eq!(
+            git(&info.main_repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main"
+        );
+        assert!(
+            info.main_repo_path.join("new.txt").exists(),
+            "merged file present in main"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conflicting_merge_aborts_and_leaves_repo_clean() {
+        let (info, root) = setup();
+        // Conflicting edits to the SAME line on both branches.
+        write(&info.main_repo_path.join("file.txt"), "main change\n");
+        git(&info.main_repo_path, &["commit", "-am", "main edit"]);
+        write(&info.worktree_path.join("file.txt"), "feature change\n");
+        git(&info.worktree_path, &["commit", "-am", "feature edit"]);
+
+        let err = merge_worktree(&info, "main").expect_err("conflicting merge must fail");
+        assert!(
+            err.contains("aborted"),
+            "error should say it aborted: {err}"
+        );
+        // The merge was aborted: no MERGE_HEAD, clean tree, main's content intact.
+        assert!(
+            !info.main_repo_path.join(".git/MERGE_HEAD").exists(),
+            "merge must be aborted (no MERGE_HEAD)"
+        );
+        assert!(
+            git(&info.main_repo_path, &["status", "--porcelain"]).is_empty(),
+            "main working tree must be clean after abort"
+        );
+        assert_eq!(
+            std::fs::read_to_string(info.main_repo_path.join("file.txt")).unwrap(),
+            "main change\n",
+            "main's content is untouched by the aborted merge"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dirty_worktree_is_refused() {
+        let (info, root) = setup();
+        // Uncommitted change in the worktree.
+        write(&info.worktree_path.join("file.txt"), "uncommitted\n");
+        let err = merge_worktree(&info, "main").expect_err("dirty worktree must be refused");
+        assert!(
+            err.contains("uncommitted"),
+            "error names the dirty state: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

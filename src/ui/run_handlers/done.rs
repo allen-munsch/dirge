@@ -29,7 +29,6 @@ use crate::session::MessageRole;
 use crate::ui::agent_io::persist_turn_to_db;
 use crate::ui::avatar;
 use crate::ui::colors::{c_agent, c_error};
-use crate::ui::events::render_session;
 use crate::ui::run_handlers::{AgentBuildDeps, RunCtx};
 use crate::ui::slash::handle_compress;
 use crate::ui::theme;
@@ -43,12 +42,6 @@ use crate::ui::tool_display::{chamber_bottom, chamber_widths};
 pub(crate) struct LoopBits<'a> {
     pub state: &'a mut Option<crate::extras::r#loop::LoopState>,
     pub label: &'a mut Option<String>,
-}
-
-/// Git-worktree return path. Same conditional rationale as `LoopBits`.
-#[cfg(feature = "git-worktree")]
-pub(crate) struct WorktreeBits<'a> {
-    pub return_path: &'a mut Option<String>,
 }
 
 // False positive for `await_holding_lock`: the plugin-manager guard
@@ -83,7 +76,6 @@ pub(crate) async fn handle_done(
         &std::sync::Arc<std::sync::Mutex<PluginManager>>,
     >,
     #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
-    #[cfg(feature = "git-worktree")] worktree_bits: WorktreeBits<'_>,
 ) -> anyhow::Result<()> {
     // Rebind the bundled deps to locals so the body below reads unchanged.
     let client = deps.client;
@@ -590,56 +582,10 @@ pub(crate) async fn handle_done(
         );
     }
 
-    #[cfg(feature = "git-worktree")]
-    if let Some(main_path) = worktree_bits.return_path.take() {
-        match std::env::set_current_dir(&main_path) {
-            Ok(()) => {
-                ctx.session.working_dir = compact_str::CompactString::new(&main_path);
-                // Re-anchor the permission checker to the main repo after
-                // merging back from the worktree, else the CWD write-allow
-                // stays pointed at the removed worktree and main-repo writes
-                // prompt. Same contract as /cd and worktree create/exit.
-                if let Some(perm) = permission
-                    && let Ok(mut guard) = perm.lock()
-                {
-                    guard.set_working_dir(&ctx.session.working_dir);
-                }
-                context.reload();
-                let model = client.completion_model(ctx.session.model.to_string());
-                *agent = crate::provider::build_agent(
-                    model,
-                    ctx.cli,
-                    ctx.cfg,
-                    context,
-                    permission.clone(),
-                    ask_tx.clone(),
-                    question_tx.clone(),
-                    plan_tx.clone(),
-                    bg_store.clone(),
-                    #[cfg(feature = "lsp")]
-                    lsp_manager.cloned(),
-                    sandbox.clone(),
-                    #[cfg(feature = "mcp")]
-                    mcp_manager,
-                    #[cfg(feature = "semantic")]
-                    semantic_manager,
-                    Some(ctx.session.id.to_string()),
-                )
-                .await;
-                render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, context)?;
-                ctx.renderer.write_line(
-                    &format!("merged and returned to main repo at {}", main_path),
-                    c_agent(),
-                )?;
-            }
-            Err(e) => {
-                ctx.renderer.write_line(
-                    &format!("warning: failed to change back to main repo: {}", e),
-                    c_error(),
-                )?;
-            }
-        }
-    }
+    // (dirge-2qke / dirge-72ea) The post-merge cwd restore that used to
+    // live here — fired unconditionally on the first Done after /wt-merge,
+    // even if the merge had failed — is gone. /wt-merge now merges
+    // programmatically and restores the cwd inline, only on a clean merge.
 
     // Drain the interjection queue once the run is fully
     // idle (no plugin follow-up, loop iteration, or worktree

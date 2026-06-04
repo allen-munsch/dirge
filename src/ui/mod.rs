@@ -421,8 +421,6 @@ pub async fn run_interactive(
     let mut loop_label: Option<String> = None;
     #[cfg(feature = "loop")]
     let mut loop_state: Option<crate::extras::r#loop::LoopState> = None;
-    #[cfg(feature = "git-worktree")]
-    let mut wt_return_path: Option<String> = None;
     let mut rewind_picker = ListPicker::new();
     let mut last_esc: Option<std::time::Instant> = None;
 
@@ -1571,6 +1569,11 @@ pub async fn run_interactive(
                                     }
                                     #[cfg(feature = "git-worktree")]
                                     Err(e) if e.to_string().starts_with("DEFER_WT_MERGE:") => {
+                                        // dirge-2qke / dirge-72ea: perform the merge
+                                        // PROGRAMMATICALLY (conflict-safe, no push, no
+                                        // unconditional worktree delete) instead of
+                                        // handing it to an LLM prompt, and restore the
+                                        // cwd to the main repo ONLY on a clean merge.
                                         let err_msg = e.to_string();
                                         let parts: Vec<&str> = err_msg.strip_prefix("DEFER_WT_MERGE:").unwrap_or("").splitn(5, ':').collect();
                                         if parts.len() == 5 {
@@ -1578,25 +1581,66 @@ pub async fn run_interactive(
                                             let target = parts[1];
                                             let main_path = parts[2].to_string();
                                             let wt_path = parts[3];
-                                            let _repo_name = parts[4];
-                                            let prompt = format!(
-                                                "I'm in a git worktree on branch '{}' at '{}'. \
-                                                 Please merge branch '{}' into '{}' in the main repo at '{}', \
-                                                 push the changes, and delete the worktree at '{}'. \
-                                                 After merging, go back to the main repo at '{}'.",
-                                                branch, wt_path, branch, target, main_path, wt_path, main_path
-                                            );
-                                            let history = crate::agent::runner::convert_history(session);
-                                            session.add_message(MessageRole::User, &prompt);
-                                            renderer.set_avatar_state(avatar::AvatarState::Idle);
-                                            last_user_prompt.clone_from(&prompt);
-                                            let runner = agent.clone().spawn_runner(
-                                                crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
-                                                history,
-                                                Some(interjection_queue.clone()),
-                                            );
-                                            runner.install_into(&mut agent_rx, &mut agent_abort, &mut agent_interject, &mut agent_cancel, &mut is_running);
-                                            wt_return_path = Some(main_path);
+                                            let info = crate::extras::git_worktree::WorktreeInfo {
+                                                branch: branch.to_string(),
+                                                worktree_path: std::path::PathBuf::from(wt_path),
+                                                main_repo_path: std::path::PathBuf::from(&main_path),
+                                            };
+                                            match crate::extras::git_worktree::merge_worktree(&info, target) {
+                                                Err(merge_err) => {
+                                                    // Merge aborted/refused — repo untouched,
+                                                    // stay in the worktree.
+                                                    renderer.write_line(&format!("merge failed: {merge_err}"), c_error())?;
+                                                }
+                                                Ok(()) => {
+                                                    // Clean merge. Leave the worktree (cwd is
+                                                    // inside it) BEFORE removing it.
+                                                    match std::env::set_current_dir(&main_path) {
+                                                        Err(e) => {
+                                                            renderer.write_line(&format!(
+                                                                "merged '{branch}' into '{target}', but failed to return to main repo: {e}"
+                                                            ), c_error())?;
+                                                        }
+                                                        Ok(()) => {
+                                                            let removed = crate::extras::git_worktree::remove_worktree(
+                                                                std::path::Path::new(&main_path),
+                                                                std::path::Path::new(wt_path),
+                                                            );
+                                                            session.working_dir = compact_str::CompactString::new(&main_path);
+                                                            if let Some(perm) = &permission
+                                                                && let Ok(mut guard) = perm.lock()
+                                                            {
+                                                                guard.set_working_dir(&session.working_dir);
+                                                            }
+                                                            context.reload();
+                                                            let model = client.completion_model(session.model.to_string());
+                                                            agent = crate::provider::build_agent(
+                                                                model, cli, cfg, context,
+                                                                permission.clone(), ask_tx.clone(), question_tx.clone(),
+                                                                plan_tx.clone(), bg_store.clone(),
+                                                                #[cfg(feature = "lsp")] lsp_manager.clone(),
+                                                                sandbox.clone(),
+                                                                #[cfg(feature = "mcp")] mcp_manager.as_ref(),
+                                                                #[cfg(feature = "semantic")] semantic_manager,
+                                                                Some(session.id.to_string()),
+                                                            ).await;
+                                                            render_session(&mut renderer, session, cli, cfg, context)?;
+                                                            renderer.write_line(&format!(
+                                                                "merged '{branch}' into '{target}' and returned to main repo at {main_path}"
+                                                            ), c_agent())?;
+                                                            if removed.is_err() {
+                                                                renderer.write_line(&format!(
+                                                                    "note: worktree at {wt_path} was not removed; remove it with `git worktree remove` when ready"
+                                                                ), theme::dim())?;
+                                                            }
+                                                            renderer.write_line(
+                                                                "push when ready (the merge was NOT pushed)",
+                                                                theme::dim(),
+                                                            )?;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     #[cfg(feature = "git-worktree")]
@@ -1960,10 +2004,6 @@ pub async fn run_interactive(
                             state: &mut loop_state,
                             label: &mut loop_label,
                         };
-                        #[cfg(feature = "git-worktree")]
-                        let worktree_bits = run_handlers::done::WorktreeBits {
-                            return_path: &mut wt_return_path,
-                        };
                         run_handlers::handle_done(
                             &mut ctx,
                             response,
@@ -1983,8 +2023,6 @@ pub async fn run_interactive(
                             plugin_manager,
                             #[cfg(feature = "loop")]
                             loop_bits,
-                            #[cfg(feature = "git-worktree")]
-                            worktree_bits,
                         ).await?;
                     }
                     #[cfg(feature = "plugin")]
