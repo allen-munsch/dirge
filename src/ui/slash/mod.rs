@@ -729,7 +729,11 @@ pub fn slash_command_names() -> Vec<&'static str> {
     }
     #[cfg(feature = "mcp")]
     cmds.push("/mcp");
-    #[cfg(feature = "loop")]
+    // `/loop` is always dispatched (its handler prints a "requires the
+    // 'loop' feature" message when built without it), so it's a KNOWN
+    // command regardless of the feature — keep the canonical list in sync
+    // (dirge-3p8j). The gated entry made it un-completable / "unknown" in
+    // no-loop builds even though the arm handled it.
     cmds.push("/loop");
     #[cfg(feature = "dap")]
     cmds.push("/debug");

@@ -116,14 +116,16 @@ pass openai-key | dirge --provider openai --api-key-stdin
 | `/tree [id-prefix]` | Show session tree; with prefix, switch the active branch to that leaf |
 | `/fork [id-prefix]` | Branch off the chosen message (default: last user message) and restore its text to the editor |
 | `/clone <id-prefix>` | Switch the active branch to the entry without restoring text |
-| `/loop [prompt]` | Start iterative coding loop |
+| `/loop [prompt]` | Start iterative coding loop (needs the `loop` feature; otherwise prints a hint) |
+| `/plan <task>` | Run the phased explore→plan→implement→review workflow (opt-in via `phased_workflow_enabled`). See [docs/agent-loop.md](docs/agent-loop.md#phased-plan-workflow-plan) |
 | `/worktree <name>` | Create a git worktree on branch |
 | `/wt-merge [branch]` | Merge worktree branch |
 | `/wt-exit` | Exit worktree |
 | `/toggle` | Toggle features on/off (currently todo tools) |
 | `/regen-prompts` | Restore built-in prompts |
-| `/mcp` | List MCP servers and tools |
-| `/panel [on\|off\|auto]` | Toggle both side panels together — left: session vitals (context gauge, recent activity, git); right: system load, MCP, LSP, todos, modified files. `auto` shows them at ≥152 cols. |
+| `/mcp` | List MCP servers and tools (only present in builds with the `mcp` feature) |
+| `/kill [id]` | Kill the subagent on the focused chat tab (also `Ctrl+K`) |
+| `/panel [on\|off\|auto\|debug]` | Toggle both side panels together — left: session vitals (context gauge, recent activity, git); right: system load, MCP, LSP, todos, modified files. `auto` shows them at ≥152 cols; `debug` forces the layout-debug view. |
 | `/display <panes>` | Choose which panes show, e.g. `/display main`, `/display main\|right`, `/display left\|main\|right`. The main pane is always shown; left/right toggle independently. Set a default with the `display` config key. |
 | `/allow [list\|add\|remove\|clear]` | Manage the session permission allowlist; bare `/allow` lists it. See [docs/permissions.md](docs/permissions.md#allow-always-and-the-session-allowlist) |
 | `/why <tool> [input]` | Dry-run a permission decision and print the full policy trace |
