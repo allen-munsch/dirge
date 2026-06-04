@@ -280,14 +280,32 @@ pub fn row_with_bg(style: BoxStyle, content: &str, total_w: usize, bg_idx: u8) -
         (out, used + 1)
     };
     let pad = inner.saturating_sub(trimmed_w);
+    // dirge-ufkp: honour `--no-color`. These diff +/- background escapes
+    // are baked straight into the line (write_line stores it verbatim),
+    // so they bypass the `theme::*()` accessors the no-color chokepoint
+    // collapses. Gate them on the same flag so a no-color terminal sees a
+    // plain padded row instead of green/red blocks.
+    let (bg_open, bg_close) = diff_bg_escapes(bg_idx, crate::ui::theme::no_color());
     format!(
-        "{} \x1b[48;5;{}m{}{}\x1b[49m {}",
+        "{} {}{}{}{} {}",
         style.vertical(),
-        bg_idx,
+        bg_open,
         trimmed,
         " ".repeat(pad),
+        bg_close,
         style.vertical(),
     )
+}
+
+/// The `(open, close)` SGR background escapes for a diff `+`/`-` row, or
+/// empty strings under `--no-color`. Pure (takes the flag as a param) so
+/// it's testable without the set-once `NO_COLOR` global. dirge-ufkp.
+fn diff_bg_escapes(bg_idx: u8, no_color: bool) -> (String, String) {
+    if no_color {
+        (String::new(), String::new())
+    } else {
+        (format!("\x1b[48;5;{bg_idx}m"), String::from("\x1b[49m"))
+    }
 }
 
 /// Expand `\t` to spaces honouring a fixed tab stop. Walks the
@@ -431,6 +449,31 @@ impl BoxBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dirge-ufkp: diff backgrounds are emitted normally, but suppressed
+    /// entirely under `--no-color` (no stray `48;5;` / `49` escapes).
+    #[test]
+    fn diff_bg_escapes_respect_no_color() {
+        let (open, close) = diff_bg_escapes(22, false);
+        assert_eq!(open, "\x1b[48;5;22m");
+        assert_eq!(close, "\x1b[49m");
+
+        let (open, close) = diff_bg_escapes(22, true);
+        assert!(open.is_empty(), "no-color must drop the bg-open escape");
+        assert!(close.is_empty(), "no-color must drop the bg-close escape");
+
+        // And the row built under no-color carries no SGR escapes at all.
+        let row_no_color = {
+            // Build the row body the way row_with_bg does, but with the
+            // no-color escapes — assert no ESC bytes leak through.
+            let (o, c) = diff_bg_escapes(52, true);
+            format!("│ {o}+ added{c} │")
+        };
+        assert!(
+            !row_no_color.contains('\x1b'),
+            "no escapes under no-color: {row_no_color:?}"
+        );
+    }
 
     /// Top, bottom, and divider all hit the requested external width.
     #[test]
