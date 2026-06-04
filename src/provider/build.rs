@@ -87,9 +87,12 @@ pub async fn build_agent(
 
             // build_agent_inner now only needs model + cli/cfg/context for the
             // preamble — all tool wiring flows to build_loop_tools below
-            // [dirge-tfip].
+            // [dirge-tfip]. The ACTIVE model name + provider are passed
+            // explicitly so model-family steering tracks /model and /agent
+            // swaps instead of the launch-time CLI model (dirge-5db6).
             let (agent, cache, memory_provider) =
-                builder::build_agent_inner($m, cli, cfg, context).await;
+                builder::build_agent_inner($m, cli, cfg, context, &provider_name, &model_name)
+                    .await;
 
             // Phase 4.5h-6: also build the LoopTool registry the
             // new agent_loop path dispatches against. Tools share

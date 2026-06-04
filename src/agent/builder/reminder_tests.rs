@@ -456,7 +456,8 @@ async fn build_agent_inner_emits_assembled_preamble() {
         .completions_api();
     let model = client.completion_model("gpt-4o");
 
-    let (agent, _cache, _provider) = build_agent_inner(model, &cli, &cfg, &context).await;
+    let (agent, _cache, _provider) =
+        build_agent_inner(model, &cli, &cfg, &context, "openai", "gpt-4o").await;
 
     let preamble = agent.preamble.unwrap_or_default();
 
@@ -538,6 +539,64 @@ async fn build_agent_inner_emits_assembled_preamble() {
             "project-skills preamble must direct to action='load'"
         );
     }
+}
+
+/// dirge-5db6 — model-family steering keys off the ACTIVE model passed
+/// to `build_agent_inner`, not the launch-time CLI model. The CLI here
+/// carries no `--model`, so `cli.resolve_model` would resolve to a
+/// non-DeepSeek default; the active model arg must override that. This
+/// is the regression: after a `/model`/`/agent` swap to a DeepSeek chat
+/// model the steering fragment must appear, and switching away must drop
+/// it.
+#[tokio::test]
+async fn steering_fragment_tracks_active_model_not_cli() {
+    use crate::context::ContextFiles;
+    use rig::client::CompletionClient;
+    use rig::providers::openai;
+
+    let cli = Cli::parse_from::<_, &str>(["dirge"]); // no --model
+    let cfg = Config::default();
+    let empty_ctx = || ContextFiles {
+        agents: None,
+        prompts: std::collections::HashMap::new(),
+        agent_defs: Default::default(),
+        current_agent: None,
+        current_prompt: None,
+        current_prompt_name: None,
+        current_prompt_deny_tools: Vec::new(),
+        prompt_layer: None,
+        agent_layer: None,
+        model_before_agent: None,
+    };
+    let client = openai::Client::new("test-key")
+        .expect("openai client builds")
+        .completions_api();
+
+    // Active model = a DeepSeek chat model → fragment present, even
+    // though the openai client/model and the CLI default are not DeepSeek.
+    let ctx = empty_ctx();
+    let model = client.completion_model("gpt-4o");
+    let (agent, _c, _p) =
+        build_agent_inner(model, &cli, &cfg, &ctx, "deepseek", "deepseek-v4-pro").await;
+    assert!(
+        agent
+            .preamble
+            .unwrap_or_default()
+            .contains("Plan-Execute-Verify"),
+        "DeepSeek-chat active model must inject the steering fragment"
+    );
+
+    // Active model = a non-DeepSeek model → fragment absent.
+    let ctx = empty_ctx();
+    let model = client.completion_model("gpt-4o");
+    let (agent, _c, _p) = build_agent_inner(model, &cli, &cfg, &ctx, "openai", "gpt-4o").await;
+    assert!(
+        !agent
+            .preamble
+            .unwrap_or_default()
+            .contains("Plan-Execute-Verify"),
+        "non-DeepSeek active model must NOT inject the steering fragment"
+    );
 }
 
 /// dirge-a6bv — assembled preamble carries hermes's MEMORY_GUIDANCE

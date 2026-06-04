@@ -33,6 +33,14 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     cli: &Cli,
     cfg: &Config,
     context: &ContextFiles,
+    // The ACTIVE provider + model identifiers (post `/model` / `/agent`
+    // swap), used for model-family steering. Passing them explicitly
+    // fixes dirge-5db6: `cli.resolve_model`/`resolve_provider` only see
+    // the launch-time CLI/config model, so steering would otherwise lag a
+    // mid-session swap (false negative switching TO DeepSeek, false
+    // positive switching away).
+    active_provider: &str,
+    active_model: &str,
 ) -> (
     Agent<M>,
     ToolCache,
@@ -203,7 +211,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     // Model-aware steering. DeepSeek chat models get a research-backed
     // guidance fragment; appended last so it's nearest the action
     // boundary, resisting prompt-distance drift. No-op for other models.
-    let family = resolve_family(&cli.resolve_provider(cfg), &cli.resolve_model(cfg));
+    let family = resolve_family(active_provider, active_model);
     if let Some(fragment) = model_steering_fragment(family) {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(fragment);
