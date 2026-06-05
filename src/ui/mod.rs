@@ -697,6 +697,12 @@ pub async fn run_interactive(
         render_frame!();
 
         tokio::select! {
+            // #387: poll arms in order so USER INPUT takes priority — when a
+            // keystroke and an agent event are both ready, the keystroke is
+            // handled first. Keeps the UI responsive under a heavy agent
+            // event stream (user input is bursty, so agent_rx still drains
+            // between keys).
+            biased;
             Some(ev) = user_rx.recv() => {
                 // Drain selection-relevant events (mouse drag/up,
                 // `y`, `Esc`-while-active) before the consumer's
