@@ -25,6 +25,10 @@ mod search_rewind;
 mod selection;
 mod shell_exec;
 mod slash;
+// #387 WIP: the data model is defined first, then wired into the event
+// loop + render effect. `allow(dead_code)` until the migration lands.
+#[allow(dead_code)]
+mod state;
 mod status;
 #[cfg(feature = "plugin")]
 mod streaming;
