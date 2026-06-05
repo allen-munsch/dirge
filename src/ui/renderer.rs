@@ -793,6 +793,7 @@ impl Renderer {
     /// surface the new chat in the UI.
     pub fn add_chat(&mut self, name: impl Into<String>) -> usize {
         self.chats.push(ChatSnapshot::empty(name.into()));
+        self.needs_paint = true;
         self.chats.len() - 1
     }
 
@@ -807,6 +808,7 @@ impl Renderer {
         self.save_active();
         self.active_chat = idx;
         self.load_active();
+        self.needs_paint = true;
     }
 
     /// Cycle to the next chat (wraps from last → first).
@@ -856,6 +858,7 @@ impl Renderer {
         } else if idx == self.active_chat && self.active_chat >= self.chats.len() {
             self.active_chat = 0;
         }
+        self.needs_paint = true;
     }
 
     pub fn active_chat(&self) -> usize {
@@ -957,6 +960,7 @@ impl Renderer {
     pub fn set_avatar_state(&mut self, state: crate::ui::avatar::AvatarState) {
         if self.avatar_state != state {
             self.avatar_state = state;
+            self.needs_paint = true;
         }
     }
 
@@ -1051,11 +1055,13 @@ impl Renderer {
         if self.alert_title.is_empty() {
             self.alert_title = "[ALERT]".to_string();
         }
+        self.needs_paint = true;
     }
 
     pub fn clear_alert_overlay(&mut self) {
         self.alert_overlay = None;
         self.alert_title.clear();
+        self.needs_paint = true;
     }
 
     /// Set (or clear, with `None`) the rewind-mode list-picker overlay. The
@@ -1064,6 +1070,7 @@ impl Renderer {
     /// sets this explicitly on enter/update and clears it on exit [dirge-92em].
     pub fn set_rewind_overlay(&mut self, overlay: Option<crate::ui::picker::PickerOverlay>) {
         self.rewind_overlay = overlay;
+        self.needs_paint = true;
     }
 
     pub fn set_panel_data(&mut self, data: PanelData) {
@@ -1107,6 +1114,9 @@ impl Renderer {
         let next = next as usize;
         let changed = next != self.modified_offset;
         self.modified_offset = next;
+        if changed {
+            self.needs_paint = true;
+        }
         changed
     }
 
@@ -1209,6 +1219,12 @@ impl Renderer {
         } else if self.scroll_offset > max_offset {
             self.scroll_offset = max_offset;
         }
+        // #387: replacing displayed content is an explicit visible change —
+        // mark dirty so the render effect repaints. Without this the modal
+        // sub-loops (question/permission/dialog) that rebuild their content
+        // via `replace_from` each keystroke wouldn't repaint and would look
+        // frozen.
+        self.needs_paint = true;
     }
 
     /// Number of rows reserved for chat history above the input area.
@@ -1321,6 +1337,7 @@ impl Renderer {
         self.selection_active = false;
         self.selection_start = None;
         self.selection_end = None;
+        self.needs_paint = true;
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -1455,6 +1472,13 @@ impl Renderer {
             let max_offset = self.buffer.len().saturating_sub(visible);
             self.scroll_offset = (self.scroll_offset + 1).min(max_offset);
         }
+        // #387: centralize dirty-marking at the buffer primitive so no
+        // higher-level appender can forget it. Gated on being at the bottom
+        // (scrolled-up views don't auto-jump on new content, matching prior
+        // behavior).
+        if self.scroll_offset == 0 {
+            self.needs_paint = true;
+        }
     }
 
     pub fn is_scrolling(&self) -> bool {
@@ -1467,12 +1491,14 @@ impl Renderer {
         if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
         }
+        self.needs_paint = true;
     }
 
     pub fn scroll_line_down(&mut self) {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
         }
+        self.needs_paint = true;
     }
 
     /// True when the chat is scrolled up off the newest content
@@ -1487,6 +1513,7 @@ impl Renderer {
         let page = visible.saturating_sub(2).max(1);
         let max_offset = self.buffer.len().saturating_sub(visible);
         self.scroll_offset = (self.scroll_offset + page).min(max_offset);
+        self.needs_paint = true;
     }
 
     pub fn scroll_page_down(&mut self) {
@@ -1497,11 +1524,13 @@ impl Renderer {
         } else {
             self.scroll_offset = self.scroll_offset.saturating_sub(page);
         }
+        self.needs_paint = true;
     }
 
     pub fn scroll_to_top(&mut self) {
         let visible = self.visible_lines();
         self.scroll_offset = self.buffer.len().saturating_sub(visible);
+        self.needs_paint = true;
     }
 
     pub fn scroll_to_bottom(&mut self) -> io::Result<()> {
