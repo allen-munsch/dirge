@@ -298,6 +298,11 @@ pub struct Renderer {
     lines: u16,
     col: u16,
     spinner_tick: bool,
+    /// #387: dirty flag for the single-paint-per-event model. Mutators
+    /// (write_line/write/scroll/render_viewport/set_bottom) set this
+    /// instead of painting inline; [`Renderer::flush`] performs the one
+    /// real `tui_redraw` per event iff it is set. See [`crate::ui::state`].
+    needs_paint: bool,
     buffer: Vec<LineEntry>,
     partial: CompactString,
     partial_color: Color,
@@ -460,6 +465,7 @@ impl Renderer {
             lines: 0,
             col: 0,
             spinner_tick: false,
+            needs_paint: false,
             buffer: Vec::new(),
             partial: CompactString::new(""),
             partial_color: Color::White,
@@ -1614,12 +1620,18 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn draw_bottom(
+    /// Update the cached bottom-area state (input rows, status text,
+    /// ghost/preview, picker overlay, spinner) from the editor + status.
+    /// Does NOT paint — callers either paint immediately ([`draw_bottom`])
+    /// or defer to the next [`flush`] ([`set_bottom`], the #387 model-
+    /// driven path). Split out so the single-paint refactor can reuse the
+    /// exact cached-state derivation.
+    fn cache_bottom(
         &mut self,
         editor: &crate::ui::input::InputEditor,
         status: &str,
         is_running: bool,
-    ) -> io::Result<()> {
+    ) {
         // Use the editor's display projection so paste markers
         // (`\x01<idx>\x01` blocks) appear as `[N lines pasted]`
         // placeholders rather than bare digits between invisible
@@ -1685,8 +1697,52 @@ impl Renderer {
             .filter(|p| p.active)
             .map(|p| p.overlay())
             .or_else(|| self.rewind_overlay.clone());
+    }
 
+    /// Legacy immediate-paint entry: cache the bottom state and paint now.
+    /// Retained for call sites not yet migrated to the model-driven
+    /// [`set_bottom`] + [`flush`] path.
+    pub fn draw_bottom(
+        &mut self,
+        editor: &crate::ui::input::InputEditor,
+        status: &str,
+        is_running: bool,
+    ) -> io::Result<()> {
+        self.cache_bottom(editor, status, is_running);
         self.tui_redraw()
+    }
+
+    /// #387: model-driven bottom update — cache the bottom state and mark
+    /// the frame dirty WITHOUT painting. The event loop calls this once
+    /// per event (with the status line built once from the model) and then
+    /// [`flush`] performs the single paint.
+    pub fn set_bottom(
+        &mut self,
+        editor: &crate::ui::input::InputEditor,
+        status: &str,
+        is_running: bool,
+    ) {
+        self.cache_bottom(editor, status, is_running);
+        self.needs_paint = true;
+    }
+
+    /// #387: mark the frame dirty so the next [`flush`] repaints. Mutators
+    /// that change on-screen content call this instead of painting inline.
+    pub fn request_repaint(&mut self) {
+        self.needs_paint = true;
+    }
+
+    /// #387: the single paint per event. Performs one `tui_redraw` iff the
+    /// frame is dirty, then clears the flag. A no-op when nothing changed,
+    /// which preserves token-stream coalescing (the token handler only
+    /// marks dirty at frame intervals).
+    pub fn flush(&mut self) -> io::Result<()> {
+        if self.needs_paint {
+            self.needs_paint = false;
+            self.tui_redraw()
+        } else {
+            Ok(())
+        }
     }
 }
 
