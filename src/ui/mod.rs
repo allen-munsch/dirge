@@ -523,23 +523,7 @@ pub async fn run_interactive(
     }
 
     render_session(&mut renderer, session, cli, cfg, context)?;
-    renderer.draw_bottom(
-        &input,
-        &with_queue(
-            StatusLine::render(
-                session,
-                false,
-                0,
-                None,
-                context.current_prompt_name.as_deref(),
-                perm_mode().as_deref(),
-                bg_store.as_ref(),
-                shell_store.as_ref(),
-            ),
-            ui.interjection_queue.lock().unwrap().len(),
-        ),
-        false,
-    )?;
+    renderer.request_repaint();
 
     // Notification receiver. The SENDER side was installed at the
     // very top of `main()` so MCP forwarders spawning during
@@ -721,12 +705,7 @@ pub async fn run_interactive(
                 match crate::ui::selection::handle(&ev, &mut renderer) {
                     crate::ui::selection::Outcome::Repaint
                     | crate::ui::selection::Outcome::RepaintAndCopied => {
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                         continue;
                     }
                     crate::ui::selection::Outcome::NotHandled => {}
@@ -755,12 +734,7 @@ pub async fn run_interactive(
                         } else {
                             renderer.scroll_line_up();
                         }
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                         continue;
                     }
                     UserEvent::ScrollDown { row, col } => {
@@ -769,21 +743,12 @@ pub async fn run_interactive(
                         } else {
                             renderer.scroll_line_down();
                         }
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                         continue;
                     }
                     UserEvent::Paste(text) => {
                         input.handle_paste(&text);
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                         continue;
                     }
                     UserEvent::Resize => {
@@ -791,12 +756,7 @@ pub async fn run_interactive(
                         // wrap, panel clipping, and input box rows recompute
                         // at the new size instead of waiting for the next
                         // unrelated event to trigger a redraw.
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                         continue;
                     }
                     UserEvent::Key(key) => {
@@ -813,22 +773,12 @@ pub async fn run_interactive(
                             if ui.rewind_picker.active {
                                 ui.rewind_picker.deactivate();
                                 renderer.set_rewind_overlay(None);
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             if input.is_in_search() {
                                 input.cancel_search();
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             if ui.is_running {
@@ -907,11 +857,7 @@ pub async fn run_interactive(
                                     &msg,
                                     c_error(),
                                 )?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                             } else if !input.expanded().is_empty() {
                                 // Idle Ctrl+C/D with a typed draft: clear the
                                 // line instead of quitting, so an accidental
@@ -919,11 +865,7 @@ pub async fn run_interactive(
                                 // draft (readline/bash behavior). Only an EMPTY
                                 // input line exits.
                                 input.set_text("");
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                             } else {
                                 // dirge-bx4g: clean exit via Ctrl+C / Ctrl+D
                                 // while idle — fire on_session_end so plugin
@@ -939,12 +881,7 @@ pub async fn run_interactive(
                         if key.code == KeyCode::Esc && ui.is_running {
                             if input.is_in_search() {
                                 input.cancel_search();
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             ui.is_running = false;
@@ -979,11 +916,7 @@ pub async fn run_interactive(
                                 "interrupted (Esc)"
                             };
                             renderer.write_line(msg, c_error())?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                ui.is_running,
-                            )?;
+                            renderer.request_repaint();
                             continue;
                         }
 
@@ -991,10 +924,10 @@ pub async fn run_interactive(
                             if let Some(idx) = ui.rewind_picker.handle_key(key) {
                                 rewind_session(session, idx, &mut renderer)?;
                                 ui.rewind_picker.deactivate();
-                                renderer.render_viewport()?;
+                                renderer.request_repaint();
                             }
                             if ui.rewind_picker.active {
-                                renderer.render_viewport()?;
+                                renderer.request_repaint();
                             }
                             // Reflect the picker's post-handle_key state into the
                             // scene overlay (Some while active, None once a
@@ -1002,23 +935,14 @@ pub async fn run_interactive(
                             renderer.set_rewind_overlay(
                                 ui.rewind_picker.active.then(|| ui.rewind_picker.overlay()),
                             );
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                ui.is_running,
-                            )?;
+                            renderer.request_repaint();
                             continue;
                         }
 
                         if key.code == KeyCode::Esc && !ui.is_running {
                             if input.is_in_search() {
                                 input.cancel_search();
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             let now = std::time::Instant::now();
@@ -1027,20 +951,12 @@ pub async fn run_interactive(
                                     ui.last_esc = None;
                                     open_rewind_picker(session, &mut ui.rewind_picker);
                                     renderer.set_rewind_overlay(Some(ui.rewind_picker.overlay()));
-                                    renderer.draw_bottom(
-                                        &input,
-                                        &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                        ui.is_running,
-                                    )?;
+                                    renderer.request_repaint();
                                     continue;
                                 }
                             ui.last_esc = Some(now);
                             renderer.write_line("Press Esc again to rewind...", theme::dim())?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                ui.is_running,
-                            )?;
+                            renderer.request_repaint();
                             continue;
                         }
 
@@ -1054,11 +970,7 @@ pub async fn run_interactive(
                                 &format!("reasoning visibility: {}", if ui.show_reasoning { "on" } else { "off" }),
                                 Color::White,
                             )?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                ui.is_running,
-                            )?;
+                            renderer.request_repaint();
                             continue;
                         }
 
@@ -1086,12 +998,7 @@ pub async fn run_interactive(
                                     EXPAND_CAP_BYTES,
                                 )?;
                             }
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                ui.is_running,
-                            )?;
+                            renderer.request_repaint();
                             continue;
                         }
 
@@ -1116,24 +1023,7 @@ pub async fn run_interactive(
                                 )
                             };
                             renderer.write_line(&msg, theme::dim())?;
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(
-                                    StatusLine::render(
-                                        session,
-                                        ui.is_running,
-                                        0,
-                                        ui.loop_label.as_deref(),
-                                        context.current_prompt_name.as_deref(),
-                                        perm_mode().as_deref(),
-                                        bg_store.as_ref(),
-                                        shell_store.as_ref(),
-                                    ),
-                                    ui.interjection_queue.lock().unwrap().len(),
-                                ),
-                                ui.is_running,
-                            )?;
+                            renderer.request_repaint();
                             continue;
                         }
 
@@ -1199,12 +1089,7 @@ pub async fn run_interactive(
                                     &mut ui.tool_calls_this_run,
                                 );
                             }
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                ui.is_running,
-                            )?;
+                            renderer.request_repaint();
                             continue;
                         }
 
@@ -1250,12 +1135,7 @@ pub async fn run_interactive(
                                         );
                                     }
                                 }
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                         }
@@ -1263,41 +1143,22 @@ pub async fn run_interactive(
                         match action {
                             Some(KeyAction::ScrollPageUp) => {
                                 renderer.scroll_page_up();
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             Some(KeyAction::ScrollPageDown) => {
                                 renderer.scroll_page_down();
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             Some(KeyAction::ScrollToTop) => {
                                 renderer.scroll_to_top();
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             Some(KeyAction::ScrollToBottom) => {
                                 renderer.scroll_to_bottom()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             _ => {}
@@ -1305,12 +1166,7 @@ pub async fn run_interactive(
 
                         if input.picker.as_ref().is_some_and(|p| p.active)
                             && input.handle_picker_key(key) {
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
 
@@ -1340,11 +1196,7 @@ pub async fn run_interactive(
                                         )?;
                                     }
                                 }
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
 
@@ -1362,11 +1214,7 @@ pub async fn run_interactive(
                                     // bottom and consume the key (don't also
                                     // move the input cursor).
                                     renderer.scroll_to_bottom()?;
-                                    renderer.draw_bottom(
-                                        &input,
-                                        &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                        ui.is_running,
-                                    )?;
+                                    renderer.request_repaint();
                                     continue;
                                 }
                                 Some(ScrollSnap::TypeThrough) => {
@@ -1408,11 +1256,7 @@ pub async fn run_interactive(
                                     "loop active — message queued (will inject at next turn boundary; /loop stop to cancel)",
                                     c_agent(),
                                 )?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             if renderer.is_scrolling() {
@@ -1429,11 +1273,7 @@ pub async fn run_interactive(
                                         "agent is busy, wait or interrupt first",
                                         c_error(),
                                     )?;
-                                    renderer.draw_bottom(
-                                        &input,
-                                        &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                        ui.is_running,
-                                    )?;
+                                    renderer.request_repaint();
                                     continue;
                                 }
                                 // Render deferred — the agent loop will emit
@@ -1480,11 +1320,7 @@ pub async fn run_interactive(
                                         }
                                     }
                                 }
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                    ui.is_running,
-                                )?;
+                                renderer.request_repaint();
                                 continue;
                             }
                             if text.starts_with('/') {
@@ -1522,11 +1358,7 @@ pub async fn run_interactive(
                                         "agent is busy — wait, interrupt (Ctrl+C), or use /quit. (/mode /tasks /help /sessions /tree /model /prompt run during agent activity.)",
                                         c_error(),
                                     )?;
-                                    renderer.draw_bottom(
-                                        &input,
-                                        &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                        ui.is_running,
-                                    )?;
+                                    renderer.request_repaint();
                                     continue;
                                 }
                                 // Slash commands that spawn agents (/resume, /loop start)
@@ -1900,11 +1732,7 @@ pub async fn run_interactive(
                                 renderer.set_avatar_state(avatar::AvatarState::Idle);
                             }
                         }
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                     }
                 }
             }
@@ -2202,11 +2030,7 @@ pub async fn run_interactive(
                         run_handlers::notices::handle_repair_stats(&mut renderer, &snapshot)?;
                     }
                 }
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
             }
             // Phased `/plan` explore→plan task events. Drained here so the forks
             // run off the event loop (dirge-vuzz): progress lines paint as they
@@ -2224,12 +2048,7 @@ pub async fn run_interactive(
                 match ev {
                     Some(PlanPhaseEvent::Progress { text, error }) => {
                         renderer.write_line(&text, if error { c_error() } else { c_agent() })?;
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                     }
                     Some(PlanPhaseEvent::Ready(kickoff)) => {
                         // explore→plan finished: launch the streamed implement run
@@ -2256,11 +2075,7 @@ pub async fn run_interactive(
                         ui.plan_phase = None;
                         ui.is_running = false;
                         renderer.set_avatar_state(avatar::AvatarState::Idle);
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
+                        renderer.request_repaint();
                     }
                 }
             }
@@ -2372,23 +2187,7 @@ pub async fn run_interactive(
                 // the prompt and reaches for a key. Without this, the
                 // avatar still showed the in-flight tool's face
                 // (Reading/Writing/Bash) until the next keystroke.
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(
-                        StatusLine::render(
-                            session,
-                            ui.is_running,
-                            0,
-                            ui.loop_label.as_deref(),
-                            context.current_prompt_name.as_deref(),
-                            perm_mode().as_deref(),
-                            bg_store.as_ref(),
-                            shell_store.as_ref(),
-                        ),
-                        ui.interjection_queue.lock().unwrap().len(),
-                    ),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
 
                 // Permission prompt is rendered ONLY as a bottom-
                 // strip overlay (set_alert_overlay below). The old
@@ -2454,23 +2253,7 @@ pub async fn run_interactive(
                         theme::perm(),
                     ));
                     renderer.set_alert_overlay(overlay);
-                    renderer.draw_bottom(
-                        &input,
-                        &with_queue(
-                            StatusLine::render(
-                                session,
-                                ui.is_running,
-                                0,
-                                ui.loop_label.as_deref(),
-                                context.current_prompt_name.as_deref(),
-                                perm_mode().as_deref(),
-                                bg_store.as_ref(),
-                                shell_store.as_ref(),
-                            ),
-                            ui.interjection_queue.lock().unwrap().len(),
-                        ),
-                        ui.is_running,
-                    )?;
+                    renderer.request_repaint();
                 }
 
                 let decision = loop {
@@ -2485,13 +2268,7 @@ pub async fn run_interactive(
                             match crate::ui::selection::handle(&ev, &mut renderer) {
                                 crate::ui::selection::Outcome::Repaint
                                 | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                    renderer.render_viewport()?;
-                                    renderer.draw_bottom(
-                                        &input,
-                                        &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                        ui.is_running,
-                                    )?;
-                                    renderer.flush()?;
+                                    render_frame!();
                                     continue;
                                 }
                                 crate::ui::selection::Outcome::NotHandled => {}
@@ -2735,12 +2512,7 @@ pub async fn run_interactive(
                     }
                 }
 
-                renderer.render_viewport()?;
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
             }
             Some(notif) = async {
                 if let Some(rx) = &mut notify_rx {
@@ -2808,24 +2580,7 @@ pub async fn run_interactive(
                     &text,
                     color,
                 )?;
-                renderer.render_viewport()?;
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(
-                        StatusLine::render(
-                            session,
-                            ui.is_running,
-                            0,
-                            ui.loop_label.as_deref(),
-                            context.current_prompt_name.as_deref(),
-                            perm_mode().as_deref(),
-                            bg_store.as_ref(),
-                            shell_store.as_ref(),
-                        ),
-                        ui.interjection_queue.lock().unwrap().len(),
-                    ),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
             }
             Some(lifecycle_evt) = async {
                 if let Some(rx) = &mut lifecycle_rx {
@@ -2881,12 +2636,7 @@ pub async fn run_interactive(
                     &label,
                     color, // theme accessors honor --no-color now [dirge-zrda]
                 )?;
-                renderer.render_viewport()?;
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
             }
             // dirge-x949: background MCP loader signalled readiness. The
             // wake channel is untyped (`()`) because a `tokio::select!`
@@ -2922,12 +2672,7 @@ pub async fn run_interactive(
                         #[cfg(feature = "lsp")]
                         lsp_manager.as_ref(),
                     ));
-                    renderer.render_viewport()?;
-                    renderer.draw_bottom(
-                        &input,
-                        &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                        ui.is_running,
-                    )?;
+                    renderer.request_repaint();
                 }
             }
             Some(chat_evt) = subagent_chat_rx.recv() => {
@@ -3107,7 +2852,7 @@ pub async fn run_interactive(
                         })
                         .collect();
                 renderer.set_subagent_status(panel_rows);
-                renderer.render_viewport()?;
+                renderer.request_repaint();
 
                 // dirge-9xo: auto-resume the parent agent when a
                 // background subagent finishes and the parent is
@@ -3149,11 +2894,7 @@ pub async fn run_interactive(
                     ui.last_user_prompt.clone_from(&synth_prompt);
                     let runner = agent.clone().spawn_runner(composed, history, Some(ui.interjection_queue.clone()));
                     runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
-                    renderer.draw_bottom(
-                        &input,
-                        &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                        ui.is_running,
-                    )?;
+                    renderer.request_repaint();
                 }
             }
             Some(question_req) = async {
@@ -3301,13 +3042,7 @@ pub async fn run_interactive(
 
                         // Replace previous render with updated options
                         renderer.replace_from(anchor, lines);
-                        renderer.render_viewport()?;
-                        renderer.draw_bottom(
-                            &input,
-                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                            ui.is_running,
-                        )?;
-                        renderer.flush()?;
+                        render_frame!();
 
                         // Wait for user input. Selection events
                         // (drag, mouse-up, `y`/`Esc` while active)
@@ -3377,13 +3112,7 @@ pub async fn run_interactive(
                                                 .collect()
                                         };
                                         renderer.replace_from(input_anchor, lines);
-                                        renderer.render_viewport()?;
-                                        renderer.draw_bottom(
-                                            &input,
-                                            &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                            ui.is_running,
-                                        )?;
-                                        renderer.flush()?;
+                                        render_frame!();
                                         let ev = user_rx.recv().await;
                                         if let Some(UserEvent::Key(k)) = ev {
                                             match k.code {
@@ -3468,12 +3197,7 @@ pub async fn run_interactive(
                 }
 
                 renderer.write_line("", Color::White)?;
-                renderer.render_viewport()?;
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
             }
             Some(dialog_req) = async {
                 if let Some(rx) = dialog_rx.as_mut() {
@@ -3529,13 +3253,7 @@ pub async fn run_interactive(
                                     match crate::ui::selection::handle(&ev, &mut renderer) {
                                         crate::ui::selection::Outcome::Repaint
                                         | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                            renderer.render_viewport()?;
-                                            renderer.draw_bottom(
-                                                &input,
-                                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                                ui.is_running,
-                                            )?;
-                                            renderer.flush()?;
+                                            render_frame!();
                                             continue;
                                         }
                                         crate::ui::selection::Outcome::NotHandled => {}
@@ -3600,13 +3318,7 @@ pub async fn run_interactive(
                                     match crate::ui::selection::handle(&ev, &mut renderer) {
                                         crate::ui::selection::Outcome::Repaint
                                         | crate::ui::selection::Outcome::RepaintAndCopied => {
-                                            renderer.render_viewport()?;
-                                            renderer.draw_bottom(
-                                                &input,
-                                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                                ui.is_running,
-                                            )?;
-                                            renderer.flush()?;
+                                            render_frame!();
                                             continue;
                                         }
                                         crate::ui::selection::Outcome::NotHandled => {}
@@ -3648,11 +3360,7 @@ pub async fn run_interactive(
                 for ev in deferred {
                     let _ = user_tx.send(ev).await;
                 }
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
             }
             Some(plan_req) = async {
                 if let Some(rx) = &mut plan_rx {
@@ -3687,13 +3395,7 @@ pub async fn run_interactive(
                     match crate::ui::selection::handle(&ev, &mut renderer) {
                         crate::ui::selection::Outcome::Repaint
                         | crate::ui::selection::Outcome::RepaintAndCopied => {
-                            renderer.render_viewport()?;
-                            renderer.draw_bottom(
-                                &input,
-                                &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                                ui.is_running,
-                            )?;
-                            renderer.flush()?;
+                            render_frame!();
                             continue;
                         }
                         crate::ui::selection::Outcome::NotHandled => {}
@@ -3761,12 +3463,7 @@ pub async fn run_interactive(
                     let _ = plan_req.reply.send(PlanSwitchResponse::Rejected);
                 }
 
-                renderer.render_viewport()?;
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                    ui.is_running,
-                )?;
+                renderer.request_repaint();
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if ui.is_running => {
                 // #387: drive the spinner/avatar animation. Force a repaint so
