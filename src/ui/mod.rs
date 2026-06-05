@@ -496,6 +496,32 @@ pub async fn run_interactive(
         };
     }
 
+    // #387: the render effect. Builds the StatusLine ONCE from the model
+    // (`ui` + session + permission + stores), updates the bottom area, and
+    // performs the single paint per event via `flush` (a no-op when nothing
+    // changed). Called at the top of the event loop and at the top of each
+    // modal sub-loop, so rendering is a pure effect of the model changing
+    // rather than ~85 ad-hoc inline paint sites.
+    macro_rules! render_frame {
+        () => {{
+            let status = with_queue(
+                StatusLine::render(
+                    session,
+                    ui.is_running,
+                    0,
+                    ui.loop_label.as_deref(),
+                    context.current_prompt_name.as_deref(),
+                    perm_mode().as_deref(),
+                    bg_store.as_ref(),
+                    shell_store.as_ref(),
+                ),
+                ui.interjection_len(),
+            );
+            renderer.set_bottom(&input, &status, ui.is_running);
+            renderer.flush()?;
+        }};
+    }
+
     render_session(&mut renderer, session, cli, cfg, context)?;
     renderer.draw_bottom(
         &input,
@@ -678,6 +704,13 @@ pub async fn run_interactive(
                 render_session(&mut renderer, session, cli, cfg, context)?;
             }
         }
+
+        // #387: single paint per event. Render the model (the previous
+        // event's mutations + this iteration's loop-top updates) exactly
+        // once, THEN block on the next event. Because every handler returns
+        // here (the trailing `continue`s restart the loop), no per-arm
+        // inline paint is required — the arms just mutate `ui`.
+        render_frame!();
 
         tokio::select! {
             Some(ev) = user_rx.recv() => {
@@ -2458,6 +2491,7 @@ pub async fn run_interactive(
                                         &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
                                         ui.is_running,
                                     )?;
+                                    renderer.flush()?;
                                     continue;
                                 }
                                 crate::ui::selection::Outcome::NotHandled => {}
@@ -3273,6 +3307,7 @@ pub async fn run_interactive(
                             &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
                             ui.is_running,
                         )?;
+                        renderer.flush()?;
 
                         // Wait for user input. Selection events
                         // (drag, mouse-up, `y`/`Esc` while active)
@@ -3348,6 +3383,7 @@ pub async fn run_interactive(
                                             &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
                                             ui.is_running,
                                         )?;
+                                        renderer.flush()?;
                                         let ev = user_rx.recv().await;
                                         if let Some(UserEvent::Key(k)) = ev {
                                             match k.code {
@@ -3499,6 +3535,7 @@ pub async fn run_interactive(
                                                 &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
                                                 ui.is_running,
                                             )?;
+                                            renderer.flush()?;
                                             continue;
                                         }
                                         crate::ui::selection::Outcome::NotHandled => {}
@@ -3569,6 +3606,7 @@ pub async fn run_interactive(
                                                 &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
                                                 ui.is_running,
                                             )?;
+                                            renderer.flush()?;
                                             continue;
                                         }
                                         crate::ui::selection::Outcome::NotHandled => {}
@@ -3655,6 +3693,7 @@ pub async fn run_interactive(
                                 &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
                                 ui.is_running,
                             )?;
+                            renderer.flush()?;
                             continue;
                         }
                         crate::ui::selection::Outcome::NotHandled => {}
@@ -3730,11 +3769,11 @@ pub async fn run_interactive(
                 )?;
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if ui.is_running => {
-                renderer.draw_bottom(
-                    &input,
-                    &with_queue(StatusLine::render(session, ui.is_running, 0, ui.loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref(), bg_store.as_ref(), shell_store.as_ref()), ui.interjection_queue.lock().unwrap().len()),
-                    ui.is_running,
-                )?;
+                // #387: drive the spinner/avatar animation. Force a repaint so
+                // the loop-top render effect advances the spinner (whose tick
+                // changes in cache_bottom but wouldn't trip dirty-on-change by
+                // itself). The status line is built once by `render_frame!`.
+                renderer.request_repaint();
             }
             else => {
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;

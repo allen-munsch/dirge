@@ -1517,7 +1517,10 @@ impl Renderer {
     }
 
     pub fn render_viewport(&mut self) -> io::Result<()> {
-        self.tui_redraw()
+        // #387: defer. The event loop flushes once per event (model-driven
+        // render effect); this just marks the frame dirty.
+        self.needs_paint = true;
+        Ok(())
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
@@ -1532,11 +1535,11 @@ impl Renderer {
                 });
             }
         }
-        // ratatui path: state is mutated above; the redraw repaints
-        // the full chat region (no per-line direct stdout writes,
-        // no Clear(CurrentLine) wiping side-panel cols).
+        // #387: defer paint. Mark dirty only when at the bottom (scrolled-up
+        // views don't auto-jump on new content, matching prior behavior);
+        // the loop's render effect flushes once per event.
         if self.scroll_offset == 0 {
-            self.tui_redraw()?;
+            self.needs_paint = true;
         }
         Ok(())
     }
@@ -1597,11 +1600,11 @@ impl Renderer {
                 }
             }
         }
-        // Single redraw at the end of the streamed batch — repeated
-        // tokens within the batch land in the buffer + partial, and
-        // the diff engine in ratatui only emits cells that changed.
+        // #387: defer paint (see write_line). The token handler gates how
+        // often this lands a dirty frame (60 fps coalescing); the loop's
+        // render effect performs the single flush.
         if self.scroll_offset == 0 {
-            self.tui_redraw()?;
+            self.needs_paint = true;
         }
         Ok(())
     }
@@ -1639,6 +1642,20 @@ impl Renderer {
         // the projected string.
         // When Ctrl+R reverse-i-search is active, show the search
         // mini-buffer instead of the normal editor buffer.
+        // #387: snapshot the visible bottom state so we can mark the frame
+        // dirty ONLY when it actually changes. The loop calls this once per
+        // event via the render effect; without change-detection that would
+        // force a paint every iteration and defeat the token-stream
+        // coalescing (the spinner animation is driven separately by the
+        // timeout arm's request_repaint).
+        let prev_status = self.cached_status.clone();
+        let prev_running = self.cached_is_running;
+        let prev_rows = self.cached_input_rows.clone();
+        let prev_cursor = (self.cached_input_cursor_row, self.cached_input_cursor_col);
+        let prev_ghost = self.cached_input_ghost.clone();
+        let prev_preview = self.cached_completion_preview.clone();
+        let prev_picker = self.picker_overlay.is_some();
+
         let (display_buf, cursor_byte) = if editor.is_in_search() {
             editor.search_display()
         } else {
@@ -1697,11 +1714,25 @@ impl Renderer {
             .filter(|p| p.active)
             .map(|p| p.overlay())
             .or_else(|| self.rewind_overlay.clone());
+
+        // Mark dirty iff a visible bottom element changed.
+        if prev_status != self.cached_status
+            || prev_running != self.cached_is_running
+            || prev_rows != self.cached_input_rows
+            || prev_cursor != (self.cached_input_cursor_row, self.cached_input_cursor_col)
+            || prev_ghost != self.cached_input_ghost
+            || prev_preview != self.cached_completion_preview
+            || prev_picker != self.picker_overlay.is_some()
+        {
+            self.needs_paint = true;
+        }
     }
 
-    /// Legacy immediate-paint entry: cache the bottom state and paint now.
-    /// Retained for call sites not yet migrated to the model-driven
-    /// [`set_bottom`] + [`flush`] path.
+    /// Cache the bottom state and mark the frame dirty on change, WITHOUT
+    /// painting (the #387 model-driven path). The event loop builds the
+    /// status line once from the model, calls this, then [`flush`] paints.
+    /// `draw_bottom` is retained as an alias for the many existing call
+    /// sites; both defer now.
     pub fn draw_bottom(
         &mut self,
         editor: &crate::ui::input::InputEditor,
@@ -1709,13 +1740,11 @@ impl Renderer {
         is_running: bool,
     ) -> io::Result<()> {
         self.cache_bottom(editor, status, is_running);
-        self.tui_redraw()
+        Ok(())
     }
 
-    /// #387: model-driven bottom update — cache the bottom state and mark
-    /// the frame dirty WITHOUT painting. The event loop calls this once
-    /// per event (with the status line built once from the model) and then
-    /// [`flush`] performs the single paint.
+    /// #387: model-driven bottom update — alias of the deferred `draw_bottom`
+    /// with a `()` return for new call sites.
     pub fn set_bottom(
         &mut self,
         editor: &crate::ui::input::InputEditor,
@@ -1723,7 +1752,6 @@ impl Renderer {
         is_running: bool,
     ) {
         self.cache_bottom(editor, status, is_running);
-        self.needs_paint = true;
     }
 
     /// #387: mark the frame dirty so the next [`flush`] repaints. Mutators
