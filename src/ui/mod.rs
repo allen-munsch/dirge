@@ -9,7 +9,7 @@ mod events;
 pub(crate) mod gitstatus;
 mod highlight;
 pub(crate) mod input;
-mod input_reader;
+pub(crate) mod input_reader;
 pub(crate) mod keymap;
 mod markdown;
 pub(crate) mod notifications;
@@ -19,7 +19,9 @@ pub(crate) mod permission_ui;
 pub(crate) mod picker;
 #[cfg(feature = "plugin")]
 mod plugin_tree;
-mod renderer;
+pub(crate) mod pty_relay;
+mod relay_tests;
+pub(crate) mod renderer;
 mod run_handlers;
 mod search_rewind;
 mod selection;
@@ -477,7 +479,7 @@ pub async fn run_interactive(
     // handlers (done / context_overflow / context_compacted) take one
     // `&AgentBuildDeps` instead of ~10 individual params.
     macro_rules! make_agent_build_deps {
-        () => {
+        ($ux:ident) => {
             run_handlers::AgentBuildDeps {
                 client: &client,
                 permission: &permission,
@@ -486,6 +488,7 @@ pub async fn run_interactive(
                 plan_tx: &plan_tx,
                 bg_store: &bg_store,
                 sandbox: &sandbox,
+                user_tx: &$ux,
                 #[cfg(feature = "mcp")]
                 mcp_manager: mcp_manager.as_ref(),
                 #[cfg(feature = "semantic")]
@@ -514,6 +517,7 @@ pub async fn run_interactive(
                     perm_mode().as_deref(),
                     bg_store.as_ref(),
                     shell_store.as_ref(),
+                    sandbox.mode.status_badge(),
                 ),
                 ui.interjection_len(),
             );
@@ -532,8 +536,13 @@ pub async fn run_interactive(
     // the UI loop's `tokio::select!`. Review #1.
     let mut notify_rx = crate::ui::notifications::take_receiver();
 
-    let (user_tx, mut user_rx) = mpsc::channel::<UserEvent>(64);
+    let (user_tx, mut user_rx) = mpsc::unbounded_channel::<UserEvent>();
     input_reader::spawn_input_reader(user_tx.clone());
+    // Defer rendering during streaming bursts (reasoning/tokens) —
+    // accumulate mutations in the buffer and paint once when the
+    // burst ends or a user event arrives. Prevents ~100s of
+    // unnecessary cache_bottom() calls per second during thinking.
+    let mut defer_render = false;
 
     loop {
         // Refresh the info panel snapshot once per iteration so it stays
@@ -694,7 +703,12 @@ pub async fn run_interactive(
         // once, THEN block on the next event. Because every handler returns
         // here (the trailing `continue`s restart the loop), no per-arm
         // inline paint is required — the arms just mutate `ui`.
-        render_frame!();
+        if defer_render {
+            defer_render = false;
+            renderer.request_repaint();
+        } else {
+            render_frame!();
+        }
 
         tokio::select! {
             // #387: poll arms in order so USER INPUT takes priority — when a
@@ -1373,7 +1387,7 @@ pub async fn run_interactive(
                                 // /help) have no UserMessage event, so we keep the echo.
                                 write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut ui.show_reasoning, &mut ui.is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut ui.todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut ui.plan_phase).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut ui.show_reasoning, &mut ui.is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut ui.todo_tools_enabled, &bg_store, &sandbox, &user_tx, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut ui.plan_phase).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -1385,7 +1399,7 @@ pub async fn run_interactive(
                                             instructions.as_deref(),
                                             true, // forced: explicit /compact [dirge-fgtj]
                                             &mut agent, &client, &mut renderer, session, cli, cfg, context,
-                                            &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
+                                            &permission, &ask_tx, &question_tx, &plan_tx, &user_tx, &bg_store, &sandbox,
                                             #[cfg(feature = "mcp")] mcp_manager.as_ref(),
                                             #[cfg(feature = "semantic")] semantic_manager,
                                             #[cfg(feature = "lsp")] lsp_manager.as_ref(),
@@ -1704,7 +1718,7 @@ pub async fn run_interactive(
                                         None,
                                         false, // forced: auto-compaction stays threshold-gated
                                         &mut agent, &client, &mut renderer, session, cli, cfg, context,
-                                        &permission, &ask_tx, &question_tx, &plan_tx, &bg_store, &sandbox,
+                                        &permission, &ask_tx, &question_tx, &plan_tx, &user_tx, &bg_store, &sandbox,
                                         #[cfg(feature = "mcp")] mcp_manager.as_ref(),
                                         #[cfg(feature = "semantic")] semantic_manager,
                                         #[cfg(feature = "lsp")] lsp_manager.as_ref(),
@@ -1776,6 +1790,7 @@ pub async fn run_interactive(
                             }
                             ui.reasoning_buf.push_str(&sanitize_output(&text));
                         }
+                    defer_render = true;
                     }
                     AgentEvent::Token(text) => {
                         // Caught-up check for the render coalescer, computed
@@ -1797,6 +1812,7 @@ pub async fn run_interactive(
                             #[cfg(feature = "plugin")]
                             current_turn_index,
                         )?;
+                    defer_render = true;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
                         let mut ctx = make_run_ctx!();
@@ -1842,7 +1858,7 @@ pub async fn run_interactive(
                             &mut ui.is_running,
                             &mut agent,
                             context,
-                            &make_agent_build_deps!(),
+                            &make_agent_build_deps!(user_tx),
                             &mut ui.agent_rx,
                             &mut ui.agent_abort,
                             &mut ui.agent_interject,
@@ -1913,7 +1929,7 @@ pub async fn run_interactive(
                             &mut ui.is_running,
                             &mut agent,
                             context,
-                            &make_agent_build_deps!(),
+                            &make_agent_build_deps!(user_tx),
                             &mut ui.agent_rx,
                             &mut ui.agent_abort,
                             &mut ui.agent_interject,
@@ -1987,7 +2003,7 @@ pub async fn run_interactive(
                         let mut ctx = make_run_ctx!();
                         run_handlers::handle_context_compacted(
                             &mut ctx,
-                            &make_agent_build_deps!(),
+                            &make_agent_build_deps!(user_tx),
                             &mut agent,
                             context,
                             new_session_id,
@@ -2604,7 +2620,7 @@ pub async fn run_interactive(
                 };
                 let (label, color) = match &lifecycle_evt {
                     LifecycleEvent::Started { id } => {
-                        let short = crate::text::short_id(&id);
+                        let short = crate::text::short_id(id);
                         (format!("[task {} started]", short), c_tool())
                     }
                     LifecycleEvent::Finished(notif) => {
@@ -3364,7 +3380,7 @@ pub async fn run_interactive(
                 // arms see them next iteration. Best-effort: a full channel
                 // (very unlikely, capacity 64) silently drops the tail.
                 for ev in deferred {
-                    let _ = user_tx.send(ev).await;
+                    let _ = user_tx.send(ev);
                 }
                 renderer.request_repaint();
             }
