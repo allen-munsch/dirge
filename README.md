@@ -56,8 +56,8 @@ cargo install dirge-agent
 Or install a prebuilt binary with [Homebrew](https://brew.sh) (macOS + Linux):
 
 ```bash
-brew install yogthos/dirge/dirge
-# equivalently: brew tap yogthos/dirge && brew install dirge
+brew install dirge-code/dirge/dirge
+# equivalently: brew tap dirge-code/dirge && brew install dirge
 ```
 
 Homebrew also makes upgrades a one-liner (`brew upgrade dirge`), and on macOS
