@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-11
+
+### Added
+- **Run dirge as an MCP server** (`dirge mcp`, `mcp-server` feature, default
+  on). Another agent (e.g. Claude Code) can delegate implementation tasks to
+  dirge and review them — the caller plans/architects, dirge implements.
+  Keeps a persistent per-project session: `delegate` extends it, `new_session`
+  rotates for a new task/thread, and the current session id is remembered in
+  `.dirge/mcp_current_session.json` across restarts. Each `delegate` returns a
+  bounded, review-friendly result — `status`, `summary`, `files_changed`,
+  `turns` — not the raw transcript. Tools: `delegate`, `new_session`,
+  `session_info`, `list_sessions`. Register with
+  `claude mcp add dirge -- dirge mcp`. See [docs/mcp-server.md](docs/mcp-server.md).
+
+### Fixed
+- **`dirge -p --session <id>` now resumes the conversation.** Headless print
+  mode persisted the session but never fed the prior turns back to the model,
+  so each `--session` run started cold (a follow-up task had no memory of the
+  previous one). The print path now resumes the loaded session's history; the
+  `--loop` path is unchanged. Fixes multi-step continuity for the MCP
+  delegation loop and any scripted `dirge -p --session` use.
+
 ## [0.5.2] - 2026-06-10
 
 ### Fixed
