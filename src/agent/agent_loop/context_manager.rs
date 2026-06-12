@@ -161,6 +161,136 @@ pub fn decide_after_usage(
     ctx_max: u64,
     already_folded_this_turn: bool,
 ) -> PostUsageDecision {
+    decide_after_usage_with_threshold(prompt_tokens, ctx_max, already_folded_this_turn, None)
+}
+
+/// MiMo-style incremental checkpoint cadence by context-window size
+/// (port of opencode `defaultThresholdsFor`). These are NON-destructive
+/// background checkpoint *writes* — they keep the full context and just
+/// refresh the durable checkpoint often, so a later overflow/fold almost
+/// always has a fresh checkpoint to recover from. They are independent of
+/// the destructive fold thresholds above. `< 25K` windows disable the
+/// subsystem (too little headroom to be worth it).
+pub fn checkpoint_thresholds_for(ctx_max: u64) -> Vec<f64> {
+    if ctx_max < 25_000 {
+        return Vec::new();
+    }
+    if ctx_max <= 200_000 {
+        return vec![0.2, 0.4, 0.6, 0.8];
+    }
+    if ctx_max <= 500_000 {
+        return (1..=9).map(|i| i as f64 * 0.1).collect();
+    }
+    (1..=18).map(|i| i as f64 * 0.05).collect()
+}
+
+/// Tracks which incremental-checkpoint thresholds a run has crossed so each
+/// fires its background writer exactly once. A destructive fold rebuilds
+/// the context, so [`reset`](Self::reset) clears the crossed state and the
+/// next growth re-checkpoints (mirrors opencode `resetThresholds`).
+#[derive(Debug, Clone)]
+pub struct CheckpointSchedule {
+    thresholds: Vec<f64>,
+    crossed: Vec<bool>,
+}
+
+impl CheckpointSchedule {
+    pub fn new(ctx_max: u64) -> Self {
+        let thresholds = checkpoint_thresholds_for(ctx_max);
+        let crossed = vec![false; thresholds.len()];
+        Self {
+            thresholds,
+            crossed,
+        }
+    }
+
+    /// Whether the subsystem is active for this window size.
+    pub fn is_enabled(&self) -> bool {
+        !self.thresholds.is_empty()
+    }
+
+    /// Record the current usage `ratio` (prompt_tokens / ctx_max). Returns
+    /// `true` when it has just crossed one or more not-yet-crossed
+    /// thresholds — the caller fires a single background checkpoint for
+    /// the crossing (multiple thresholds crossed at once → one write).
+    pub fn note_usage(&mut self, ratio: f64) -> bool {
+        let mut newly = false;
+        for (i, &t) in self.thresholds.iter().enumerate() {
+            if !self.crossed[i] && ratio >= t {
+                self.crossed[i] = true;
+                newly = true;
+            }
+        }
+        newly
+    }
+
+    /// Clear crossed state after a destructive fold rebuilt the context.
+    pub fn reset(&mut self) {
+        for c in &mut self.crossed {
+            *c = false;
+        }
+    }
+}
+
+/// Process-wide early-fold threshold, installed once at startup from
+/// `Config::compaction_fold_threshold` via [`init_fold_threshold`]. Lets a
+/// user opt into MiMo-style earlier checkpointing without threading the
+/// value through the whole loop config — same OnceLock-set-once convention
+/// as `timeout::Timeouts::init`. Unset → the [`HISTORY_FOLD_THRESHOLD`]
+/// default.
+static FOLD_THRESHOLD_OVERRIDE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+
+/// Install the configured early-fold threshold process-wide. Idempotent —
+/// the first call wins; later calls are ignored. Called once at startup
+/// after config load. `None` (or never calling this) keeps the default.
+pub fn init_fold_threshold(override_fraction: Option<f64>) {
+    let _ = FOLD_THRESHOLD_OVERRIDE.set(override_fraction);
+}
+
+/// Process-wide toggle for the incremental background checkpoint. Default
+/// ON (mirrors MiMo) — installed once at startup from
+/// `Config::incremental_checkpoint`. Only an explicit `Some(false)`
+/// disables it.
+static INCREMENTAL_CHECKPOINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the incremental-checkpoint toggle. `None` keeps the default-on
+/// behavior; `Some(false)` turns it off process-wide.
+pub fn init_incremental_checkpoint(enabled: Option<bool>) {
+    let _ = INCREMENTAL_CHECKPOINT.set(enabled.unwrap_or(true));
+}
+
+/// Whether the incremental background checkpoint is active. Default true.
+pub fn incremental_checkpoint_enabled() -> bool {
+    *INCREMENTAL_CHECKPOINT.get().unwrap_or(&true)
+}
+
+/// Clamp a configured early-fold threshold into a safe range. An override
+/// may only make the NORMAL fold fire *earlier* — never later than the
+/// default and never below a floor that would fold almost immediately —
+/// so the aggressive/force bands above it keep their ordering. An explicit
+/// `override_fraction` wins (used by callers and tests); otherwise the
+/// startup-installed process global is consulted; out-of-range or absent
+/// values fall back to [`HISTORY_FOLD_THRESHOLD`].
+pub fn effective_fold_threshold(override_fraction: Option<f64>) -> f64 {
+    let candidate = override_fraction.or_else(|| FOLD_THRESHOLD_OVERRIDE.get().copied().flatten());
+    match candidate {
+        Some(f) if f.is_finite() && (0.3..=HISTORY_FOLD_THRESHOLD).contains(&f) => f,
+        _ => HISTORY_FOLD_THRESHOLD,
+    }
+}
+
+/// As [`decide_after_usage`], but with a configurable early-fold threshold
+/// (MiMo's "checkpoint/compress earlier" knob). A lower threshold folds —
+/// and therefore writes the durable checkpoint — sooner and from more
+/// coherent context, at the cost of more frequent folds. The aggressive
+/// and force-summary bands are unchanged; the override is clamped by
+/// [`effective_fold_threshold`] so it can only lower the normal band.
+pub fn decide_after_usage_with_threshold(
+    prompt_tokens: Option<u64>,
+    ctx_max: u64,
+    already_folded_this_turn: bool,
+    fold_threshold_override: Option<f64>,
+) -> PostUsageDecision {
     let Some(prompt_tokens) = prompt_tokens else {
         return PostUsageDecision {
             kind: PostUsageDecisionKind::None,
@@ -216,7 +346,7 @@ pub fn decide_after_usage(
         };
     }
 
-    if ratio > HISTORY_FOLD_THRESHOLD {
+    if ratio > effective_fold_threshold(fold_threshold_override) {
         return PostUsageDecision {
             kind: PostUsageDecisionKind::Fold,
             prompt_tokens,
@@ -261,6 +391,90 @@ pub fn estimate_turn_start(estimate_tokens: u64, ctx_max: u64) -> TurnStartEstim
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // incremental checkpoint schedule
+    // ============================================================
+
+    #[test]
+    fn checkpoint_cadence_matches_mimo_by_window() {
+        assert!(
+            checkpoint_thresholds_for(8_000).is_empty(),
+            "tiny window disabled"
+        );
+        assert_eq!(checkpoint_thresholds_for(128_000), vec![0.2, 0.4, 0.6, 0.8]);
+        assert_eq!(checkpoint_thresholds_for(200_000), vec![0.2, 0.4, 0.6, 0.8]);
+        assert_eq!(checkpoint_thresholds_for(400_000).len(), 9, "10% cadence");
+        assert_eq!(checkpoint_thresholds_for(1_000_000).len(), 18, "5% cadence");
+    }
+
+    #[test]
+    fn schedule_fires_each_threshold_once_until_reset() {
+        let mut s = CheckpointSchedule::new(128_000); // [.2,.4,.6,.8]
+        assert!(s.is_enabled());
+        assert!(!s.note_usage(0.1), "below first threshold");
+        assert!(s.note_usage(0.25), "crossed 20%");
+        assert!(!s.note_usage(0.30), "no new threshold");
+        assert!(s.note_usage(0.45), "crossed 40%");
+        // Jumping past several at once is a single firing.
+        assert!(s.note_usage(0.85), "crossed 60% and 80% together");
+        assert!(!s.note_usage(0.9), "all crossed");
+        // A destructive fold rebuilds context → re-arm.
+        s.reset();
+        assert!(s.note_usage(0.25), "fires again after reset");
+    }
+
+    #[test]
+    fn disabled_schedule_never_fires() {
+        let mut s = CheckpointSchedule::new(10_000);
+        assert!(!s.is_enabled());
+        assert!(!s.note_usage(0.99));
+    }
+
+    // ============================================================
+    // early-fold threshold override
+    // ============================================================
+
+    /// The override is clamped: a value in `0.3..=0.75` is honored; out of
+    /// range or absent falls back to the default. Uses explicit params so
+    /// it doesn't depend on the process-global install.
+    #[test]
+    fn effective_fold_threshold_clamps_override() {
+        assert_eq!(effective_fold_threshold(Some(0.5)), 0.5);
+        assert_eq!(effective_fold_threshold(Some(0.3)), 0.3);
+        assert_eq!(
+            effective_fold_threshold(Some(0.9)),
+            HISTORY_FOLD_THRESHOLD,
+            "above the default is rejected (can't fold later)"
+        );
+        assert_eq!(
+            effective_fold_threshold(Some(0.05)),
+            HISTORY_FOLD_THRESHOLD,
+            "below the floor is rejected"
+        );
+        assert_eq!(
+            effective_fold_threshold(Some(f64::NAN)),
+            HISTORY_FOLD_THRESHOLD
+        );
+        assert_eq!(effective_fold_threshold(None), HISTORY_FOLD_THRESHOLD);
+    }
+
+    /// A lower override folds sooner: a ratio that is healthy at the
+    /// default (0.75) becomes a Fold under an earlier threshold, while the
+    /// aggressive/force bands above it are unchanged.
+    #[test]
+    fn lower_override_folds_earlier() {
+        // 60% of the window: no fold at the default threshold…
+        let d = decide_after_usage_with_threshold(Some(76_800), 128_000, false, None);
+        assert_eq!(d.kind, PostUsageDecisionKind::None);
+        // …but folds with an early 0.5 threshold.
+        let d = decide_after_usage_with_threshold(Some(76_800), 128_000, false, Some(0.5));
+        assert_eq!(d.kind, PostUsageDecisionKind::Fold);
+        assert!(!d.aggressive, "still the normal band, not aggressive");
+        // The force-summary band is independent of the override.
+        let d = decide_after_usage_with_threshold(Some(110_000), 128_000, false, Some(0.5));
+        assert_eq!(d.kind, PostUsageDecisionKind::ExitWithSummary);
+    }
 
     // ============================================================
     // decide_after_usage

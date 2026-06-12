@@ -153,6 +153,9 @@ enum FollowUpSource {
     Verifier,
     /// Bounded LLM critic judgment (at most once per run).
     Critic,
+    /// Goal gate: user-defined stop condition not yet met. Re-enters the
+    /// loop, bounded by [`super::goal::MAX_GOAL_REACT`].
+    Goal,
     /// Unfinished-todo nudge (bounded by [`MAX_TODO_NUDGES`]).
     Todo,
     /// No gate fired — the run may finalize.
@@ -199,6 +202,7 @@ async fn poll_finalization_follow_up(
     system_prompt: &str,
     new_messages: &[LoopMessage],
     critic_done: &mut bool,
+    goal_reacts: &mut u8,
     todo_nudges: &mut u8,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // 1. Caller hook (pi lines 256-262) — highest priority.
@@ -229,6 +233,24 @@ async fn poll_finalization_follow_up(
             if !msgs.is_empty() {
                 return (msgs, FollowUpSource::Critic);
             }
+        }
+    }
+    // 3.5 Goal gate — user-defined stop condition. Unlike the one-shot
+    //     critic, this PERSISTS across finalizations: each time the model
+    //     tries to stop, an independent judge (the critic provider, reused)
+    //     rules whether the stated condition holds; if not, its reason
+    //     re-enters the loop. Bounded by MAX_GOAL_REACT so a mis-stated or
+    //     unsatisfiable goal can't loop forever. Active only when a goal is
+    //     set AND a judge is configured — off for default/interactive runs.
+    if *goal_reacts < super::goal::MAX_GOAL_REACT
+        && let Some(goal) = &config.goal
+        && let Some(judge) = &config.critic_fn
+    {
+        let transcript = build_critic_transcript(new_messages);
+        let msgs = super::goal::run_goal_gate(judge, goal, system_prompt, &transcript).await;
+        if !msgs.is_empty() {
+            *goal_reacts += 1;
+            return (msgs, FollowUpSource::Goal);
         }
     }
     // 4. vix-port — final gate: nudge the model to finish or clear unfinished
@@ -349,6 +371,32 @@ fn record_compaction_outcome(failures: &mut u32, outcome: SummaryOutcome) {
         SummaryOutcome::Failed => *failures = failures.saturating_add(1),
         SummaryOutcome::Skipped => {}
     }
+}
+
+/// Spawn a background incremental checkpoint: summarize a snapshot of the
+/// current context off the loop and emit [`LoopEvent::CheckpointRefresh`]
+/// so the consumer persists it to the durable checkpoint WITHOUT folding.
+/// Best-effort — a summarizer error or invalid summary is silently dropped
+/// (the next threshold, or the eventual destructive fold, will write one).
+/// Mirrors MiMo's background checkpoint writer.
+fn spawn_incremental_checkpoint(
+    sfn: crate::agent::compression::SummarizeFn,
+    messages: Vec<serde_json::Value>,
+    emit: mpsc::Sender<LoopEvent>,
+) {
+    tokio::spawn(async move {
+        use crate::agent::compression;
+        if messages.is_empty() {
+            return;
+        }
+        let budget = compression::summary_budget(compression::estimate_messages_tokens(&messages));
+        let prompt = compression::build_summary_prompt(&messages, budget, None, None);
+        if let Ok(summary) = sfn(prompt).await
+            && compression::validate_summary(&summary)
+        {
+            let _ = emit.send(LoopEvent::CheckpointRefresh { summary }).await;
+        }
+    });
 }
 
 async fn run_compaction_pass(
@@ -800,6 +848,15 @@ pub async fn run_loop(
 
     // F6 tier 3: the bounded LLM critic fires at most once per run.
     let mut critic_done = false;
+
+    // Goal gate: counts re-entries so a user-defined stop condition that
+    // never resolves can't loop past MAX_GOAL_REACT.
+    let mut goal_reacts: u8 = 0;
+
+    // Incremental background checkpoint schedule (MiMo 20% cadence).
+    // Lazily built on first post-usage check with the live ctx_max; reset
+    // after a destructive fold rebuilds the context.
+    let mut checkpoint_schedule: Option<context_manager::CheckpointSchedule> = None;
 
     // vix-port: don't let the model end a turn while it still has unfinished
     // todos (bounded by MAX_TODO_NUDGES; vix caps at 3, session.go:1551).
@@ -1290,6 +1347,33 @@ pub async fn run_loop(
                     }
                     _ => {}
                 }
+                // Incremental background checkpoint (MiMo 20% cadence):
+                // when NOT folding, refresh the durable checkpoint at each
+                // newly-crossed usage threshold so a later resume/overflow
+                // recovers a fresh state. Non-destructive — the summary is
+                // generated off the loop and written by the consumer
+                // without touching the live context. A destructive fold
+                // re-arms the schedule (the context was rebuilt).
+                if context_manager::incremental_checkpoint_enabled()
+                    && let Some(sfn) = &summarize_fn
+                {
+                    let sched = checkpoint_schedule
+                        .get_or_insert_with(|| context_manager::CheckpointSchedule::new(ctx_max));
+                    match decision.kind {
+                        PostUsageDecisionKind::Fold | PostUsageDecisionKind::ExitWithSummary => {
+                            sched.reset()
+                        }
+                        PostUsageDecisionKind::None => {
+                            if sched.is_enabled() && sched.note_usage(decision.ratio) {
+                                spawn_incremental_checkpoint(
+                                    sfn.clone(),
+                                    current_context.messages.clone(),
+                                    emit.clone(),
+                                );
+                            }
+                        }
+                    }
+                }
                 // Snip credit is per-iteration: it informed THIS post-usage
                 // decision; clear it so a later iteration's fold isn't
                 // suppressed by a stale snip (IMPROVEMENTS_PLAN #4).
@@ -1437,6 +1521,7 @@ pub async fn run_loop(
             &current_context.system_prompt,
             &new_messages,
             &mut critic_done,
+            &mut goal_reacts,
             &mut todo_nudges,
         )
         .await;

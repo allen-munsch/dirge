@@ -35,6 +35,14 @@ pub(crate) fn dirs_path() -> PathBuf {
     }
 }
 
+/// Path to the GLOBAL, cross-project memory database. Unlike per-project
+/// memory (under each repo's `.dirge/sessions/state.db`), this is a single
+/// db in the user data dir so durable user preferences follow the user
+/// across every project.
+pub(crate) fn global_memory_db_path() -> PathBuf {
+    dirs_path().join("global-memory.db")
+}
+
 pub(crate) fn config_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("DIRGE_CONFIG_DIR") {
         return PathBuf::from(dir);
@@ -262,6 +270,72 @@ mod tests {
                     .ends_with(".local/share/dirge/sessions"),
             "session_dir leaked to the real data dir: {:?}",
             session_dir()
+        );
+    }
+
+    /// Resuming any member of a fold chain resolves to the live tip —
+    /// the newest session sharing the origin — not the stale older file
+    /// the fold left behind. A unique origin keeps the shared test data
+    /// dir's scan from colliding with other tests' sessions.
+    #[test]
+    fn load_session_tip_resolves_to_newest_in_chain() {
+        use crate::session::{MessageRole, Session};
+        let origin = format!("origin-{}", uuid::Uuid::new_v4().simple());
+
+        // Original session: its own origin (origin_id None), older.
+        let mut old = Session::new("p", "m", 128_000);
+        old.id = compact_str::CompactString::new(origin.clone());
+        old.add_message(MessageRole::User, "the original ask");
+        old.updated_at = compact_str::CompactString::new("2026-01-01T00:00:00+00:00");
+        save_session(&mut old).unwrap();
+
+        // Rotated tip: shares the origin, newer.
+        let mut tip = Session::new("p", "m", 128_000);
+        tip.id =
+            compact_str::CompactString::new(format!("compacted-{}", uuid::Uuid::new_v4().simple()));
+        tip.origin_id = Some(compact_str::CompactString::new(origin.clone()));
+        tip.add_message(MessageRole::User, "newer state");
+        tip.updated_at = compact_str::CompactString::new("2026-06-01T00:00:00+00:00");
+        save_session(&mut tip).unwrap();
+
+        // Resuming the ORIGINAL id hops forward to the tip.
+        let resolved = load_session_tip(&origin).unwrap();
+        assert_eq!(
+            resolved.id, tip.id,
+            "resuming the original id must land on the chain tip"
+        );
+
+        // Resuming the tip id stays on the tip.
+        let resolved2 = load_session_tip(tip.id.as_str()).unwrap();
+        assert_eq!(resolved2.id, tip.id);
+    }
+
+    /// A folded conversation collapses to its tip in a listing: the
+    /// newest member of each origin survives, standalone sessions are
+    /// untouched, and ordering is preserved.
+    #[test]
+    fn dedup_by_origin_keeps_tip_per_conversation() {
+        use crate::session::Session;
+        let mk = |id: &str, origin: Option<&str>, updated: &str| {
+            let mut s = Session::new("p", "m", 0);
+            s.id = compact_str::CompactString::new(id);
+            s.origin_id = origin.map(compact_str::CompactString::new);
+            s.updated_at = compact_str::CompactString::new(updated);
+            s
+        };
+        // Newest-first input, as callers pass it. Chain "conv": tip then
+        // its stale older rotation. Plus a standalone session.
+        let input = vec![
+            mk("compacted-tip", Some("conv"), "2026-06-01T00:00:00+00:00"),
+            mk("standalone", None, "2026-05-01T00:00:00+00:00"),
+            mk("conv", None, "2026-01-01T00:00:00+00:00"), // origin == its own id
+        ];
+        let out = dedup_by_origin(input);
+        let ids: Vec<&str> = out.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["compacted-tip", "standalone"],
+            "the chain collapses to its tip; standalone stays"
         );
     }
 
@@ -873,6 +947,55 @@ mod tests {
     }
 }
 
+/// Collapse fold chains to one entry per conversation: keep only the
+/// first session seen for each [`Session::effective_origin`]. Callers
+/// pass a newest-first list, so the survivor is the chain tip and the
+/// stale older rotations drop out — the session list shows a folded
+/// conversation once, not once per rotation. Pure for testability.
+fn dedup_by_origin(sessions: Vec<Session>) -> Vec<Session> {
+    let mut seen = std::collections::HashSet::new();
+    sessions
+        .into_iter()
+        .filter(|s| seen.insert(s.effective_origin().to_string()))
+        .collect()
+}
+
+/// Resume helper: resolve `id` to the TIP of its fold chain. A compaction
+/// fold rotates the session id and leaves the older file behind unchanged
+/// (pre-fold state), so resuming *any* member of a chain must hop to the
+/// newest session that shares the same [`Session::effective_origin`] —
+/// otherwise resume silently loads a stale snapshot. Falls back to the
+/// directly-loaded session when nothing newer shares its origin (the
+/// common case: the user already named the tip, or the session never
+/// folded). Filtering by origin makes the directory scan robust to
+/// unrelated sessions.
+pub fn load_session_tip(id: &str) -> anyhow::Result<Session> {
+    let requested = load_session(id)?;
+    let origin = requested.effective_origin().to_string();
+    let dir = session_dir();
+    if !dir.exists() {
+        return Ok(requested);
+    }
+    let mut tip = requested;
+    for entry in std::fs::read_dir(&dir)? {
+        // Skip a bad directory entry rather than aborting resume: a
+        // concurrent fold/cleanup can delete a sibling file mid-scan, and
+        // the seed session already loaded fine — a plain load would have
+        // succeeded, so the tip scan must degrade to it, not error out.
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json")
+            && let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(s) = serde_json::from_str::<Session>(&json)
+            && s.effective_origin() == origin
+            && s.updated_at > tip.updated_at
+        {
+            tip = s;
+        }
+    }
+    Ok(tip)
+}
+
 pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
     // SESS-5: `stem.starts_with("")` matches every session file, so
     // `/sessions ` or `/sessions delete ` (trailing space) would
@@ -900,7 +1023,9 @@ pub fn find_sessions_by_prefix(prefix: &str) -> anyhow::Result<Vec<Session>> {
         }
     }
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    Ok(sessions)
+    // Collapse fold chains so a prefix that spans a rotated conversation
+    // returns the single tip, not every rotation.
+    Ok(dedup_by_origin(sessions))
 }
 
 pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
@@ -944,7 +1069,12 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
     // proxy but `updated_at` is canonical. Cheap on the already-
     // truncated list.
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    Ok(sessions)
+    // Show one row per conversation: a just-folded chain can have both
+    // its tip and a recent older rotation inside the window; keep the
+    // tip. Stale rotations from older folds already sink below the
+    // window by mtime. (A chain occupying the window can yield slightly
+    // fewer than `limit` rows — acceptable for a recents list.)
+    Ok(dedup_by_origin(sessions))
 }
 
 pub fn agents_path() -> PathBuf {

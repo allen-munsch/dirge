@@ -476,6 +476,21 @@ pub struct Config {
     pub escalation_provider: Option<String>,
     /// Optional provider for context summarization / compaction.
     pub summarization_provider: Option<String>,
+    /// Early-fold threshold as a fraction of the model's context window
+    /// (e.g. `0.5`). Lowers the point at which history folds into a
+    /// summary — and thus when the durable session checkpoint is written
+    /// — so it captures earlier, from more coherent context (MiMo's
+    /// "compress before the window fills" insight). Clamped to
+    /// `0.3..=0.75`; out-of-range or unset keeps the `0.75` default.
+    /// Installed process-wide at startup.
+    pub compaction_fold_threshold: Option<f64>,
+    /// Incremental background checkpoint (MiMo-style): refresh the durable
+    /// session checkpoint at 20%-interval usage thresholds, in the
+    /// background, without folding the live context — so a resume after a
+    /// crash/quit recovers a fresh state. Default ON; set `false` to
+    /// disable (skips the background summary calls). Installed process-wide
+    /// at startup.
+    pub incremental_checkpoint: Option<bool>,
     /// Optional provider for sub-agents (`task` tool).
     pub subagent_provider: Option<String>,
     /// Optional provider for the F6 in-loop critic (tier 3). When set,

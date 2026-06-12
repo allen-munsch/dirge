@@ -559,6 +559,21 @@ async fn main() -> anyhow::Result<()> {
     // them via `timeout::Timeouts::get()` so a `[timeouts]` config override
     // applies across LSP / MCP / bash / the stream loop from one place.
     timeout::Timeouts::init(cfg.resolve_timeouts());
+    // Install the optional early-fold threshold process-wide (mirrors the
+    // timeouts install): the compaction decision + summarizer gate consult
+    // it so an earlier checkpoint cadence applies from one place.
+    crate::agent::agent_loop::context_manager::init_fold_threshold(cfg.compaction_fold_threshold);
+    // Incremental checkpoint is persisted only by the interactive
+    // session-rotation path; the headless modes have no consumer for the
+    // CheckpointRefresh event, so firing it there would just burn
+    // background summary calls. Force it off for --print / --loop.
+    crate::agent::agent_loop::context_manager::init_incremental_checkpoint(
+        if cli.print || cli.loop_mode {
+            Some(false)
+        } else {
+            cfg.incremental_checkpoint
+        },
+    );
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
     // dirge-ykeu: load user-defined agent profiles. Done here (not in
     // context::load) because the lowest-precedence tier is `config.json`
@@ -648,7 +663,10 @@ async fn main() -> anyhow::Result<()> {
         // Try exact id first; fall back to prefix match so the CLI
         // is as forgiving as the interactive `/sessions <prefix>`
         // command. Ambiguous prefix surfaces a list of matching ids.
-        match session::storage::load_session(session_id) {
+        // Resolve to the chain tip: a folded session rotates its id and
+        // leaves the older file behind, so resuming by the id the user
+        // started with must hop forward to the live state.
+        match session::storage::load_session_tip(session_id) {
             Ok(s) => session = s,
             Err(_) => {
                 let matches = session::storage::find_sessions_by_prefix(session_id)?;
@@ -662,7 +680,13 @@ async fn main() -> anyhow::Result<()> {
                         session::storage::validate_session_id(session_id)?;
                         session.id = CompactString::new(session_id);
                     }
-                    1 => session = matches.into_iter().next().expect("len == 1"),
+                    // Prefix matched one session — resolve it to its chain
+                    // tip too, so a prefix of a folded conversation still
+                    // lands on the live state.
+                    1 => {
+                        let m = matches.into_iter().next().expect("len == 1");
+                        session = session::storage::load_session_tip(&m.id).unwrap_or(m);
+                    }
                     n => {
                         let ids: Vec<String> =
                             matches.iter().take(5).map(|s| s.id.to_string()).collect();

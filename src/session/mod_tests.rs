@@ -1,5 +1,45 @@
 use super::*;
 
+/// A fresh session is its own origin: `effective_origin` falls back to
+/// `id` while `origin_id` is None.
+#[test]
+fn effective_origin_falls_back_to_id_when_unset() {
+    let s = Session::new("openrouter", "test/model", 0);
+    assert!(s.origin_id.is_none());
+    assert_eq!(s.effective_origin(), s.id.as_str());
+}
+
+/// Once set (the fold handler copies the chain's origin forward),
+/// `effective_origin` returns it regardless of the rotated `id`.
+#[test]
+fn effective_origin_returns_origin_id_when_set() {
+    let mut s = Session::new("openrouter", "test/model", 0);
+    s.origin_id = Some(compact_str::CompactString::new("conv-root"));
+    assert_eq!(s.effective_origin(), "conv-root");
+    assert_ne!(s.effective_origin(), s.id.as_str());
+}
+
+/// The verbatim first user message is the checkpoint's drift anchor:
+/// it skips any leading system/assistant messages and ignores later
+/// user turns.
+#[test]
+fn first_user_prompt_is_the_verbatim_first_user_message() {
+    let mut s = Session::new("openrouter", "test/model", 0);
+    s.add_message(MessageRole::System, "system preamble");
+    s.add_message(MessageRole::User, "the original ask");
+    s.add_message(MessageRole::Assistant, "working on it");
+    s.add_message(MessageRole::User, "a follow-up");
+    assert_eq!(s.first_user_prompt(), Some("the original ask"));
+}
+
+/// No user message yet → no anchor.
+#[test]
+fn first_user_prompt_is_none_without_a_user_message() {
+    let mut s = Session::new("openrouter", "test/model", 0);
+    s.add_message(MessageRole::System, "only system");
+    assert_eq!(s.first_user_prompt(), None);
+}
+
 /// New messages get a fresh UUID and a non-zero timestamp. P4a's
 /// whole point.
 #[test]

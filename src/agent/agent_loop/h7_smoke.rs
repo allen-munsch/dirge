@@ -157,6 +157,9 @@ fn dump_events(events: &[AgentEvent]) {
             AgentEvent::ContextCompacted { .. } => {
                 eprintln!("\n[context_compacted]");
             }
+            AgentEvent::CheckpointRefresh { .. } => {
+                eprintln!("\n[checkpoint_refresh]");
+            }
             AgentEvent::RetryNotice {
                 attempt,
                 delay_ms,
@@ -221,6 +224,7 @@ async fn h7_scenario_1_simple_text() {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal: None,
         max_turns: None,
         bg_store: None,
         memory_provider: None,
@@ -300,6 +304,7 @@ async fn h7_scenario_2_turn_boundaries() {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal: None,
         max_turns: None,
         bg_store: None,
         memory_provider: None,
@@ -413,6 +418,7 @@ async fn h7_scenario_5_auth_error_surfaces() {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal: None,
         max_turns: None,
         bg_store: None,
         memory_provider: None,
@@ -578,6 +584,7 @@ async fn h7_scenario_3_tool_dispatch() {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal: None,
         max_turns: None,
         bg_store: None,
         memory_provider: None,
@@ -695,6 +702,7 @@ async fn h7_glm_scenario_1_simple_text() {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal: None,
         max_turns: None,
         bg_store: None,
         memory_provider: None,
@@ -830,6 +838,7 @@ async fn h7_glm_scenario_3_tool_dispatch() {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal: None,
         max_turns: None,
         bg_store: None,
         memory_provider: None,
