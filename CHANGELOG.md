@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-06-14
+
+### Added
+- **Working-context budget (`context_target`, default 100k tokens).** A
+  model's effective quality degrades well before its advertised window
+  fills — the usable "smart zone" runs out around 100k regardless of size.
+  The compaction decision now treats the effective window as
+  `min(model_window, context_target)`, so the live context is folded — and
+  project memory formed — to stay inside the budget rather than drifting
+  into the degradation zone on a 200k/1M model. Configurable in
+  `config.json`; floored at 16k; composes with `compaction_fold_threshold`
+  (fold point = `fraction × min(window, context_target)`).
+- **Memory formation on compaction.** When a summary fold clears
+  conversation context, dirge now runs the same background review/curate
+  pass it runs at session end, so the session's learnings are captured into
+  the durable per-project memory store before the fold discards them.
+  Self-throttled and single-runner, so frequent folds don't pile up.
+
+### Fixed
+- The agent loop now honors an explicit `context_window` config override
+  (it previously read only the built-in model table and ignored it).
+
 ## [0.6.3] - 2026-06-13
 
 ### Fixed
