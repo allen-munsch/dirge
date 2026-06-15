@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-06-15
+
+### Changed
+- **Default and coding prompts now lead with a "reach for what exists" ladder.**
+  Both prompts gained a short decision procedure run before writing any code:
+  skip it (YAGNI) → stdlib → native platform feature → installed dependency →
+  one line → minimum that works. The Code Style sections were previously all
+  "don'ts"; this adds the positive directive that actually cuts output volume,
+  plus an explicit list of what laziness never touches (trust-boundary
+  validation, data-loss handling, security, accessibility). Adapted from the
+  [ponytail](https://github.com/DietrichGebert/ponytail) skill.
+
 ## [0.7.1] - 2026-06-15
 
 ### Fixed
