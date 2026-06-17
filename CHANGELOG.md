@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-06-17
+
+### Added
+- **ChatGPT/Codex authentication.** Run `codex login`, then `dirge` with the
+  `openai` provider and `auth: chatgpt` — dirge reads the Codex bearer token
+  from `~/.codex/auth.json` (or `$CODEX_HOME/auth.json` / `CODEX_ACCESS_TOKEN`)
+  and talks to the Codex backend through a small request shim that adapts the
+  `/responses` body shape. The token is sent only to the Codex endpoint over
+  https, never logged, and ChatGPT auth is refused for any non-`openai`
+  provider so the token can't leak to a third party. (#428, #433)
+- **Skills discovered under `.agents/skills/` too**, alongside `.claude`,
+  `.opencode`, and `.dirge`, at both home and per-project scope. (#432)
+
 ## [0.7.6] - 2026-06-17
 
 ### Fixed
