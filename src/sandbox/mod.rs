@@ -100,6 +100,7 @@ impl Sandbox {
     }
 
     /// String label for the current sandbox mode.
+    #[cfg(feature = "plugin")]
     pub fn mode_str(&self) -> &str {
         match self.mode {
             SandboxMode::Off => "off",
