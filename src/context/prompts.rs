@@ -273,7 +273,7 @@ fn copy_embedded(dest: &Path) -> anyhow::Result<()> {
 /// available prompt names; `current` is the active prompt name, or `None` for
 /// the base layer. Wraps past the end; an unknown or missing `current` starts
 /// from the head. Returns `None` only when there are no prompts to cycle.
-pub fn next_prompt<'a>(current: Option<&str>, sorted: &'a [String]) -> Option<&'a str> {
+pub fn next_prompt<'a>(current: Option<&str>, sorted: &'a [&'a String]) -> Option<&'a str> {
     if sorted.is_empty() {
         return None;
     }

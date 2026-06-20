@@ -1778,8 +1778,8 @@ pub async fn run_interactive(
                         // turn.
                         if action == Some(KeyAction::CyclePrompt) {
                             let names = {
-                                let mut v: Vec<String> =
-                                    context.prompts.keys().cloned().collect();
+                                let mut v: Vec<_> =
+                                    context.prompts.keys().collect();
                                 v.sort();
                                 v
                             };
@@ -1801,12 +1801,13 @@ pub async fn run_interactive(
                                 .expect("name drawn from prompts.keys()");
                             let body = p.body.clone();
                             let deny = p.deny_tools.clone();
-                            context.set_prompt_layer(Some(name.to_string()), Some(body), deny);
+                            let name = name.to_string();
+                            context.set_prompt_layer(Some(name.clone()), Some(body), deny);
                             crate::permission::apply_prompt_deny(
                                 &permission,
                                 &context.current_prompt_deny_tools,
                             );
-                            session.current_prompt_name = Some(name.to_string());
+                            session.current_prompt_name = Some(name);
                             let model = client.completion_model(session.model.to_string());
                             agent = crate::provider::build_agent(
                                 model,
