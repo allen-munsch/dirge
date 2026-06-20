@@ -655,8 +655,7 @@ pub async fn enforce_request(
             // it can judge bash compounds and redirect targets precisely.
             // dirge-a5ir: a Deny escalates to the human (see `enforce`).
             let resources = crate::permission::approval::summarize_claims(&req.claims);
-            let verdict =
-                try_auto_approve(perm, &req.tool, &req.display_input, resources).await;
+            let verdict = try_auto_approve(perm, &req.tool, &req.display_input, resources).await;
             resolve_auto_verdict(verdict, ask_tx, perm, &req.tool, &req.display_input).await?;
             // Approved → clear the loop-guard counter (see `enforce`).
             perm.lock_ignore_poison().note_allowed_request(&req);
@@ -747,9 +746,13 @@ mod tests {
     fn is_permission_denial_recognizes_every_enforce_denial_form() {
         // Lock the contract: each message the enforce layer can emit on a
         // refusal must be recognized, and ordinary tool errors must not be.
-        assert!(is_permission_denial("Permission denied: writes outside project"));
+        assert!(is_permission_denial(
+            "Permission denied: writes outside project"
+        ));
         assert!(is_permission_denial("Permission denied by user"));
-        assert!(is_permission_denial("Permission denied (non-interactive mode)"));
+        assert!(is_permission_denial(
+            "Permission denied (non-interactive mode)"
+        ));
         assert!(is_permission_denial(
             "Auto-approval denied by approval_provider: file is outside the project directory"
         ));
@@ -825,7 +828,10 @@ mod tests {
             err.contains(AUTO_DENIAL_PREFIX) && err.contains("writes outside project"),
             "non-interactive deny keeps the evaluator reason: {err}"
         );
-        assert!(is_permission_denial(&err), "still a recognized denial: {err}");
+        assert!(
+            is_permission_denial(&err),
+            "still a recognized denial: {err}"
+        );
     }
 
     /// Test helper: build a single op-based rule (tool-agnostic).

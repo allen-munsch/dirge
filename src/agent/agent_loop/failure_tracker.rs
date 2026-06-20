@@ -523,7 +523,11 @@ mod tests {
         t.record(Outcome::Error, "read", "file not found");
         // If this denial wrongly fed the mechanical streak, escalation
         // would reach 3 and the mechanical checkpoint would fire.
-        t.record(Outcome::Denied, "write", "Permission denied: outside project");
+        t.record(
+            Outcome::Denied,
+            "write",
+            "Permission denied: outside project",
+        );
         assert!(
             t.poll_reflection().is_empty(),
             "2 mechanical errors + 1 denial: neither streak at threshold"
