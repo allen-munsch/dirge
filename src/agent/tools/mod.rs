@@ -157,6 +157,32 @@ pub enum ToolError {
     Msg(String),
 }
 
+/// Stable leading marker on every rule/user/non-interactive permission
+/// refusal produced by [`enforce`] / [`enforce_request`] / the human-ask
+/// path. The failure tracker ([`Outcome::Denied`]) and the critic
+/// transcript labeler key off this prefix to tell a *policy* refusal —
+/// which the model cannot fix by retrying — apart from a mechanical
+/// failure it can. dirge-c7sd: denials carry no typed identity by the
+/// time they reach those consumers (they arrive as a result string +
+/// `is_error` bool), so the message prefix IS the signal. Keep this and
+/// [`AUTO_DENIAL_PREFIX`] in sync with [`is_permission_denial`].
+pub const DENIAL_PREFIX: &str = "Permission denied";
+/// Leading marker on an `approval_provider` (LLM evaluator) auto-denial.
+/// Separate from [`DENIAL_PREFIX`] because the wording differs; both are
+/// recognized by [`is_permission_denial`].
+pub const AUTO_DENIAL_PREFIX: &str = "Auto-approval denied by approval_provider";
+
+/// True when a tool-result error text is a permission/approval denial: a
+/// policy refusal the model cannot resolve by retrying or rephrasing,
+/// only the user can (via `/allow` or a prompt). Single source of truth
+/// shared by the failure tracker and the critic so neither mistakes a
+/// guardrail for a mechanical failure to "try a different approach"
+/// around. Keyed on the stable prefixes the `enforce` layer emits.
+pub fn is_permission_denial(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with(DENIAL_PREFIX) || t.starts_with(AUTO_DENIAL_PREFIX)
+}
+
 impl From<io::Error> for ToolError {
     fn from(e: io::Error) -> Self {
         ToolError::Msg(e.to_string())
@@ -392,35 +418,46 @@ async fn handle_ask_inner(
                 .add_session_allowlist(tool.to_string(), &pattern);
             Ok(())
         }
-        _ => Err(ToolError::Msg("Permission denied by user".to_string())),
+        _ => Err(ToolError::Msg(format!("{DENIAL_PREFIX} by user"))),
     }
 }
 
+/// Outcome of the optional LLM auto-approval pass (dirge-0g6i).
+enum AutoVerdict {
+    /// Evaluator approved — caller proceeds without a human prompt.
+    Allow,
+    /// Evaluator denied, carrying its reason. dirge-a5ir: this is ADVISORY
+    /// — the caller escalates it to the human prompt (the user may approve
+    /// and `/allow` it), and only treats it as terminal when there is no
+    /// human (non-interactive). The evaluator is not the final authority
+    /// on denials, just on the cheap auto-ALLOW path.
+    Deny(String),
+    /// No evaluator configured, OR the evaluator call errored → the human
+    /// decides (fail-open to the prompt, never silently allow).
+    Abstain,
+}
+
 /// dirge-0g6i: if an `approval_provider` LLM is configured, let it judge
-/// an otherwise-`Ask` decision instead of prompting the human. Shared by
-/// both [`enforce`] (single scope) and [`enforce_request`] (multi-claim
-/// bash) so the evaluation path isn't duplicated. Returns:
-///
-/// - `Some(Ok(()))` → auto-approved; caller proceeds.
-/// - `Some(Err(..))` → auto-denied (with the evaluator's reason).
-/// - `None` → no evaluator configured, OR the evaluator call errored →
-///   caller falls back to the human prompt (fail-open to the human,
-///   never silently allow).
+/// an otherwise-`Ask` decision before prompting the human. Shared by both
+/// [`enforce`] (single scope) and [`enforce_request`] (multi-claim bash)
+/// so the evaluation path isn't duplicated. See [`AutoVerdict`] for how
+/// each outcome is handled — note a Deny escalates to the human rather
+/// than failing outright (dirge-a5ir).
 async fn try_auto_approve(
     perm: &PermCheck,
     tool: &str,
     command: &str,
     resources: Vec<String>,
-) -> Option<Result<(), ToolError>> {
+) -> AutoVerdict {
     use crate::permission::approval::{ApprovalDecision, ApprovalRequest};
     // One lock: pull the evaluator (clone the Arc) + working dir, then
     // drop the lock BEFORE the await so we never hold it across the LLM
-    // call. `None` evaluator → caller falls back to the human prompt.
+    // call. No evaluator → the human decides.
     let (f, working_dir) = {
         let g = perm.lock_ignore_poison();
         match g.approval_fn() {
             Some(f) => (f, g.working_dir().to_string()),
-            None => return None,
+            None => return AutoVerdict::Abstain,
         }
     };
     let req = ApprovalRequest {
@@ -432,19 +469,44 @@ async fn try_auto_approve(
     match f(req).await {
         Ok(ApprovalDecision::Allow) => {
             tracing::info!(target: "dirge::permission", tool, command, "auto-approval: ALLOW");
-            Some(Ok(()))
+            AutoVerdict::Allow
         }
         Ok(ApprovalDecision::Deny(reason)) => {
-            tracing::info!(target: "dirge::permission", tool, command, %reason, "auto-approval: DENY");
-            Some(Err(ToolError::Msg(format!(
-                "Auto-approval denied by approval_provider: {reason}"
-            ))))
+            tracing::info!(target: "dirge::permission", tool, command, %reason, "auto-approval: DENY (escalating to human)");
+            AutoVerdict::Deny(reason)
         }
         Err(e) => {
             tracing::warn!(target: "dirge::permission", error = %e, "approval_provider call failed; falling back to human prompt");
-            None
+            AutoVerdict::Abstain
         }
     }
+}
+
+/// Shared post-`try_auto_approve` handling for the `Ask` branch of both
+/// [`enforce`] and [`enforce_request`] (dirge-a5ir). `Allow` proceeds;
+/// `Deny`/`Abstain` both route to the human prompt, differing only in the
+/// terminal message when no human is available (non-interactive). Returns
+/// `Ok(true)` when auto-approved (caller need not prompt), `Ok(false)`
+/// when the human approved, or the denial error.
+async fn resolve_auto_verdict(
+    verdict: AutoVerdict,
+    ask_tx: &Option<AskSender>,
+    perm: &PermCheck,
+    tool: &str,
+    input: &str,
+) -> Result<bool, ToolError> {
+    // Deny and Abstain share one path: prompt the human, terminal only when
+    // there's nobody to ask. They differ only in that no-human message.
+    let no_human_msg = match verdict {
+        AutoVerdict::Allow => return Ok(true),
+        AutoVerdict::Deny(reason) => format!("{AUTO_DENIAL_PREFIX}: {reason}"),
+        AutoVerdict::Abstain => format!("{DENIAL_PREFIX} (non-interactive mode)"),
+    };
+    let Some(tx) = ask_tx else {
+        return Err(ToolError::Msg(no_human_msg));
+    };
+    handle_ask_inner(tx, perm, tool, input).await?;
+    Ok(false)
 }
 
 /// Scope arg passed to the [`enforce`] chokepoint. Discriminates
@@ -542,24 +604,16 @@ pub async fn enforce(
     use crate::permission::engine::types::Effect;
     match effect {
         Effect::Allow => Ok(resolved),
-        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Deny => Err(ToolError::Msg(format!("{DENIAL_PREFIX}: {reason}"))),
         Effect::Ask => {
-            // dirge-0g6i: optional LLM auto-approval before the human prompt.
-            if let Some(outcome) = try_auto_approve(perm, tool, raw_scope, Vec::new()).await {
-                outcome?; // Deny → propagate; Allow → fall through.
-                perm.lock_ignore_poison()
-                    .note_allowed_scope(tool, raw_scope, is_path);
-                return Ok(resolved);
-            }
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
-            };
-            handle_ask_inner(tx, perm, tool, raw_scope).await?;
-            // Approved → clear the loop-guard counter so a repeated call
-            // the user keeps allowing never trips the doom-loop hard-deny
-            // (only repeatedly-denied prompts accumulate).
+            // dirge-0g6i: optional LLM auto-approval before the human
+            // prompt. dirge-a5ir: a Deny escalates to the human, it doesn't
+            // short-circuit — handled in `resolve_auto_verdict`.
+            let verdict = try_auto_approve(perm, tool, raw_scope, Vec::new()).await;
+            resolve_auto_verdict(verdict, ask_tx, perm, tool, raw_scope).await?;
+            // Approved (auto or by the human) → clear the loop-guard counter
+            // so a repeated call the user keeps allowing never trips the
+            // doom-loop hard-deny (only repeatedly-denied prompts accumulate).
             perm.lock_ignore_poison()
                 .note_allowed_scope(tool, raw_scope, is_path);
             Ok(resolved)
@@ -594,25 +648,15 @@ pub async fn enforce_request(
     };
     match effect {
         Effect::Allow => Ok(()),
-        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Deny => Err(ToolError::Msg(format!("{DENIAL_PREFIX}: {reason}"))),
         Effect::Ask => {
             // dirge-0g6i: optional LLM auto-approval. The evaluator sees a
             // per-claim danger summary (operation + in/out-of-project) so
             // it can judge bash compounds and redirect targets precisely.
+            // dirge-a5ir: a Deny escalates to the human (see `enforce`).
             let resources = crate::permission::approval::summarize_claims(&req.claims);
-            if let Some(outcome) =
-                try_auto_approve(perm, &req.tool, &req.display_input, resources).await
-            {
-                outcome?; // Deny → propagate; Allow → fall through.
-                perm.lock_ignore_poison().note_allowed_request(&req);
-                return Ok(());
-            }
-            let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
-            };
-            handle_ask_inner(tx, perm, &req.tool, &req.display_input).await?;
+            let verdict = try_auto_approve(perm, &req.tool, &req.display_input, resources).await;
+            resolve_auto_verdict(verdict, ask_tx, perm, &req.tool, &req.display_input).await?;
             // Approved → clear the loop-guard counter (see `enforce`).
             perm.lock_ignore_poison().note_allowed_request(&req);
             Ok(())
@@ -697,6 +741,98 @@ mod tests {
         Action, OpSpec, PermissionConfig, RuleConfig, SecurityMode, checker::PermissionChecker,
     };
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn is_permission_denial_recognizes_every_enforce_denial_form() {
+        // Lock the contract: each message the enforce layer can emit on a
+        // refusal must be recognized, and ordinary tool errors must not be.
+        assert!(is_permission_denial(
+            "Permission denied: writes outside project"
+        ));
+        assert!(is_permission_denial("Permission denied by user"));
+        assert!(is_permission_denial(
+            "Permission denied (non-interactive mode)"
+        ));
+        assert!(is_permission_denial(
+            "Auto-approval denied by approval_provider: file is outside the project directory"
+        ));
+        // Leading whitespace (excerpt trimming) still matches.
+        assert!(is_permission_denial("  Permission denied: x"));
+        // Non-denials.
+        assert!(!is_permission_denial("old_string not found in file"));
+        assert!(!is_permission_denial("Command timed out after 120s"));
+        assert!(!is_permission_denial(
+            "error: the user lacks permission denied elsewhere in sentence"
+        ));
+    }
+
+    // dirge-a5ir: an approval_provider Deny is advisory — it escalates to
+    // the human prompt rather than hard-failing the call. These tests pin
+    // that the human can override a Deny in interactive mode, and that it
+    // stays terminal only when there's no human.
+
+    /// Build a checker whose `Ask`-default applies (no rule matches) and
+    /// install an approval_fn that always denies with `reason`.
+    fn checker_with_denying_evaluator(reason: &'static str) -> PermCheck {
+        use crate::permission::approval::ApprovalDecision;
+        // Ask-everything: a single Ask rule over all edits so a write to an
+        // out-of-cwd path routes through the auto-approval path.
+        let config = PermissionConfig {
+            rules: vec![rule(OpSpec::Edit, "**", Action::Ask)],
+            ..Default::default()
+        };
+        let mut checker = PermissionChecker::new(
+            &config,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/tmp")),
+        );
+        checker.set_approval_fn(Arc::new(move |_req| {
+            Box::pin(async move { Ok(ApprovalDecision::Deny(reason.to_string())) })
+        }));
+        Arc::new(Mutex::new(checker))
+    }
+
+    #[tokio::test]
+    async fn approval_provider_deny_escalates_to_human_who_can_allow() {
+        use crate::permission::ask::{AskRequest, UserDecision};
+        let perm = checker_with_denying_evaluator("writes outside project");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AskRequest>(1);
+
+        // Stand in for the UI: the human approves despite the evaluator's deny.
+        let human = tokio::spawn(async move {
+            let req = rx.recv().await.expect("a prompt must reach the human");
+            let _ = req.reply.send(UserDecision::AllowOnce);
+        });
+
+        let result = enforce(
+            &Some(perm),
+            &Some(tx),
+            "write",
+            Scope::PathResolve("/tmp/x.rs"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "human override of an evaluator deny should allow: {result:?}"
+        );
+        human.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_provider_deny_is_terminal_without_a_human() {
+        let perm = checker_with_denying_evaluator("writes outside project");
+        // No ask_tx → non-interactive → the deny stands, carrying the reason.
+        let result = enforce(&Some(perm), &None, "write", Scope::PathResolve("/tmp/x.rs")).await;
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(AUTO_DENIAL_PREFIX) && err.contains("writes outside project"),
+            "non-interactive deny keeps the evaluator reason: {err}"
+        );
+        assert!(
+            is_permission_denial(&err),
+            "still a recognized denial: {err}"
+        );
+    }
 
     /// Test helper: build a single op-based rule (tool-agnostic).
     fn rule(op: OpSpec, pattern: &str, effect: Action) -> RuleConfig {
