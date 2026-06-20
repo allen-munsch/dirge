@@ -166,6 +166,87 @@ impl Keymap {
     pub fn resolve(&self, key: &KeyEvent) -> Option<KeyAction> {
         self.map.get(&[(key.code, key.modifiers)][..]).copied()
     }
+
+    /// True when `seq` is a *proper* prefix of some longer bound sequence —
+    /// i.e. more keys could still complete a binding. Drives the pending-
+    /// prefix hold in the chord-sequence runtime (#234).
+    fn is_strict_prefix(&self, seq: &[Chord]) -> bool {
+        self.map.keys().any(|k| k.len() > seq.len() && k.starts_with(seq))
+    }
+
+    /// Classify an accumulated chord sequence for the #234 runtime.
+    /// Single-key bindings are deliberately NOT reported as `Exact` here —
+    /// they flow through [`Keymap::resolve`] with its full dispatch
+    /// precedence; only genuine multi-key sequences fire from the matcher.
+    pub fn classify_seq(&self, seq: &[Chord]) -> SeqClass {
+        if seq.len() >= 2
+            && let Some(action) = self.map.get(seq).copied()
+        {
+            return SeqClass::Exact(action);
+        }
+        if self.is_strict_prefix(seq) {
+            SeqClass::Prefix
+        } else {
+            SeqClass::NoMatch
+        }
+    }
+}
+
+/// Outcome of matching an accumulated chord sequence against the keymap
+/// (#234). See [`Keymap::classify_seq`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeqClass {
+    /// The sequence exactly matches a multi-key binding — fire this action.
+    Exact(KeyAction),
+    /// The sequence is a proper prefix of a longer binding — hold and wait
+    /// for more keys.
+    Prefix,
+    /// The sequence matches nothing extendable — not part of a sequence.
+    NoMatch,
+}
+
+/// Render one chord back to the config chord grammar (e.g. `ctrl-x`),
+/// the inverse of [`parse_chord`]. Used for the pending-prefix footer
+/// echo and conflict warnings.
+pub fn chord_label(chord: &Chord) -> String {
+    let (code, mods) = chord;
+    let mut s = String::new();
+    if mods.contains(KeyModifiers::CONTROL) {
+        s.push_str("ctrl-");
+    }
+    if mods.contains(KeyModifiers::ALT) {
+        s.push_str("alt-");
+    }
+    if mods.contains(KeyModifiers::SHIFT) {
+        s.push_str("shift-");
+    }
+    let key = match code {
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        other => format!("{other:?}").to_ascii_lowercase(),
+    };
+    s.push_str(&key);
+    s
+}
+
+/// Render a chord sequence (e.g. `ctrl-x ctrl-s`).
+pub fn chord_seq_label(seq: &[Chord]) -> String {
+    seq.iter().map(chord_label).collect::<Vec<_>>().join(" ")
 }
 
 /// Both keymaps built from one `keybindings` config (dirge-xv9l). The
@@ -215,6 +296,39 @@ impl Keymaps {
                 ));
             }
         }
+
+        // dirge-fl57 conflict resolution: a chord that is BOTH a terminal
+        // (single-key) binding AND the prefix of a longer sequence can't be
+        // both — the sequence must wait for more keys. The sequence wins;
+        // drop the single-key binding and warn.
+        let prefixed: Vec<ChordSeq> = global
+            .map
+            .keys()
+            .filter(|k| k.len() == 1 && global.is_strict_prefix(k))
+            .cloned()
+            .collect();
+        for k in prefixed {
+            global.map.remove(&k);
+            warnings.push(format!(
+                "keybindings: {} starts a chord sequence; its single-key binding is disabled",
+                chord_seq_label(&k)
+            ));
+        }
+
+        // Chord sequences only fire for global commands (the runtime matches
+        // against the global keymap). An input-editor command bound to a
+        // multi-key sequence would never trigger — drop it with a warning
+        // rather than leave a dead binding.
+        let input_seqs: Vec<ChordSeq> = input.map.keys().filter(|k| k.len() > 1).cloned().collect();
+        for k in input_seqs {
+            input.map.remove(&k);
+            warnings.push(format!(
+                "keybindings: chord sequences ({}) are only supported for global commands, \
+                 not input-editor commands",
+                chord_seq_label(&k)
+            ));
+        }
+
         (Keymaps { global, input }, warnings)
     }
 }
@@ -869,22 +983,72 @@ mod tests {
         );
     }
 
+    // --- chord-sequence runtime (#234, dirge-fl57) -----------------
+
+    fn ctrl(c: char) -> Chord {
+        (KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
     #[test]
-    fn config_stores_a_multi_key_sequence() {
-        // Sequence-native storage (the #234 runtime activates it in phase 4):
-        // a 2-chord binding lands in the map keyed on the full sequence, and
-        // does not disturb single-key resolution of its prefix.
+    fn sequence_binding_disables_its_terminal_prefix() {
+        // Binding `ctrl-x ctrl-s` makes plain Ctrl+X a prefix key, so its
+        // default terminal binding (close_chat) is dropped with a warning —
+        // the sequence wins.
         let (kms, warns) = Keymaps::from_config(Some(&[cfg("ctrl-x ctrl-s", "toggle_reasoning")]));
-        assert!(warns.is_empty(), "{warns:?}");
-        let seq = vec![
-            (KeyCode::Char('x'), KeyModifiers::CONTROL),
-            (KeyCode::Char('s'), KeyModifiers::CONTROL),
-        ];
-        assert_eq!(kms.global.map.get(&seq), Some(&KeyAction::ToggleReasoning));
-        // Single Ctrl+X still resolves to its default (close_chat), unaffected.
-        assert_eq!(
-            kms.global.resolve(&ev(KeyCode::Char('x'), KeyModifiers::CONTROL)),
-            Some(KeyAction::CloseChat)
+        assert_eq!(kms.global.map.get(&vec![ctrl('x'), ctrl('s')]), Some(&KeyAction::ToggleReasoning));
+        // Plain Ctrl+X no longer resolves to close_chat (it's a prefix now).
+        assert_eq!(kms.global.resolve(&ev(KeyCode::Char('x'), KeyModifiers::CONTROL)), None);
+        assert!(
+            warns.iter().any(|w| w.contains("starts a chord sequence")),
+            "{warns:?}"
         );
+    }
+
+    #[test]
+    fn classify_seq_holds_prefix_then_fires_exact() {
+        let (kms, _) = Keymaps::from_config(Some(&[cfg("ctrl-x ctrl-s", "scroll_to_top")]));
+        let km = &kms.global;
+        // First key of the sequence → hold.
+        assert_eq!(km.classify_seq(&[ctrl('x')]), SeqClass::Prefix);
+        // Completing it → fire.
+        assert_eq!(
+            km.classify_seq(&[ctrl('x'), ctrl('s')]),
+            SeqClass::Exact(KeyAction::ScrollToTop)
+        );
+        // A wrong second key → no match (caller aborts the prefix).
+        assert_eq!(km.classify_seq(&[ctrl('x'), ctrl('a')]), SeqClass::NoMatch);
+        // An unrelated single key → no match (handled by normal resolve).
+        assert_eq!(km.classify_seq(&[ctrl('r')]), SeqClass::NoMatch);
+    }
+
+    #[test]
+    fn single_key_bindings_never_classify_as_exact() {
+        // The matcher only fires multi-key sequences; a plain Ctrl+R binding
+        // is left to the normal dispatch (so its precedence rules apply).
+        let km = Keymap::defaults();
+        assert_eq!(km.classify_seq(&[ctrl('r')]), SeqClass::NoMatch);
+    }
+
+    #[test]
+    fn input_command_sequence_is_rejected_with_warning() {
+        // Sequences only fire for global commands; an input-command sequence
+        // is dropped with a warning rather than left as a dead binding.
+        let (kms, warns) = Keymaps::from_config(Some(&[cfg("ctrl-x ctrl-s", "kill_to_line_end")]));
+        assert!(kms.input.map.keys().all(|k| k.len() == 1), "no input sequences kept");
+        assert!(
+            warns.iter().any(|w| w.contains("only supported for global commands")),
+            "{warns:?}"
+        );
+    }
+
+    #[test]
+    fn chord_labels_round_trip_the_grammar() {
+        assert_eq!(chord_label(&ctrl('x')), "ctrl-x");
+        assert_eq!(chord_label(&(KeyCode::Home, KeyModifiers::NONE)), "home");
+        assert_eq!(
+            chord_label(&(KeyCode::Char('f'), KeyModifiers::ALT | KeyModifiers::SHIFT)),
+            "alt-shift-f"
+        );
+        assert_eq!(chord_seq_label(&[ctrl('x'), ctrl('s')]), "ctrl-x ctrl-s");
     }
 }
