@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-06-20
+
+### Added
+- **Cycle prompts with Shift+Tab.** A hotkey (rebindable as `cycle_prompt`)
+  steps through the configured prompt layers like a mode switcher, and now
+  cycles back to the no-prompt base layer past the last one. (#485, #489)
+
+### Fixed
+- **Critic / verifier / todo nudge no longer vanishes from the log.** These
+  finalization nudges re-enter as user-role messages without a Done/ToolCall to
+  reset the stream anchor, so the next turn's render overwrote them — they
+  disappeared on screen a moment later even though the model still had them in
+  context. The in-flight response is now finalized before the nudge renders, so
+  the next turn streams below it. (#488)
+
 ## [0.10.1] - 2026-06-20
 
 ### Added
