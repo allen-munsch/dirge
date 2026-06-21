@@ -1438,7 +1438,7 @@ pub async fn run_interactive(
                         // Resolve the key to a rebindable global command
                         // (config-overridable), or use the action a completed
                         // chord sequence produced. `None` for everything else
-                        // (typing, input-editor keys, the Ctrl+C/D/Esc cancel
+                        // (typing, input-editor keys, Ctrl+C cancel
                         // gesture), which flows through unchanged.
                         let action = seq_action.or_else(|| keymap.resolve(&key));
                         // A completed chord sequence consumes its terminal key:
@@ -1450,10 +1450,7 @@ pub async fn run_interactive(
                         let is_ctrl_c = !from_sequence
                             && key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
-                        let is_ctrl_d = !from_sequence
-                            && key.code == KeyCode::Char('d')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if is_ctrl_c || is_ctrl_d {
+                        if is_ctrl_c {
                             if ui.rewind_picker.active {
                                 ui.rewind_picker.deactivate();
                                 renderer.set_rewind_overlay(None);
@@ -1543,7 +1540,7 @@ pub async fn run_interactive(
                                 )?;
                                 renderer.request_repaint();
                             } else if !input.expanded().is_empty() {
-                                // Idle Ctrl+C/D with a typed draft: clear the
+                                // Idle Ctrl+C with a typed draft: clear the
                                 // line instead of quitting, so an accidental
                                 // Ctrl+C doesn't end the session and discard the
                                 // draft (readline/bash behavior). Only an EMPTY
@@ -1551,7 +1548,7 @@ pub async fn run_interactive(
                                 input.set_text("");
                                 renderer.request_repaint();
                             } else {
-                                // dirge-bx4g: clean exit via Ctrl+C / Ctrl+D
+                                // dirge-bx4g: clean exit via Ctrl+C
                                 // while idle — fire on_session_end so plugin
                                 // providers see the session boundary.
                                 crate::agent::review::maybe_fire_session_end(
@@ -1765,6 +1762,81 @@ pub async fn run_interactive(
                                 )
                             };
                             renderer.write_line(&msg, theme::dim())?;
+                            renderer.request_repaint();
+                            continue;
+                        }
+
+                        // Shift+Tab cycles the active prompt layer to the next
+                        // available prompt. Silent: updates the status-bar
+                        // badge without writing to the chat log (unlike the
+                        // `/prompt <name>` slash command, which announces the
+                        // switch). Mirrors that command's layer swap + agent
+                        // rebuild so the new prompt takes effect on the next
+                        // turn.
+                        if action == Some(KeyAction::CyclePrompt) {
+                            let names = {
+                                let mut v: Vec<_> =
+                                    context.prompts.keys().collect();
+                                v.sort();
+                                v
+                            };
+                            let Some(target) = crate::context::prompts::next_prompt(
+                                context.current_prompt_name.as_deref(),
+                                &names,
+                            ) else {
+                                continue; // no named prompts to cycle through
+                            };
+                            // target: None = base (no-prompt) layer, Some(name) =
+                            // a named prompt. Skip the rebuild if we'd land on the
+                            // layer that's already active.
+                            if target == context.current_prompt_name.as_deref() {
+                                continue;
+                            }
+                            // Resolve the switch into owned data BEFORE mutating
+                            // `context` (the immutable `names`/`target` borrows it).
+                            let named = target.map(|name| {
+                                let p = context
+                                    .prompts
+                                    .get(name)
+                                    .expect("name drawn from prompts.keys()");
+                                (name.to_string(), p.body.clone(), p.deny_tools.clone())
+                            });
+                            match named {
+                                Some((name, body, deny)) => {
+                                    context.set_prompt_layer(Some(name.clone()), Some(body), deny);
+                                    session.current_prompt_name = Some(name);
+                                }
+                                None => {
+                                    // Cycled past the last prompt → back to base.
+                                    context.clear_prompt_layer();
+                                    session.current_prompt_name = None;
+                                }
+                            }
+                            crate::permission::apply_prompt_deny(
+                                &permission,
+                                &context.current_prompt_deny_tools,
+                            );
+                            let model = client.completion_model(session.model.to_string());
+                            agent = crate::provider::build_agent(
+                                model,
+                                cli,
+                                cfg,
+                                context,
+                                permission.clone(),
+                                ask_tx.clone(),
+                                question_tx.clone(),
+                                plan_tx.clone(),
+                                bg_store.clone(),
+                                #[cfg(feature = "lsp")]
+                                lsp_manager.clone(),
+                                sandbox.clone(),
+                                #[cfg(feature = "mcp")]
+                                mcp_manager.as_ref(),
+                                #[cfg(feature = "semantic")]
+                                semantic_manager,
+                                Some(session.id.to_string()),
+                            )
+                            .await;
                             renderer.request_repaint();
                             continue;
                         }
@@ -2864,7 +2936,20 @@ pub async fn run_interactive(
                         );
                     }
                     AgentEvent::UserMessage { content } => {
-                        run_handlers::notices::handle_user_message(&mut renderer, &content)?;
+                        // Finalize any in-flight assistant response and drop the
+                        // stream anchor first — a critic/verifier/todo nudge
+                        // re-enters here without a Done/ToolCall to reset it, so
+                        // otherwise the next turn's replace_from overwrites the
+                        // nudge and it vanishes on screen (dirge-m10x).
+                        run_handlers::notices::handle_user_message_after_response(
+                            &mut renderer,
+                            &content,
+                            &mut ui.response_buf,
+                            &mut ui.response_start_line,
+                            &mut ui.reasoning_buf,
+                            &mut ui.reasoning_start_line,
+                            &mut ui.agent_line_started,
+                        )?;
                         // session.add_message handled at input time.
                     }
                     AgentEvent::EscalationActivated { provider, reason } => {

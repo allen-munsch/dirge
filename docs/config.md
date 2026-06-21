@@ -640,6 +640,7 @@ routes to the right one by its command name.
 | `close_chat` | `ctrl-x` | Close the active chat window |
 | `kill_subagent` | `ctrl-k` | Kill the focused subagent |
 | `drop_queue` | `alt-x` | Drop queued interjections (without cancelling the run) |
+| `cycle_prompt` | `shift-tab` | Cycle the active prompt layer to the next available prompt |
 
 ### Input-editor commands
 
@@ -652,6 +653,7 @@ routes to the right one by its command name.
 | `word_left` | `alt-b`, `alt-left` | Cursor one word left |
 | `word_right` | `alt-f`, `alt-right` | Cursor one word right |
 | `delete_char_back` | `ctrl-h` | Delete character before cursor |
+| `delete_char_forward` | `ctrl-d` | Delete character at cursor (forward) |
 | `kill_to_line_end` | `ctrl-k` | Kill to end of line |
 | `kill_to_line_start` | `ctrl-u` | Kill to start of line |
 | `kill_word_back` | `ctrl-w` | Kill word before cursor |
@@ -687,7 +689,7 @@ you'll see a warning.
 
 Notes:
 - **Always fixed** (never rebindable): the cancel/interrupt gesture
-  **Ctrl+C / Ctrl+D / Esc** (the panic button) and intrinsic editing —
+  **Ctrl+C / Esc** (the panic button) and intrinsic editing —
   typing a character, **Backspace**, **Delete**, **Enter** to submit,
   **Ctrl+J** (insert newline), and **Tab** completion. Binding a global
   command to one of these chords shadows the intrinsic behavior while
