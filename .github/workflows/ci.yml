@@ -39,11 +39,13 @@ jobs:
 
       - name: Install Janet
         run: |
+          mkdir -p ~/.local
           curl -fsSLo /tmp/janet.tar.gz https://github.com/janet-lang/janet/releases/download/v1.36.0/janet-v1.36.0-linux-x64.tar.gz
-          sudo tar xzf /tmp/janet.tar.gz -C /usr/local --strip-components=1
+          tar xzf /tmp/janet.tar.gz -C ~/.local --strip-components=2
 
       - name: Syntax-check all plugins
         run: |
+          export PATH="$HOME/.local/bin:$PATH"
           failed=0
           for f in plugins/*.janet; do
             if ! janet -k "$f"; then
