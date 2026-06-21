@@ -28,32 +28,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  # Syntax-check every plugin with standalone Janet so a missing
-  # dap/* or harness/* binding reference never sneaks past CI.
-  # Complements the Rust `validate_all_plugins_compile` test that
-  # checks compilation against the full dirge host surface.
-  janet-plugins:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Janet
-        run: |
-          mkdir -p ~/.local
-          curl -fsSLo /tmp/janet.tar.gz https://github.com/janet-lang/janet/releases/download/v1.36.0/janet-v1.36.0-linux-x64.tar.gz
-          tar xzf /tmp/janet.tar.gz -C ~/.local --strip-components=2
-
-      - name: Syntax-check all plugins
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          failed=0
-          for f in plugins/*.janet; do
-            if ! janet -k "$f"; then
-              echo "FAIL: $f"
-              failed=1
-            fi
-          done
-          exit $failed
+  # The `validate_all_plugins_compile` Rust test (mod_tests.rs) loads every
+  # plugin against the full dirge harness surface.  It runs in the
+  # --all-features test variant below.  That's the canonical gate; there is
+  # no standalone janet -k check because the plugins reference harness/* and
+  # dap/* symbols that only exist inside the dirge Janet runtime.
+  #
 
   # dirge-9wtb: feature matrix.
   #
