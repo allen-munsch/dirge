@@ -28,6 +28,29 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+  # Syntax-check every plugin with standalone Janet so a missing
+  # dap/* or harness/* binding reference never sneaks past CI.
+  # Complements the Rust `validate_all_plugins_compile` test that
+  # checks compilation against the full dirge host surface.
+  janet-plugins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Janet
+        run: sudo apt-get update -y && sudo apt-get install -y janet
+
+      - name: Syntax-check all plugins
+        run: |
+          failed=0
+          for f in plugins/*.janet; do
+            if ! janet -k "$f"; then
+              echo "FAIL: $f"
+              failed=1
+            fi
+          done
+          exit $failed
+
   # dirge-9wtb: feature matrix.
   #
   # Default `cargo build` only compiles the code paths reachable
@@ -56,6 +79,8 @@ jobs:
             features: "--features acp"
           - name: plugin
             features: "--features plugin"
+          - name: dap
+            features: "--features dap,plugin"
           - name: mcp
             features: "--features mcp"
           - name: lsp
@@ -86,7 +111,7 @@ jobs:
         # CI time without commensurate coverage gain. Run tests on
         # default, plugin (covers plugin-only hook tests), and
         # all-features (worst-case interaction).
-        if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'all-features'
+        if: matrix.name == 'default' || matrix.name == 'plugin' || matrix.name == 'dap' || matrix.name == 'all-features'
         run: cargo test --bin dirge ${{ matrix.features }}
 
   # Windows is only built at release time (release.yml, tag-triggered),

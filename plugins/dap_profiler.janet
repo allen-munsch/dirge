@@ -58,7 +58,7 @@
     (while (and (< found 10)
                 (>= idx 0)
                 (< idx (length frames-str)))
-      (def name-start (string/find "\"name\": \"" frames-str idx))
+      (var name-start (string/find "\"name\": \"" frames-str idx))
       (if (not name-start)
         (break))
       (set name-start (+ name-start 9))
@@ -99,7 +99,7 @@
 (defn profile-start [args]
   (when (not (dap/session-active?))
     (break "No active DAP session — launch a program first"))
-  (def interval (if (empty? args) 200 (math/parse-int args)))
+  (def interval (if (empty? args) 200 (scan-number args)))
   (set profiling true)
   (set profile-interval (max 50 interval))
   (set profile-max-samples 100)

@@ -2562,3 +2562,30 @@ fn nrepl_plugin_paren_repair_balances_delimiters() {
         r#"(str ")")"#
     );
 }
+
+// --- Plugin compilation validation ------------------------------------
+
+/// **Every** `.janet` file under `plugins/` must compile cleanly
+/// against the full dirge harness surface (all features enabled) so
+/// startup warnings about "failed to load plugin" never regress.
+/// Standalone `janet -k` catches syntax errors, but only a full Rust
+/// eval with the dirge host can catch missing symbol references.
+#[cfg(all(feature = "plugin", feature = "dap", feature = "mcp", feature = "lsp"))]
+#[test]
+fn validate_all_plugins_compile() {
+    let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins");
+    let mut mgr = PluginManager::try_new().unwrap();
+    let mut count = 0usize;
+
+    for entry in std::fs::read_dir(&plugin_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().map_or(false, |e| e == "janet") {
+            let source = std::fs::read_to_string(&path).unwrap();
+            mgr.eval(&source)
+                .unwrap_or_else(|e| panic!("{} failed to compile: {e}", path.display()));
+            count += 1;
+        }
+    }
+
+    assert!(count >= 20, "expected at least 20 plugins, found {count}");
+}
