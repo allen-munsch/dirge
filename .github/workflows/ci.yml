@@ -38,7 +38,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Janet
-        run: sudo apt-get update -y && sudo apt-get install -y janet
+        run: |
+          curl -fsSLo /tmp/janet.tar.gz https://github.com/janet-lang/janet/releases/download/v1.36.0/janet-v1.36.0-linux-x64.tar.gz
+          sudo tar xzf /tmp/janet.tar.gz -C /usr/local --strip-components=1
 
       - name: Syntax-check all plugins
         run: |
