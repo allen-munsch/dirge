@@ -85,6 +85,8 @@ Classify every entry you save with the `kind` parameter — it drives how memory
   • `working` — short-lived task context. Rarely worth saving and the FIRST to be evicted under budget pressure — prefer not to persist it.
 When unsure, use `semantic` for facts and `procedural` for rules.
 
+**1a. Keep the PROJECT OVERVIEW current.** Maintain exactly ONE `overview`-kind entry: a minimal (≤5 lines) high-level orientation of the project — what it is, its language/stack, the rough source layout, and how to build/test/run it. This is the gestalt a future session should read first. If no overview exists yet, create it with `memory(action='add', kind='overview', content='...')`; the deterministic session ground-truth above is a good starting point. If one exists and the big picture has changed (or it is missing something foundational), REPLACE it — adding an `overview` overwrites the existing one in place, so just `add` the refreshed version. Keep it stable and short: it is orientation, not a changelog. Do nothing here if the current overview is still accurate.
+
 **1b. Record procedural OUTCOMES.** A `procedural` memory is a playbook, and its value is whether it actually works. If the conversation shows an existing procedural entry being applied and the result is clear, record it with `memory(action='mark', old_text='<id-or-substring>', outcome='success'|'failure')`:
   • `success` — the rule was followed and the thing worked, or the user confirmed it ("thanks, that worked").
   • `failure` — following the rule led to a broken or rejected result ("that didn't help", the step had to be undone).
