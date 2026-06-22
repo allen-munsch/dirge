@@ -142,7 +142,7 @@ SAVE WHEN: the user corrects you or says "remember this"; you discover build/tes
 
 TARGETS: "memory" (facts, conventions, build, architecture), "pitfalls" (anti-patterns, things tried and failed).
 
-KINDS (optional, default "procedural"): semantic (fact), episodic (event), procedural (rule), working (short-lived), identity (user/agent), overview (the single high-level project orientation — stack, layout, how to build/test; SINGULAR: adding one replaces the existing overview; always shown first and never evicted).
+KINDS (optional, default "procedural"): semantic (fact), episodic (event), procedural (rule), working (short-lived), identity (user/agent), overview (singular project orientation; adding one replaces it).
 
 ACTIONS:
 - view: inline entries + breadcrumb index for a target
