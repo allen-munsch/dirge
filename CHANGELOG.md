@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-06-22
+
+### Added
+- **Read the current session id.** `/sessions current` prints the full session
+  id with a `dirge --session <id>` resume hint, and `/sessions list` marks the
+  live session. The status footer's session badge now shows a *distinct*
+  compact id (keeps a `compacted-`/`forked-` prefix plus the unique uuid head)
+  instead of collapsing every compacted session to "compacte".
+
+### Changed
+- **One-shot side-LLM calls no longer burn reasoning tokens.** The summarizer,
+  critic, and approval-evaluator one-shots now request the model's
+  extended-reasoning trace OFF (provider-appropriate param: chat_template_kwargs
+  for the openai-compat/DeepSeek family, `think:false` for Ollama, zero thinking
+  budget for Gemini). On reasoning-by-default models this roughly halves a
+  context-checkpoint summary's latency. Anthropic (off by default) and OpenAI
+  (no safe "off") are untouched.
+
 ## [0.11.2] - 2026-06-22
 
 ### Fixed
