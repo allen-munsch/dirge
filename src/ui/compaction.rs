@@ -20,17 +20,25 @@ use crate::ui::slash::CompactionRequest;
 pub(crate) enum CompactionThen {
     /// Explicit `/compress` or post-turn auto-compact: nothing follows.
     Nothing,
-    /// Preemptive (pre-prompt) and reactive (overflow-recovery) compaction:
-    /// run a normal streamed agent turn afterward. `run_prompt` is what the
-    /// runner receives (may be plugin-rewritten); `record_text` is recorded in
-    /// the session as the user message (matching the inline submit path).
-    /// `reactive` marks overflow-recovery, where a compaction FAILURE means the
-    /// prompt still won't fit, so we must not blindly resend it.
-    /// `last_user_prompt` is already set at submit time, so the arm leaves it.
+    /// Preemptive (pre-prompt) compaction: after install, run a NEW streamed
+    /// turn. `run_prompt` is what the runner receives (may be plugin-rewritten);
+    /// `record_text` is recorded in the session as the user message (matching
+    /// the inline submit path). `last_user_prompt` is already set at submit, so
+    /// the arm leaves it. Resent on success AND on compaction failure (the
+    /// estimate may have been pessimistic; reactive recovery is the backstop).
     SendPrompt {
         run_prompt: String,
         record_text: String,
-        reactive: bool,
+    },
+    /// Reactive overflow recovery: the prompt already overflowed and is ALREADY
+    /// in the session, so the retry drops the trailing user message from history
+    /// and does NOT re-record it. Only retried when compaction actually shrank
+    /// the context (`Compacted`) AND no side-effecting tools ran on the failed
+    /// turn (re-running them would double-apply). Otherwise the user is told to
+    /// recover manually.
+    RetryAfterOverflow {
+        prompt: String,
+        tools_already_ran: bool,
     },
 }
 

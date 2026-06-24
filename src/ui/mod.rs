@@ -2582,7 +2582,6 @@ pub async fn run_interactive(
                                                 crate::ui::compaction::CompactionThen::SendPrompt {
                                                     run_prompt: prompt.clone(),
                                                     record_text: text.to_string(),
-                                                    reactive: false,
                                                 },
                                             ));
                                             ui.is_running = true;
@@ -2888,6 +2887,7 @@ pub async fn run_interactive(
                             &mut ui.agent_interject,
                             &mut ui.agent_cancel,
                             &ui.interjection_queue,
+                            &mut ui.compaction_phase,
                         ).await?;
                     }
                     AgentEvent::Error(e) => {
@@ -3111,10 +3111,18 @@ pub async fn run_interactive(
                 let tokens_before = handle.tokens_before;
                 let then = handle.then;
 
-                // Decide whether to run the continuation prompt: on success
-                // always; on failure only for the preemptive case (a reactive
-                // resend would just re-overflow). `(run_prompt, record_text)`.
-                let resend: Option<(String, String)> = match ev {
+                // What to do after install. `Submit` is the preemptive new turn;
+                // `Retry` is the reactive overflow retry (drops the trailing user
+                // message, doesn't re-record); `Finish` just releases the busy
+                // state (and, on a reactive no-retry/failure, drops queued
+                // interjections for tool-side-effect safety).
+                enum Next {
+                    Finish { clear_queue: bool },
+                    Submit { run_prompt: String, record_text: String },
+                    Retry { prompt: String },
+                }
+
+                let next = match ev {
                     Some(CompactionPhaseEvent::Done { summary }) => {
                         let outcome = crate::ui::slash::install_compaction(
                             summary, cut_idx, tokens_before,
@@ -3124,16 +3132,43 @@ pub async fn run_interactive(
                             #[cfg(feature = "semantic")] semantic_manager,
                             #[cfg(feature = "lsp")] lsp_manager.as_ref(),
                         ).await;
-                        if let Err(e) = outcome {
+                        let compacted = matches!(
+                            outcome,
+                            Ok(crate::ui::slash::CompressOutcome::Compacted)
+                        );
+                        if let Err(e) = &outcome {
                             renderer.write_line(&format!("compress error: {e}"), c_error())?;
                         }
                         if let Err(e) = crate::session::storage::save_session(session) {
                             renderer.write_line(&format!("warning: failed to save session: {e}"), c_error())?;
                         }
                         match then {
-                            CompactionThen::Nothing => None,
-                            CompactionThen::SendPrompt { run_prompt, record_text, .. } => {
-                                Some((run_prompt, record_text))
+                            CompactionThen::Nothing => Next::Finish { clear_queue: false },
+                            CompactionThen::SendPrompt { run_prompt, record_text } => {
+                                Next::Submit { run_prompt, record_text }
+                            }
+                            CompactionThen::RetryAfterOverflow { prompt, tools_already_ran } => {
+                                if compacted && !tools_already_ran {
+                                    Next::Retry { prompt }
+                                } else if compacted {
+                                    // Compacted, but the failed run already invoked
+                                    // tools — refuse auto-retry to avoid re-applying
+                                    // side effects.
+                                    renderer.write_line(
+                                        "  ↳ context compacted, but the failed run already invoked tools — not auto-retrying. Re-issue your prompt manually if you want to continue.",
+                                        c_error(),
+                                    )?;
+                                    Next::Finish { clear_queue: true }
+                                } else {
+                                    // Install made no progress (e.g. summary larger
+                                    // than what it replaced) — retrying would just
+                                    // overflow again.
+                                    renderer.write_line(
+                                        "auto-compact made no progress; leaving session as-is. Try /compress with stricter instructions, lower keep_recent_tokens, or /clear.",
+                                        c_error(),
+                                    )?;
+                                    Next::Finish { clear_queue: true }
+                                }
                             }
                         }
                     }
@@ -3146,50 +3181,84 @@ pub async fn run_interactive(
                         match then {
                             CompactionThen::Nothing => {
                                 renderer.write_line(&format!("compaction failed: {error}"), c_error())?;
-                                None
+                                Next::Finish { clear_queue: false }
                             }
-                            CompactionThen::SendPrompt { run_prompt, record_text, reactive } => {
-                                if reactive {
-                                    // The prompt overflowed and compaction couldn't
-                                    // shrink the context — don't resend (it would
-                                    // just overflow again).
-                                    renderer.write_line(
-                                        &format!("compaction failed and context is still over the limit: {error}"),
-                                        c_error(),
-                                    )?;
-                                    None
-                                } else {
-                                    // Preemptive estimate; the real send may still
-                                    // fit and reactive recovery is the backstop.
-                                    renderer.write_line(
-                                        &format!("preemptive compaction failed (will retry reactively if needed): {error}"),
-                                        c_error(),
-                                    )?;
-                                    Some((run_prompt, record_text))
-                                }
+                            CompactionThen::SendPrompt { run_prompt, record_text } => {
+                                // Preemptive estimate; the real send may still fit
+                                // and reactive recovery is the backstop. Proceed.
+                                renderer.write_line(
+                                    &format!("preemptive compaction failed (will retry reactively if needed): {error}"),
+                                    c_error(),
+                                )?;
+                                Next::Submit { run_prompt, record_text }
+                            }
+                            CompactionThen::RetryAfterOverflow { .. } => {
+                                renderer.write_line(
+                                    &format!("auto-compact failed ({error}); leaving session as-is. Try /compress manually or /clear."),
+                                    c_error(),
+                                )?;
+                                Next::Finish { clear_queue: true }
                             }
                         }
                     }
                 };
 
-                if let Some((run_prompt, record_text)) = resend {
-                    // Streamed turn from the post-compaction state. Mirrors the
-                    // inline submit path exactly: history (without the new prompt),
-                    // spawn the runner with the (rewritten) prompt, then record
-                    // the original text. `last_user_prompt` was set at submit.
-                    let history = crate::agent::runner::convert_history(session);
-                    let runner = agent.clone().spawn_runner(
-                        crate::agent::tools::background::prepend_pending_notifications(&run_prompt, bg_store.as_ref()),
-                        history,
-                        Some(ui.interjection_queue.clone()),
-                    );
-                    runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
-                    session.add_message(MessageRole::User, &record_text);
-                    begin_snapshot_turn(session);
-                    renderer.set_avatar_state(avatar::AvatarState::Idle);
-                } else {
-                    ui.is_running = false;
-                    renderer.set_avatar_state(avatar::AvatarState::Idle);
+                match next {
+                    Next::Submit { run_prompt, record_text } => {
+                        // New streamed turn from the post-compaction state. Mirrors
+                        // the inline submit path: history (without the new prompt),
+                        // spawn the runner with the (rewritten) prompt, then record
+                        // the original text. `last_user_prompt` was set at submit.
+                        let history = crate::agent::runner::convert_history(session);
+                        let runner = agent.clone().spawn_runner(
+                            crate::agent::tools::background::prepend_pending_notifications(&run_prompt, bg_store.as_ref()),
+                            history,
+                            Some(ui.interjection_queue.clone()),
+                        );
+                        runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
+                        session.add_message(MessageRole::User, &record_text);
+                        begin_snapshot_turn(session);
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    }
+                    Next::Retry { prompt } => {
+                        // Reactive overflow retry: the prompt is ALREADY in the
+                        // session, so drop the trailing user message from history
+                        // and don't re-record it. Stale collapsed result is cleared.
+                        let mut history = crate::agent::runner::convert_history(session);
+                        if let Some(last) = history.last()
+                            && matches!(last, rig::completion::Message::User { .. })
+                        {
+                            history.pop();
+                        }
+                        ui.last_user_prompt.clone_from(&prompt);
+                        let runner = agent.clone().spawn_runner(
+                            crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
+                            history,
+                            Some(ui.interjection_queue.clone()),
+                        );
+                        runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
+                        ui.last_collapsed = None;
+                        renderer.write_line("  ↳ resumed run with compacted history", theme::dim())?;
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    }
+                    Next::Finish { clear_queue } => {
+                        ui.is_running = false;
+                        if clear_queue {
+                            let dropped = ui.interjection_queue.lock().unwrap().len();
+                            ui.interjection_queue.lock().unwrap().clear();
+                            if dropped > 0 {
+                                renderer.write_line(
+                                    &format!(
+                                        "{} queued message{} dropped (compaction couldn't recover the context)",
+                                        dropped,
+                                        if dropped == 1 { "" } else { "s" }
+                                    ),
+                                    c_error(),
+                                )?;
+                            }
+                        }
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    }
                 }
                 renderer.request_repaint();
             }

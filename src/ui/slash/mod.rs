@@ -159,7 +159,7 @@ pub fn undo_last(session: &mut Session) -> UndoOutcome {
 /// ContextLength error and loops.
 pub enum CompressOutcome {
     Compacted,
-    NoOp { reason: &'static str },
+    NoOp,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -281,9 +281,7 @@ pub(crate) fn prepare_compaction(
     // compress, summary-larger-than-savings) still apply to both [dirge-fgtj].
     if !forced && session.total_estimated_tokens <= max_tokens {
         renderer.write_line("context within limits, no compression needed", c_agent())?;
-        return Ok(CompactionDecision::NoOp(CompressOutcome::NoOp {
-            reason: "context within limits",
-        }));
+        return Ok(CompactionDecision::NoOp(CompressOutcome::NoOp));
     }
 
     let mut accumulated = 0u64;
@@ -307,9 +305,7 @@ pub(crate) fn prepare_compaction(
 
     if cut_idx == 0 {
         renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
-        return Ok(CompactionDecision::NoOp(CompressOutcome::NoOp {
-            reason: "entire context is within keep_recent_tokens — lower it to compress further",
-        }));
+        return Ok(CompactionDecision::NoOp(CompressOutcome::NoOp));
     }
 
     let messages_to_summarize = &session.messages[..cut_idx];
@@ -413,9 +409,7 @@ pub(crate) async fn install_compaction(
             ),
             c_error(),
         )?;
-        return Ok(CompressOutcome::NoOp {
-            reason: "summary would be larger than the messages it replaces",
-        });
+        return Ok(CompressOutcome::NoOp);
     }
 
     // `compress_reporting` returns the count of non-active-path
