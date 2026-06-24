@@ -62,7 +62,9 @@ pub(crate) async fn handle_done(
     was_reasoning: &mut bool,
     is_running: &mut bool,
     agent: &mut AnyAgent,
-    context: &mut ContextFiles,
+    // Used only by the plugin-gated model-swap rebuild below; mark it used in
+    // no-plugin builds so `-D warnings` stays clean.
+    #[cfg_attr(not(feature = "plugin"), allow(unused_variables))] context: &mut ContextFiles,
     // dirge-4y4l: the ~10 build_agent inputs bundled (see AgentBuildDeps).
     deps: &AgentBuildDeps<'_>,
     agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
@@ -80,18 +82,29 @@ pub(crate) async fn handle_done(
     #[cfg(feature = "loop")] loop_bits: LoopBits<'_>,
 ) -> anyhow::Result<()> {
     // Rebind the bundled deps to locals so the body below reads unchanged.
+    // Most of these feed ONLY the plugin-gated model-swap rebuild below (a
+    // plugin's `prepare-next-run` setting `harness-next-model`), so they're
+    // gated to `plugin` — otherwise a no-plugin build (e.g. windows-default)
+    // sees them unused and `-D warnings` fails. `bg_store` stays ungated: it
+    // also feeds `finalize_idle_turn`.
+    #[cfg(feature = "plugin")]
     let client = deps.client;
+    #[cfg(feature = "plugin")]
     let permission = deps.permission;
+    #[cfg(feature = "plugin")]
     let ask_tx = deps.ask_tx;
+    #[cfg(feature = "plugin")]
     let question_tx = deps.question_tx;
+    #[cfg(feature = "plugin")]
     let plan_tx = deps.plan_tx;
     let bg_store = deps.bg_store;
+    #[cfg(feature = "plugin")]
     let sandbox = deps.sandbox;
-    #[cfg(feature = "mcp")]
+    #[cfg(all(feature = "mcp", feature = "plugin"))]
     let mcp_manager = deps.mcp_manager;
-    #[cfg(feature = "semantic")]
+    #[cfg(all(feature = "semantic", feature = "plugin"))]
     let semantic_manager = deps.semantic_manager;
-    #[cfg(feature = "lsp")]
+    #[cfg(all(feature = "lsp", feature = "plugin"))]
     let lsp_manager = deps.lsp_manager;
     *was_reasoning = false;
     // A successful turn must not leave a chamber
@@ -473,6 +486,82 @@ pub(crate) async fn handle_done(
     // so finalization runs later from the review_phase arm's terminal verdict
     // (via this same `finalize_idle_turn`) rather than now.
     if !*is_running {
+        // Persist entity/relation records drained from the Janet harness
+        // accumulators (#393), then build the graph context for the next turn's
+        // system prompt. Best-effort: silently skip on DB errors. Gated to
+        // experimental-graph-search (the SQL tables) + plugin (the harness
+        // accumulators). Runs before finalize_idle_turn so the system-prompt
+        // append lands before any interjection drain spawns the next turn.
+        #[cfg(all(feature = "experimental-graph-search", feature = "plugin"))]
+        {
+            let paths = crate::extras::dirge_paths::ProjectPaths::new(
+                &std::env::current_dir().unwrap_or_else(|_| ".".into()),
+            );
+            if let Some(pm) = plugin_manager {
+                let mut mgr = pm.lock_ignore_poison();
+                let entities = mgr.drain_entity_records();
+                let relations = mgr.drain_relation_records();
+                if !entities.is_empty() || !relations.is_empty() {
+                    if let Ok(db) =
+                        crate::extras::session_db::SessionDb::open(&paths.session_db_path())
+                    {
+                        use crate::extras::entity_db;
+                        let sid =
+                            format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+                        for ent in &entities {
+                            let _ = entity_db::upsert_entity(
+                                &db.conn,
+                                &sid,
+                                None,
+                                &ent.kind,
+                                &ent.name,
+                                ent.extra.as_deref(),
+                            );
+                        }
+                        for rel in &relations {
+                            let source_id = entity_db::resolve_entity(
+                                &db.conn,
+                                &rel.source_kind,
+                                &rel.source_name,
+                            );
+                            let target_id = entity_db::resolve_entity(
+                                &db.conn,
+                                &rel.target_kind,
+                                &rel.target_name,
+                            );
+                            if let (Ok(Some(src_eid)), Ok(Some(tgt_eid))) = (source_id, target_id) {
+                                let _ = entity_db::insert_relation(
+                                    &db.conn,
+                                    src_eid,
+                                    tgt_eid,
+                                    &rel.rel_type,
+                                    &sid,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build graph context for next turn's system prompt.
+            if let Some(pm) = plugin_manager {
+                if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path())
+                {
+                    let sid = format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+                    if let Ok(context) =
+                        crate::extras::entity_compress::build_graph_context(&db.conn, &sid)
+                    {
+                        if !context.is_empty() {
+                            let mut mgr = pm.lock_ignore_poison();
+                            let escaped = crate::plugin::escape_janet_string(&context);
+                            let _ =
+                                mgr.eval(&format!("(harness/append-system-prompt {})", escaped));
+                        }
+                    }
+                }
+            }
+        }
+
         finalize_idle_turn(
             ctx.session,
             ctx.last_user_prompt,

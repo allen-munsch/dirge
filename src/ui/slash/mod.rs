@@ -531,6 +531,7 @@ pub async fn handle_slash(
         "/allow" => cmd::allow::cmd_allow(&mut ctx, &parts, text).await?,
         "/why" => cmd::allow::why::cmd_why(&mut ctx, &parts).await?,
         "/help" => cmd::help::cmd_help(&mut ctx).await?,
+        "/graph" => cmd::graph::cmd_graph(&mut ctx, &parts).await?,
         "/memory" => cmd::memory::cmd_memory(&mut ctx, &parts).await?,
         "/kill" => cmd::kill::cmd_kill(&mut ctx, &parts).await?,
         #[cfg(unix)]
@@ -643,6 +644,7 @@ pub fn slash_command_names() -> Vec<&'static str> {
         "/compress",
         "/display",
         "/fork",
+        "/graph",
         "/help",
         "/kill",
         "/memory",
@@ -1063,6 +1065,7 @@ mod tests {
             "/compress",
             "/display",
             "/fork",
+            "/graph",
             "/help",
             "/kill",
             "/memory",
