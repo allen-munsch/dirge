@@ -198,6 +198,10 @@ pub(crate) struct UiState {
     /// In-flight non-blocking compaction (summarizer LLM on a spawned task);
     /// the `compaction_phase` select! arm installs the result. dirge-tv3p.
     pub(crate) compaction_phase: Option<crate::ui::compaction::CompactionPhaseHandle>,
+    /// In-flight non-blocking `/plan` reviewer (the write-disabled reviewer runs
+    /// code on a spawned task); the `review_phase` arm applies the verdict.
+    /// dirge-4koy.
+    pub(crate) review_phase: Option<crate::agent::plan::runtime::ReviewPhaseHandle>,
 
     // ── Chats / subagents ────────────────────────────────────────────
     /// Per-chat-tab UI state (response/reasoning/chamber buffers).
@@ -397,6 +401,7 @@ impl UiState {
             loop_label: None,
             plan_phase: None,
             compaction_phase: None,
+            review_phase: None,
             active_plan: None,
 
             chat_ui_states: vec![ChatUiState::empty()],

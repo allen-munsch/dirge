@@ -1494,6 +1494,12 @@ pub async fn run_interactive(
                                 if let Some(ph) = ui.compaction_phase.take() {
                                     ph.task.abort();
                                 }
+                                // dirge-4koy: likewise abort an in-flight `/plan`
+                                // reviewer (the write-disabled reviewer task);
+                                // its verdict continuation is discarded.
+                                if let Some(ph) = ui.review_phase.take() {
+                                    ph.task.abort();
+                                }
                                 // Cooperative cancel first: lets the
                                 // retry loop and rig stream observe
                                 // `signal.is_cancelled()` and exit
@@ -1594,6 +1600,10 @@ pub async fn run_interactive(
                             }
                             // dirge-tv3p: and an in-flight non-blocking compaction.
                             if let Some(ph) = ui.compaction_phase.take() {
+                                ph.task.abort();
+                            }
+                            // dirge-4koy: and an in-flight `/plan` reviewer.
+                            if let Some(ph) = ui.review_phase.take() {
                                 ph.task.abort();
                             }
                             if let Some(tx) = ui.agent_cancel.take() {
@@ -2807,6 +2817,7 @@ pub async fn run_interactive(
                             &mut ui.agent_interject,
                             &mut ui.agent_cancel,
                             &ui.interjection_queue,
+                            &mut ui.review_phase,
                             #[cfg(feature = "plugin")]
                             plugin_manager,
                             #[cfg(feature = "loop")]
@@ -3291,6 +3302,61 @@ pub async fn run_interactive(
                         renderer.set_avatar_state(avatar::AvatarState::Idle);
                     }
                 }
+                renderer.request_repaint();
+            }
+            // dirge-4koy: the spawned `/plan` reviewer (a write-disabled agent
+            // that runs the code) streams its verdict here, so the loop stays
+            // responsive + Ctrl+C-able for the tens-of-seconds-to-minutes it
+            // takes. The arm applies the verdict: relaunch the implement run on
+            // NEEDS_FIX, or finalize the turn on a terminal verdict. Binds the
+            // Option directly so a closed channel doesn't busy-loop the select.
+            ev = async {
+                if let Some(ph) = &mut ui.review_phase {
+                    ph.rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                use crate::agent::plan::runtime::{ReviewPhaseEvent, ReviewPhaseHandle};
+                // The recv borrow is released here; take the handle (and its
+                // carried verdict-finalization payload) out.
+                let Some(handle) = ui.review_phase.take() else {
+                    continue;
+                };
+                let ReviewPhaseHandle {
+                    plan,
+                    cycles_left,
+                    response,
+                    tool_calls,
+                    ..
+                } = handle;
+                let result = match ev {
+                    Some(ReviewPhaseEvent::Done { result }) => result,
+                    // Task died without sending (panic / abort that wasn't
+                    // routed through Ctrl+C) — treat as a reviewer error so the
+                    // turn still finalizes rather than hanging busy.
+                    None => Err("reviewer task ended unexpectedly".to_string()),
+                };
+                run_handlers::plan_review::apply_review_verdict(
+                    result,
+                    plan,
+                    cycles_left,
+                    &response,
+                    &tool_calls,
+                    &mut renderer,
+                    session,
+                    &mut ui.active_plan,
+                    &mut ui.last_user_prompt,
+                    &agent,
+                    &bg_store,
+                    &ui.interjection_queue,
+                    &mut ui.agent_rx,
+                    &mut ui.agent_abort,
+                    &mut ui.agent_interject,
+                    &mut ui.agent_cancel,
+                    &mut ui.is_running,
+                )?;
+                renderer.set_avatar_state(avatar::AvatarState::Idle);
                 renderer.request_repaint();
             }
             Some(ask_req) = async {

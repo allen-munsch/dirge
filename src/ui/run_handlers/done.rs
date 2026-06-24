@@ -70,6 +70,10 @@ pub(crate) async fn handle_done(
     agent_interject: &mut Option<mpsc::Sender<()>>,
     agent_cancel: &mut Option<mpsc::Sender<()>>,
     interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    // dirge-4koy: the loop parks the spawned `/plan` reviewer here; its
+    // `review_phase` arm applies the verdict after the reviewer (which runs
+    // code, off-thread) finishes.
+    review_phase: &mut Option<crate::agent::plan::runtime::ReviewPhaseHandle>,
     #[cfg(feature = "plugin")] plugin_manager: Option<
         &std::sync::Arc<std::sync::Mutex<PluginManager>>,
     >,
@@ -449,83 +453,97 @@ pub(crate) async fn handle_done(
     // implement run and nothing else (plugin follow-up / loop iteration) claimed
     // the next turn, a write-disabled reviewer runs the code and either approves
     // or relaunches the implement run with the punch-list. See `plan_review`.
+    // Clone the turn's tool calls out before the `&mut ctx` call (they're
+    // carried into the reviewer handle for the deferred finalize).
+    let plan_review_tool_calls = ctx.tool_calls_buf.clone();
     super::plan_review::drive_plan_review(
         ctx,
         agent,
-        bg_store,
-        interjection_queue,
-        agent_rx,
-        agent_abort,
-        agent_interject,
-        agent_cancel,
+        &response,
+        &plan_review_tool_calls,
+        review_phase,
         is_running,
-    )
-    .await?;
+    )?;
 
-    // Phase 4: spawn background review when the
-    // session is truly idle (no plugin followup,
-    // loop iteration, or worktree cleanup claimed
-    // the next turn). Fire-and-forget — the review
-    // runs in a tokio task and never blocks the user.
+    // Phase 4: when the session is truly idle (no plugin follow-up, loop
+    // iteration, or worktree cleanup claimed the next turn) finalize the turn —
+    // persist it, spawn the post-session learning pass, and drain any queued
+    // interjections. Skipped when a follow-up is in flight, INCLUDING a spawned
+    // `/plan` reviewer (dirge-4koy): drive_plan_review keeps `is_running` true,
+    // so finalization runs later from the review_phase arm's terminal verdict
+    // (via this same `finalize_idle_turn`) rather than now.
     if !*is_running {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-        let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
-
-        // Persist the completed turn to the SQLite
-        // session DB for future search. Uses a
-        // stable session id so messages from the
-        // same interactive session are grouped.
-        // Includes tool names + results for FTS5.
-        persist_turn_to_db(
+        finalize_idle_turn(
             ctx.session,
             ctx.last_user_prompt,
             &response,
             ctx.tool_calls_buf,
-        );
-
-        // dirge-a62g: prepend a deterministic, model-free ground-truth
-        // digest (files touched, commands run, goal, where we stopped,
-        // git diff --stat) so the review ranks/classifies KNOWN facts
-        // instead of rediscovering them by re-reading the transcript.
-        let base = crate::agent::review::build_transcript(ctx.session);
-        let transcript =
-            crate::agent::session_digest::review_transcript(ctx.session, Some(&paths.root), base);
-
-        // dirge-ba0m: unified post-session learning orchestrator.
-        // Replaces the three independent fire-and-forget spawns
-        // (background review + skills curator + memory curator)
-        // that used to race here. The orchestrator runs them
-        // strictly in order inside ONE detached task so a skill
-        // the review creates is flushed before the curator reads
-        // it, and the three LLM runners never fire concurrently.
-        // Still fire-and-forget — the user's turn never waits.
-        crate::agent::post_session::spawn_post_session(agent.clone(), paths, transcript);
+            agent,
+            bg_store,
+            interjection_queue,
+            agent_rx,
+            agent_abort,
+            agent_interject,
+            agent_cancel,
+            is_running,
+        )?;
     }
+    Ok(())
+}
 
-    // (dirge-2qke / dirge-72ea) The post-merge cwd restore that used to
-    // live here — fired unconditionally on the first Done after /wt-merge,
-    // even if the merge had failed — is gone. /wt-merge now merges
-    // programmatically and restores the cwd inline, only on a clean merge.
+/// Finalize a turn that left the session idle: persist it to the search DB,
+/// spawn the (fire-and-forget) post-session learning pass, and drain any queued
+/// interjections into a fresh turn. Extracted from `handle_done` so the spawned
+/// `/plan` reviewer can run the SAME finalization from the `review_phase` arm
+/// once its verdict lands (dirge-4koy) — the reviewer keeps the loop busy, so
+/// `handle_done` can't finalize inline without racing the reviewer's relaunch.
+/// The caller must only invoke this when the run is actually idle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_idle_turn(
+    session: &mut crate::session::Session,
+    last_user_prompt: &mut String,
+    response: &str,
+    tool_calls: &[crate::session::ToolCallEntry],
+    agent: &AnyAgent,
+    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
+    interjection_queue: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
+    agent_abort: &mut Option<tokio::task::JoinHandle<()>>,
+    agent_interject: &mut Option<mpsc::Sender<()>>,
+    agent_cancel: &mut Option<mpsc::Sender<()>>,
+    is_running: &mut bool,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
 
-    // Drain the interjection queue once the run is fully
-    // idle (no plugin follow-up, loop iteration, or worktree
-    // cleanup grabbed the next turn). Concatenate all
-    // queued messages as a single new user turn and kick
-    // off another run against the now-stable agent/cwd.
-    if !*is_running && !interjection_queue.lock().unwrap().is_empty() {
+    // Persist the completed turn to the SQLite session DB for future search
+    // (stable session id groups same-session messages; tool names + results
+    // feed FTS5).
+    persist_turn_to_db(session, last_user_prompt, response, tool_calls);
+
+    // dirge-a62g: prepend a deterministic, model-free ground-truth digest
+    // (files touched, commands run, goal, where we stopped, git diff --stat) so
+    // the review ranks/classifies KNOWN facts instead of rediscovering them.
+    let base = crate::agent::review::build_transcript(session);
+    let transcript =
+        crate::agent::session_digest::review_transcript(session, Some(&paths.root), base);
+
+    // dirge-ba0m: unified post-session learning orchestrator — review, then
+    // skills curator, then memory curator, strictly ordered inside ONE detached
+    // task so a skill the review creates is flushed before the curator reads it
+    // and the three runners never fire concurrently. Fire-and-forget.
+    crate::agent::post_session::spawn_post_session(agent.clone(), paths, transcript);
+
+    // Drain the interjection queue: concatenate all queued messages into one
+    // new user turn and launch it against the now-stable agent/cwd. No
+    // write_user_lines here — the loop's MessageStart{User} →
+    // AgentEvent::UserMessage bridge renders the text once (commit 7584bdf).
+    if !interjection_queue.lock().unwrap().is_empty() {
         let queued: Vec<String> = interjection_queue.lock().unwrap().drain(..).collect();
         let combined = queued.join("\n\n");
-        // No write_user_lines here — the loop's
-        // MessageStart{User} → AgentEvent::UserMessage
-        // bridge will render the user's text once,
-        // post-stripping the system-reminder block.
-        // Calling write_user_lines here would
-        // duplicate the render (see commit 7584bdf
-        // for the original regular-input fix).
-
-        ctx.last_user_prompt.clone_from(&combined);
-        let history = crate::agent::runner::convert_history(ctx.session);
-        ctx.session.add_message(MessageRole::User, &combined);
+        last_user_prompt.clone_from(&combined);
+        let history = crate::agent::runner::convert_history(session);
+        session.add_message(MessageRole::User, &combined);
 
         let runner = agent.clone().spawn_runner(
             crate::agent::tools::background::prepend_pending_notifications(
