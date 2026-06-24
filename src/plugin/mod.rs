@@ -304,10 +304,6 @@ impl PluginManager {
         let _ = self.worker.eval(&expr);
     }
 
-    #[cfg(not(feature = "experimental-ui-computer-use"))]
-    #[allow(dead_code)]
-    pub fn set_deny_tools_for_computer_use(&mut self, _deny: &[String]) {}
-
     pub fn dispatch(&mut self, hook: &str, context_janet: &str) -> Result<Vec<String>, String> {
         let names = match self.hooks.get(hook) {
             Some(names) => names.clone(),
