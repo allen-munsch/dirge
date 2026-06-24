@@ -172,20 +172,19 @@ impl SessionDigest {
     }
 }
 
-/// Convenience for the review path: build the digest, attach git for `repo_root`
-/// (when given), and render the preamble. Returns `""` when nothing was
-/// captured, so the caller can prepend unconditionally.
-pub fn review_preamble(session: &Session, repo_root: Option<&Path>) -> String {
-    SessionDigest::from_session(session)
-        .with_git_diff_stat(repo_root.and_then(git_diff_stat))
-        .render_for_review()
-}
-
 /// The transcript handed to the background review: the deterministic digest
 /// preamble (when any) followed by the conversation `base`. Single owner of the
 /// preamble-vs-conversation layout so both post-session entry points agree.
-pub fn review_transcript(session: &Session, repo_root: Option<&Path>, base: String) -> String {
-    let preamble = review_preamble(session, repo_root);
+/// Finish a review transcript from an already-built [`SessionDigest`]: attach
+/// git (this shells out `git diff --stat`) and prepend the rendered preamble to
+/// `base`. Split from [`review_transcript`] so the caller can build the
+/// session-derived digest on the UI thread (cheap) but defer the git subprocess
+/// to the post-session task (dirge-6rtt) — keeping the event loop off a
+/// subprocess on every turn end.
+pub fn assemble_review_transcript(digest: SessionDigest, repo_root: &Path, base: String) -> String {
+    let preamble = digest
+        .with_git_diff_stat(git_diff_stat(repo_root))
+        .render_for_review();
     if preamble.is_empty() {
         base
     } else {

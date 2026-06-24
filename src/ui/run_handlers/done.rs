@@ -524,15 +524,16 @@ pub(crate) fn finalize_idle_turn(
     // dirge-a62g: prepend a deterministic, model-free ground-truth digest
     // (files touched, commands run, goal, where we stopped, git diff --stat) so
     // the review ranks/classifies KNOWN facts instead of rediscovering them.
+    // dirge-6rtt: build the session-derived digest on-thread (cheap), but defer
+    // its `git diff --stat` subprocess to the post-session task.
     let base = crate::agent::review::build_transcript(session);
-    let transcript =
-        crate::agent::session_digest::review_transcript(session, Some(&paths.root), base);
+    let digest = crate::agent::session_digest::SessionDigest::from_session(session);
 
     // dirge-ba0m: unified post-session learning orchestrator — review, then
     // skills curator, then memory curator, strictly ordered inside ONE detached
     // task so a skill the review creates is flushed before the curator reads it
     // and the three runners never fire concurrently. Fire-and-forget.
-    crate::agent::post_session::spawn_post_session(agent.clone(), paths, transcript);
+    crate::agent::post_session::spawn_post_session(agent.clone(), paths, digest, base);
 
     // Drain the interjection queue: concatenate all queued messages into one
     // new user turn and launch it against the now-stable agent/cwd. No
