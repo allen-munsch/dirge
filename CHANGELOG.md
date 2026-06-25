@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.4] - 2026-06-25
+
+### Fixed
+- **`--print --output-format stream-json` now streams incrementally.** The
+  headless run loop received the agent's per-turn and per-tool events but, in
+  `stream-json` mode, emitted nothing for them — only a `system` init line, then
+  silence for the whole run, then one final `assistant` + `result` at the end.
+  Multi-turn agentic runs looked frozen to any consumer parsing the stream. The
+  loop now emits a Claude-compatible `assistant` event at each turn boundary
+  (text + `tool_use` blocks) and a `user` event carrying that turn's
+  `tool_result` blocks, so live-progress UIs get real incremental output. The
+  single-turn shape (`system` → `assistant` → `result`) is unchanged. (#520,
+  dirge-kuqp)
+
 ## [0.12.3] - 2026-06-25
 
 ### Added
