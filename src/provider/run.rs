@@ -224,18 +224,14 @@ impl AnyAgent {
                 }
                 AgentEvent::ToolResult { id, output, .. } => {
                     if stream_json {
-                        // Pair to a call id. Empty id (provider didn't emit
-                        // one) falls back to the next unmatched tool_use by
-                        // position, mirroring the persistence path below.
-                        let pair_id = if !id.is_empty() {
-                            id.to_string()
-                        } else {
-                            turn_tool_uses
-                                .get(turn_tool_results.len())
-                                .map(|(uid, _, _)| uid.clone())
-                                .unwrap_or_default()
-                        };
-                        turn_tool_results.push((pair_id, output.to_string()));
+                        // Key the result by its call id. Providers that
+                        // don't emit ids leave it empty for every call in
+                        // the turn, so there's nothing to pair against —
+                        // consumers fall back to positional matching, same
+                        // as the persistence path below. Results can arrive
+                        // in completion order under parallel dispatch, so we
+                        // deliberately don't try to reconstruct an index.
+                        turn_tool_results.push((id.to_string(), output.to_string()));
                     }
                     let target = if !id.is_empty() {
                         tool_calls.iter_mut().rev().find(|e| e.id == id.as_str())
@@ -395,26 +391,31 @@ impl AnyAgent {
                 //   1. A partial final turn whose TurnEnd never arrived
                 //      (runner died / interjected mid-turn) — flush the
                 //      buffered text + tool calls.
-                //   2. A plugin `on-response` replacement rewrote the
-                //      final answer after the last turn streamed — emit
-                //      the corrected text so the stream isn't stale.
+                //   2. A plugin `on-response` replacement rewrote the final
+                //      answer after the last turn streamed — emit the
+                //      corrected text so the stream matches the result
+                //      envelope (which carries the replacement).
+                // The two can co-occur (a runner died mid-turn AND a plugin
+                // replaced the result): the replacement is authoritative, so
+                // it wins the text, but still carry any buffered tool_use
+                // blocks from the dead turn so the stream stays well-formed.
                 let leftover = !turn_text.is_empty() || !turn_tool_uses.is_empty();
-                if leftover {
+                if response_replaced {
+                    runner::emit_stream_json_event(stream_json_assistant_event(
+                        &full_response,
+                        &turn_tool_uses,
+                        &session_id,
+                    ));
+                } else if leftover {
                     runner::emit_stream_json_event(stream_json_assistant_event(
                         &turn_text,
                         &turn_tool_uses,
                         &session_id,
                     ));
-                    if !turn_tool_results.is_empty() {
-                        runner::emit_stream_json_event(stream_json_tool_result_event(
-                            &turn_tool_results,
-                            &session_id,
-                        ));
-                    }
-                } else if response_replaced {
-                    runner::emit_stream_json_event(stream_json_assistant_event(
-                        &full_response,
-                        &[],
+                }
+                if (response_replaced || leftover) && !turn_tool_results.is_empty() {
+                    runner::emit_stream_json_event(stream_json_tool_result_event(
+                        &turn_tool_results,
                         &session_id,
                     ));
                 }
