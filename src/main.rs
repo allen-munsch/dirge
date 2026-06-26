@@ -1207,7 +1207,7 @@ async fn main() -> anyhow::Result<()> {
     let Channels {
         permission,
         ask_tx,
-        ask_rx,
+        mut ask_rx,
         question_tx,
         question_rx,
         plan_tx,
@@ -1215,6 +1215,31 @@ async fn main() -> anyhow::Result<()> {
         bg_store,
         lifecycle_rx,
     } = build_channels(&cli, &cfg);
+
+    // Headless modes (`--print`, `--loop`) have no UI loop to service
+    // `ask_rx`. A tool that routes to a permission prompt would send an
+    // `AskRequest` and block on `reply_rx.await` forever, suspending the
+    // agent loop and hanging the whole run (issue #523). Drain it with a
+    // deny-all responder; the interactive path keeps `ask_rx` for the UI.
+    let headless = cli.print || {
+        #[cfg(feature = "loop")]
+        {
+            cli.loop_mode
+        }
+        #[cfg(not(feature = "loop"))]
+        {
+            false
+        }
+    };
+    let _ask_responder = match (headless, ask_rx.take()) {
+        (true, Some(rx)) => Some(crate::permission::ask::spawn_headless_ask_responder(rx)),
+        (_, taken) => {
+            // Not headless (or no-tools): hand the receiver back to the
+            // interactive path, which drains it via the UI event loop.
+            ask_rx = taken;
+            None
+        }
+    };
 
     if let Some(perm) = &permission {
         let allowlist: Vec<(String, String)> = session

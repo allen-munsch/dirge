@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Headless `--print`/`--loop` no longer hangs forever on a tool that needs
+  permission confirmation.** These modes have no UI loop to service the
+  permission channel, so a tool routing to a confirmation prompt (e.g. a `bash`
+  command `--accept-all` doesn't auto-allow) sent an `AskRequest` and blocked on
+  the reply forever — suspending the agent loop with no output and no `result`.
+  Headless runs now drain that channel with a deny-all responder (mirroring the
+  ACP path), so a not-auto-allowed tool call fails fast instead of hanging; the
+  model sees the denial and re-plans. For fully unattended runs that must never
+  block, use `--yolo` (which allows every tool and never prompts) or configure
+  explicit allow rules. This is the real fix for the deadlock first reported in
+  #523 (the earlier 0.12.5 plugin-worker fix addressed a different path).
+  (#523, dirge-3oy0)
+
 ## [0.13.0] - 2026-06-26
 
 ### Added
