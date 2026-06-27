@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.6] - 2026-06-27
+
+### Added
+- **Native issue tracker** — a persistent, agent-facing kanban in the existing
+  per-project session DB (`.dirge/sessions/state.db`, `issues` table), framed as
+  a stateful extension of the memory model. The new `issue` tool creates /
+  starts / blocks / closes / updates / lists / searches durable tasks (status
+  `open`/`in_progress`/`blocked`/`done`, priority `high`/`normal`/`low`); unlike
+  the ephemeral `write_todo_list`, issues persist across sessions. The harness
+  injects the top open issues as a board at the **start of each turn** (bounded,
+  with a "+N more" hint) so the model works its backlog without polling — gated
+  so forked review/curator runners don't receive it. View it from the TUI with
+  `/issues` (`/issues list`, `/issues <id>`, `/issues search <q>`). The store
+  owns its schema and opens lock-free, so it adds no migration contention to the
+  shared session DB. See [docs/issues.md](docs/issues.md). (#534)
+
 ## [0.13.5] - 2026-06-27
 
 ### Fixed
