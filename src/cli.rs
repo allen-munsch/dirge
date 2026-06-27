@@ -294,6 +294,13 @@ pub enum AuthAction {
     },
     /// Start Anthropic Claude Code OAuth login and persist credentials
     Anthropic,
+    /// Log in to Google Cloud using gcloud ADC (opens browser)
+    #[command(
+        name = "google",
+        visible_alias = "gcloud",
+        long_about = "Run `gcloud auth application-default login` to authenticate with Google Cloud.\n\nThis stores credentials that the gemini provider uses when `auth: google` is configured."
+    )]
+    Google,
 }
 
 #[derive(clap::Subcommand, Debug)]

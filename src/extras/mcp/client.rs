@@ -166,8 +166,15 @@ pub async fn raw_connect(
             url,
             headers,
             allow_external_paths: _,
+            auth_provider_type: _,
+            oauth: _,
+            target_audience: _,
+            target_service_account: _,
         } => {
+            // Auth negotiation for Google/OAuth MCP servers is pending
+            // a minimal, secure ADC auth module (see google_adc module).
             let custom_headers = parse_headers(headers)?;
+
             let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
                 .custom_headers(custom_headers);
             type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;

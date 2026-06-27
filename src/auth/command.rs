@@ -87,6 +87,7 @@ where
             println!("Anthropic OAuth credentials saved to {}", path.display());
             Ok(())
         }
+        crate::cli::AuthAction::Google => login_google().await,
     }
 }
 
@@ -283,6 +284,34 @@ fn current_epoch_ms() -> anyhow::Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|err| anyhow::anyhow!("system clock is before Unix epoch: {err}"))?;
     Ok(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+}
+
+async fn login_google() -> Result<()> {
+    let status = tokio::process::Command::new("gcloud")
+        .args(["auth", "application-default", "login"])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .context("failed to execute gcloud — is the Google Cloud SDK installed?")?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "gcloud auth application-default login failed with exit code {}",
+            status.code().unwrap_or(-1)
+        );
+    }
+
+    println!();
+    println!("✓ Application Default Credentials saved to");
+    println!(
+        "  ~/.config/gcloud/application_default_credentials.json"
+    );
+    println!();
+    println!("Configure your Gemini provider with `auth: google` in the profile config.");
+    println!("e.g.:  provider: gemini   auth: google   model: gemini-2.5-flash");
+    Ok(())
 }
 
 #[cfg(test)]

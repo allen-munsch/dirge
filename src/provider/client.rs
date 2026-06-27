@@ -88,9 +88,26 @@ pub(crate) fn create_client_with_auth(
     providers: &HashMap<String, ProviderEntry>,
     default_auth: Option<ProviderAuth>,
 ) -> anyhow::Result<AnyClient> {
+    // For Gemini with no explicit API key, try Google Cloud ADC first
+    // (gemini-cli compat). Uses the current tokio runtime to block on
+    // the async ADC resolution — safe because this is always called
+    // from an async context (build_agent, main, etc.).
+    let mut adc_token: Option<String> = None;
+    if api_key.is_none() && provider_name == "gemini" {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if let Ok(Some(adc)) = handle.block_on(super::google_adc::resolve_adc_token()) {
+                tracing::info!(
+                    target: "dirge::provider",
+                    "Gemini: using Google Cloud ADC (project: {})",
+                    adc.project_id.as_deref().unwrap_or("<none>"),
+                );
+                adc_token = Some(adc.access_token);
+            }
+        }
+    }
     create_client_with_resolved_auth(
         provider_name,
-        api_key,
+        api_key.or(adc_token.as_deref()),
         providers,
         default_auth,
         None,
@@ -200,11 +217,19 @@ where
              Set `auth: anthropic` only on your anthropic provider (or use an API key for `{provider_name}`)."
         );
     }
+    if auth == ProviderAuth::Google && info.kind != ProviderKind::Gemini {
+        anyhow::bail!(
+            "Google ADC auth is only supported for the `gemini` provider, not `{provider_name}`. \
+             Set `auth: google` only on your gemini provider (or use an API key for `{provider_name}`)."
+        );
+    }
     let auth_headers = match (auth, resolved_auth_headers) {
         (ProviderAuth::ChatGpt, Some(headers)) => Some(headers),
+        (ProviderAuth::Google, Some(headers)) => Some(headers),
         _ => resolve_auth_headers(auth)?,
     };
     let is_chatgpt_auth = auth == ProviderAuth::ChatGpt;
+    let is_google_auth = auth == ProviderAuth::Google;
 
     let credential = if let Some(headers) = auth_headers.as_ref() {
         ProviderCredential::ChatGptAuth(headers.bearer_token.clone())
@@ -326,7 +351,40 @@ where
             }
         }
         ProviderKind::Gemini => {
-            let mut b = gemini::Client::builder().api_key(&key);
+            // When using an ADC access token (Google OAuth), the gemini API
+            // requires an Authorization: Bearer header, not a URL query param.
+            // Build a custom HTTP client with the Bearer header when needed;
+            // otherwise use a plain reqwest client (same type, avoids a type
+            // mismatch in the if/else).
+            let is_adc = key.starts_with("ya29.");
+            let http = if is_adc {
+                let mut headers = http::HeaderMap::new();
+                if let Ok(value) =
+                    http::HeaderValue::from_str(&format!("Bearer {key}"))
+                {
+                    headers.insert(http::header::AUTHORIZATION, value);
+                }
+                // X-Goog-User-Project: required when using ADC/OAuth tokens
+                // so Google bills the correct project (Code Assist etc.).
+                if let Ok(project) = std::env::var("GOOGLE_CLOUD_PROJECT")
+                    && !project.trim().is_empty()
+                {
+                    if let Ok(value) = http::HeaderValue::from_str(project.trim()) {
+                        headers.insert(
+                            http::HeaderName::from_static("x-goog-user-project"),
+                            value,
+                        );
+                    }
+                }
+                reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()?
+            } else {
+                reqwest::Client::new()
+            };
+            let mut b = gemini::Client::builder()
+                .api_key(&key)
+                .http_client(http);
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }

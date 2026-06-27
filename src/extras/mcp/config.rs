@@ -14,6 +14,11 @@ use serde::Deserialize;
 /// working directory. Intended for semantic indexers, project-wide
 /// search tools, or any MCP server whose legitimate scope is broader
 /// than the current project.
+///
+/// The `Url` variant supports Google and OAuth authentication through
+/// The `Url` variant supports Google authentication. When
+/// `auth_provider_type` is set, dirge will
+/// negotiate tokens before connecting and include them in request headers.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum McpServerConfig {
@@ -32,6 +37,19 @@ pub enum McpServerConfig {
         headers: HashMap<String, String>,
         #[serde(default)]
         allow_external_paths: bool,
+        /// Auth provider type: `google_credentials`, `service_account_impersonation`,
+        /// or `dynamic_discovery`.
+        #[serde(default)]
+        auth_provider_type: Option<String>,
+        /// OAuth PKCE configuration (for `dynamic_discovery` provider).
+        #[serde(default)]
+        oauth: Option<String>,
+        /// OAuth target audience (CLIENT_ID.apps.googleusercontent.com).
+        #[serde(default)]
+        target_audience: Option<String>,
+        /// Service account email to impersonate.
+        #[serde(default)]
+        target_service_account: Option<String>,
     },
 }
 
@@ -49,5 +67,16 @@ impl McpServerConfig {
                 ..
             } => *allow_external_paths,
         }
+    }
+
+    /// Whether this `Url` variant has auth configured.
+    pub fn has_auth(&self) -> bool {
+        matches!(
+            self,
+            McpServerConfig::Url {
+                auth_provider_type: Some(_),
+                ..
+            }
+        )
     }
 }

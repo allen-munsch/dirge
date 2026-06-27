@@ -33,7 +33,36 @@ pub fn resolve_auth_headers(auth: ProviderAuth) -> anyhow::Result<Option<Provide
         ProviderAuth::ApiKey => Ok(None),
         ProviderAuth::ChatGpt => Ok(Some(resolve_chatgpt_auth()?)),
         ProviderAuth::Anthropic => Ok(Some(resolve_anthropic_auth()?)),
+        ProviderAuth::Google => Ok(Some(resolve_google_auth()?)),
     }
+}
+
+fn resolve_google_auth() -> anyhow::Result<ProviderAuthHeaders> {
+    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        anyhow::anyhow!(
+            "Google ADC auth requested but no tokio runtime available — \
+             ADC token resolution requires an async runtime"
+        )
+    })?;
+    let adc = handle
+        .block_on(crate::provider::google_adc::resolve_adc_token())
+        .context("failed to resolve Google Application Default Credentials")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Google ADC auth requested but no credentials found — \
+                 run `gcloud auth application-default login` or `dirge auth google`, \
+                 or set GOOGLE_APPLICATION_CREDENTIALS"
+            )
+        })?;
+    tracing::info!(
+        target: "dirge::provider",
+        "Gemini: using Google Cloud ADC (project: {})",
+        adc.project_id.as_deref().unwrap_or("<none>"),
+    );
+    Ok(ProviderAuthHeaders {
+        bearer_token: adc.access_token,
+        chatgpt_account_id: adc.project_id,
+    })
 }
 
 fn resolve_chatgpt_auth() -> anyhow::Result<ProviderAuthHeaders> {

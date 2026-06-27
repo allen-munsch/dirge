@@ -1,6 +1,7 @@
 pub(crate) mod anthropic_http;
 pub(crate) mod anthropic_oauth;
 pub(crate) mod auth;
+pub(crate) mod google_adc;
 mod billing_fallback;
 mod build;
 pub mod client;

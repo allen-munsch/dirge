@@ -35,6 +35,8 @@ pub enum ProviderAuth {
     ChatGpt,
     #[serde(alias = "claude-code", alias = "claude_code", alias = "claude")]
     Anthropic,
+    #[serde(alias = "gcloud", alias = "adc", alias = "gemini")]
+    Google,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1158,6 +1160,10 @@ pub fn load() -> Config {
                         url: "https://mcp.exa.ai/mcp".to_string(),
                         headers,
                         allow_external_paths: false,
+                        auth_provider_type: None,
+                        oauth: None,
+                        target_audience: None,
+                        target_service_account: None,
                     },
                 );
                 cfg.mcp_servers = Some(defaults);
