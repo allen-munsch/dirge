@@ -558,6 +558,11 @@ pub struct Config {
     /// the verifier escalates to a bounded LLM critique at finalization
     /// on substantive runs. Unset (default) = no critic, no cost.
     pub critic_provider: Option<String>,
+    /// Optional system-preamble override for the in-loop critic. When set,
+    /// replaces the built-in `CRITIC_PREAMBLE` for every prompt unless a
+    /// prompt's own `critic_preamble` frontmatter overrides it. Unset
+    /// (default) = built-in critic stance. See `resolve_critic_preamble`.
+    pub critic_preamble: Option<String>,
     /// dirge-0g6i: optional provider for LLM auto-approval. When set, a
     /// permission prompt is routed to this model (with a safety prompt)
     /// which replies ALLOW/DENY instead of asking the human. Unset
@@ -731,6 +736,15 @@ impl Config {
             return Some((alias, ProviderEntry::default()));
         }
         None
+    }
+
+    /// Resolve the critic's system preamble: the config override when set,
+    /// else the built-in `CRITIC_PREAMBLE`. A prompt may further override
+    /// this via frontmatter (applied in `build_agent`).
+    pub fn resolve_critic_preamble(&self) -> &str {
+        self.critic_preamble
+            .as_deref()
+            .unwrap_or(crate::agent::agent_loop::critic::CRITIC_PREAMBLE)
     }
 
     /// Resolve the provider_type for an entry — the entry's
@@ -1252,6 +1266,23 @@ mod tests {
         assert!(cfg.chord_timeout_ms.is_none());
         let cfg: Config = serde_json::from_str(r#"{ "chord_timeout_ms": 1500 }"#).unwrap();
         assert_eq!(cfg.chord_timeout_ms, Some(1500));
+    }
+
+    #[test]
+    fn critic_preamble_absent_and_parses() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(cfg.critic_preamble.is_none());
+
+        let cfg: Config =
+            serde_json::from_str(r#"{ "critic_preamble": "Be extra strict." }"#).unwrap();
+        assert_eq!(cfg.critic_preamble.as_deref(), Some("Be extra strict."));
+
+        // Absent → resolve returns the built-in critic preamble.
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(
+            cfg.resolve_critic_preamble(),
+            crate::agent::agent_loop::critic::CRITIC_PREAMBLE,
+        );
     }
 
     /// Cross-session Up-arrow history depth: absent by default (→3),

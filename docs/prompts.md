@@ -49,6 +49,36 @@ in `deny_tools` matches an MCP-exported tool when the entry equals
 For surgical control over one MCP tool without affecting the built-in, use
 the qualified form.
 
+## Critic control (frontmatter)
+
+Two optional keys steer the F6 in-loop critic (see [`config.md`](config.md),
+`critic_provider`) **per prompt**, without touching config:
+
+- `critic: false` — suppress the critic for this prompt only. The **goal
+  gate** (`--goal`) is unaffected: it has its own judge under its own fixed
+  preamble. `critic: true`, or omitting the key, inherits the global
+  behavior.
+- `critic_preamble:` — override the critic's system preamble for this
+  prompt. Wins over `critic_preamble` in config and the built-in. Inline
+  string or a YAML block scalar (`|`) for multi-line:
+
+  ```markdown
+  ---
+  critic: false
+  ---
+  ```
+
+  ```markdown
+  ---
+  critic_preamble: |
+    You are a security-focused reviewer.
+    Block only on concrete, in-scope gaps.
+  ---
+  ```
+
+An empty `critic_preamble` is treated as unset (inherits). Block-scalar
+indentation is stripped; folding (`>`) is not supported.
+
 ## Custom prompts
 
 Custom prompts can be placed in `$XDG_CONFIG_HOME/dirge/prompts/` as `.md` files

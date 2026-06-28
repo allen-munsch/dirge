@@ -89,7 +89,7 @@ pub(crate) async fn summarize_with_model(
 pub(crate) async fn oneshot_with_model(
     model: super::AnyModel,
     label: &'static str,
-    preamble: &'static str,
+    preamble: &str,
     mut prompt: String,
 ) -> anyhow::Result<String> {
     const ONESHOT_PROMPT_BUDGET_BYTES: usize = 128 * 1024; // ~32k tokens
@@ -202,7 +202,7 @@ pub(crate) fn head_tail_truncate(prompt: &str, budget: usize) -> String {
 async fn run_oneshot<M>(
     model: M,
     label: &'static str,
-    preamble: &'static str,
+    preamble: &str,
     prompt: String,
     reasoning_disable: Option<serde_json::Value>,
 ) -> anyhow::Result<String>
@@ -212,6 +212,10 @@ where
 {
     use crate::agent::recovery::{RecoveryPolicy, run_with_retry};
     let policy = RecoveryPolicy::default();
+    // Own the preamble so each retry clone moves into the 'static stream
+    // future — the caller may now pass a non-'static &str (e.g. from an
+    // Arc<str> baked into a judge closure).
+    let preamble = preamble.to_string();
 
     // The attempt/classify/backoff/sleep loop lives in `run_with_retry`
     // (dirge-6cvc). The closure builds + drains one stream and returns a
@@ -221,13 +225,14 @@ where
     let response = run_with_retry(&policy, label, || {
         let model = model.clone();
         let prompt = prompt.clone();
+        let preamble = preamble.clone();
         let reasoning_disable = reasoning_disable.clone();
         async move {
             // dirge-zt8p: turn off the model's extended-reasoning trace for this
             // one-shot — summarize/critic/approval don't benefit from it, and on
             // reasoning-by-default models it ~doubles latency. rig forwards an
             // agent's `additional_params` into the request.
-            let mut builder = rig::agent::AgentBuilder::new(model).preamble(preamble);
+            let mut builder = rig::agent::AgentBuilder::new(model).preamble(&preamble);
             if let Some(params) = reasoning_disable {
                 builder = builder.additional_params(params);
             }

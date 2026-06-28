@@ -250,7 +250,7 @@ async fn poll_finalization_follow_up(
     //     set AND a judge is configured — off for default/interactive runs.
     if *goal_reacts < super::goal::MAX_GOAL_REACT
         && let Some(goal) = &config.goal
-        && let Some(judge) = &config.critic_fn
+        && let Some(judge) = &config.goal_fn
     {
         let transcript = build_critic_transcript(new_messages);
         // dirge-6q3w: same read-only verification signal as the critic, but

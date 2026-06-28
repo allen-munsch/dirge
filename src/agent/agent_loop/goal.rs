@@ -34,7 +34,7 @@ pub const GOAL_TAG: &str = "[goal]";
 /// Like the critic, it must respect the agent's own constraints so it never
 /// demands a forbidden action, and it must judge ONLY the stated stop
 /// condition — not invent extra requirements.
-const GOAL_PREAMBLE: &str = "\
+pub(crate) const GOAL_PREAMBLE: &str = "\
 You are a completion judge for an autonomous coding agent. You are given the agent's own \
 instructions and constraints, a single natural-language STOP CONDITION the user set for this run, \
 and a transcript of what the agent has done so far. Decide ONLY whether the stop condition is now \

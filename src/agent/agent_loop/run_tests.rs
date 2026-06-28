@@ -133,6 +133,7 @@ fn build_config() -> LoopConfig {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal_fn: None,
         goal: None,
         max_turns: None,
     }
@@ -3091,7 +3092,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
     config.goal = Some("all tests pass and committed".into());
     let judge: CriticFn =
         Arc::new(|_p| Box::pin(async { Ok("GOAL: UNMET\n- tests still failing".to_string()) }));
-    config.critic_fn = Some(judge);
+    config.goal_fn = Some(judge);
 
     let mut critic_done = true; // skip the one-shot critic
     let mut goal_reacts = 0u8;
@@ -3118,7 +3119,7 @@ async fn finalization_goal_met_finalizes() {
     let mut config = build_config();
     config.goal = Some("all tests pass".into());
     let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("GOAL: MET".to_string()) }));
-    config.critic_fn = Some(judge);
+    config.goal_fn = Some(judge);
 
     let mut critic_done = true;
     let mut goal_reacts = 0u8;
@@ -3146,7 +3147,7 @@ async fn finalization_goal_bound_stops_reentry() {
     let mut config = build_config();
     config.goal = Some("unsatisfiable".into());
     let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("GOAL: UNMET".to_string()) }));
-    config.critic_fn = Some(judge);
+    config.goal_fn = Some(judge);
 
     let mut critic_done = true;
     let mut goal_reacts = crate::agent::agent_loop::goal::MAX_GOAL_REACT;
@@ -3165,13 +3166,13 @@ async fn finalization_goal_bound_stops_reentry() {
     assert_eq!(source, FollowUpSource::None, "bound reached → finalize");
 }
 
-/// Goal gate stays OFF when no judge is configured, even with a goal set —
-/// it reuses the critic provider, so no provider means no gate.
+/// Goal gate stays OFF when no judge (`goal_fn`) is configured, even with
+/// a goal set.
 #[tokio::test]
 async fn finalization_goal_without_judge_is_inert() {
     let mut config = build_config();
     config.goal = Some("all tests pass".into());
-    config.critic_fn = None; // no judge
+    config.goal_fn = None; // no judge
 
     let mut critic_done = true;
     let mut goal_reacts = 0u8;

@@ -52,6 +52,16 @@ pub struct Prompt {
     /// Surfaced by `/prompt` listing in the slash command UI when set.
     /// Single-line summary of the mode (e.g. "Read-only planning mode").
     pub description: Option<String>,
+    /// Disables the in-loop critic while this prompt is active. Only
+    /// `Some(false)` is meaningful — it suppresses the critic for this
+    /// prompt only (the goal gate is unaffected). `None` / `Some(true)`
+    /// inherit the global (`critic_provider`) behavior. Applied in
+    /// `build_agent`.
+    pub critic: Option<bool>,
+    /// Overrides the critic's system preamble for this prompt. Wins over
+    /// `config.critic_preamble` and the built-in `CRITIC_PREAMBLE`. An
+    /// empty value is treated as unset. `None` = inherit.
+    pub critic_preamble: Option<String>,
     /// Tier this prompt was loaded from. `parse_frontmatter` defaults to
     /// `Embedded`; the global/project loaders override it.
     pub source: PromptSource,
@@ -94,6 +104,8 @@ fn parse_frontmatter(raw: &str) -> Prompt {
 
     let mut deny_tools: Vec<String> = Vec::new();
     let mut description: Option<String> = None;
+    let mut critic: Option<bool> = None;
+    let mut critic_preamble: Option<String> = None;
     let lines: Vec<&str> = front.lines().collect();
     let mut i = 0;
     while i < lines.len() {
@@ -158,6 +170,42 @@ fn parse_frontmatter(raw: &str) -> Prompt {
                     description = Some(v.to_string());
                 }
             }
+            "critic" => match value {
+                "false" => critic = Some(false),
+                "true" => critic = Some(true),
+                _ => {}
+            },
+            "critic_preamble" => {
+                if (value == "|" || value == "|-") && i < lines.len() {
+                    // YAML block scalar: collect the following indented lines
+                    // (literal style — folding isn't supported).
+                    let mut block: Vec<String> = Vec::new();
+                    while i < lines.len() {
+                        let raw = lines[i];
+                        if raw.is_empty() {
+                            block.push(String::new());
+                            i += 1;
+                        } else if raw.starts_with(char::is_whitespace) {
+                            block.push(raw.trim_start().to_string());
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    while block.last().is_some_and(String::is_empty) {
+                        block.pop();
+                    }
+                    let joined = block.join("\n");
+                    if !joined.trim().is_empty() {
+                        critic_preamble = Some(joined);
+                    }
+                } else {
+                    let v = value.trim_matches(|c| c == '"' || c == '\'');
+                    if !v.is_empty() {
+                        critic_preamble = Some(v.to_string());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -165,6 +213,8 @@ fn parse_frontmatter(raw: &str) -> Prompt {
         body: body.to_string(),
         deny_tools,
         description,
+        critic,
+        critic_preamble,
         ..Default::default()
     }
 }
@@ -349,6 +399,41 @@ mod tests {
         assert_eq!(p.deny_tools, vec!["edit", "write", "apply_patch", "bash"]);
         assert_eq!(p.description.as_deref(), Some("Read-only plan mode"));
         assert_eq!(p.body, "You are dirge.\n");
+    }
+
+    #[test]
+    fn frontmatter_parses_critic_disable_and_inline_preamble() {
+        let raw = "---\ncritic: false\ncritic_preamble: Be strict about tests.\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert_eq!(p.critic, Some(false));
+        assert_eq!(p.critic_preamble.as_deref(), Some("Be strict about tests."));
+    }
+
+    #[test]
+    fn frontmatter_parses_critic_preamble_block_scalar() {
+        let raw = "---\ncritic_preamble: |\n  You are a security-focused reviewer.\n  Block on concrete, in-scope gaps.\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert_eq!(
+            p.critic_preamble.as_deref(),
+            Some("You are a security-focused reviewer.\nBlock on concrete, in-scope gaps."),
+        );
+    }
+
+    #[test]
+    fn frontmatter_empty_critic_preamble_is_unset() {
+        // An accidentally-empty preamble is treated as unset (inherits the
+        // config / built-in), not a system-prompt-less critic call.
+        let raw = "---\ncritic_preamble:\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert!(p.critic_preamble.is_none());
+        assert!(p.critic.is_none(), "critic omitted → inherit");
+    }
+
+    #[test]
+    fn frontmatter_critic_true_parses() {
+        let raw = "---\ncritic: true\n---\nbody\n";
+        let p = parse_frontmatter(raw);
+        assert_eq!(p.critic, Some(true));
     }
 
     /// #429: plan mode must be a comprehensive read-only lock — every tool

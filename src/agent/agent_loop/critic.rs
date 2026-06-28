@@ -36,7 +36,7 @@ pub const CRITIC_TAG: &str = "[critic]";
 
 /// System preamble for the critic: establishes its role and a calibrated —
 /// not trigger-happy — stance. Passed as the LLM system prompt by
-/// `build_critic_fn` so the model knows what it is BEFORE it sees the
+/// `build_judge_fn` so the model knows what it is BEFORE it sees the
 /// transcript. The response FORMAT lives in [`build_prompt`] instead —
 /// right next to the material being judged.
 ///
