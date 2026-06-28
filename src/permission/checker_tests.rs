@@ -978,6 +978,28 @@ fn memory_tool_standard_mode_auto_approved() {
     }
 }
 
+/// The issue tracker is auto-approved (Meta op) for every action — the
+/// model records its own work in a local, user-viewable (`/issues`),
+/// reversible DB, so prompting per create/start/close is friction without
+/// security value. Mirrors `write_todo_list`.
+#[test]
+fn issue_tool_standard_mode_auto_approved() {
+    let mut checker = PermissionChecker::new(
+        &PermissionConfig::default(),
+        SecurityMode::Standard,
+        Some(std::path::PathBuf::from("/tmp")),
+    );
+    for action in [
+        "create", "start", "block", "close", "update", "list", "show",
+    ] {
+        let result = checker.check("issue", action);
+        assert!(
+            matches!(result, CheckResult::Allowed),
+            "issue.{action} must auto-allow in Standard; got {result:?}",
+        );
+    }
+}
+
 /// dirge-sm9w: Restrictive mode (`-R`) still prompts for memory.
 /// Restrictive's contract is "every WRITE action confirms" —
 /// the builtin Allow rule installed for Standard/Accept must
