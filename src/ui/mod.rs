@@ -2505,6 +2505,34 @@ pub async fn run_interactive(
                                             )?;
                                         }
                                     }
+                                    Err(e) if e.to_string().starts_with("DEFER_PROMPT_RUN:") => {
+                                        // `/prompt <name> <text...>`
+                                        // switched the prompt inside the command
+                                        // and handed the trailing text back here.
+                                        // Slash handlers can't touch the loop's run
+                                        // slots (agent_rx/is_running/select!), so we
+                                        // launch the streamed turn here — the same
+                                        // control-flow channel as DEFER_COMPRESS.
+                                        let run_text = e
+                                            .to_string()
+                                            .strip_prefix("DEFER_PROMPT_RUN:")
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if !run_text.is_empty() {
+                                            ui.last_user_prompt = run_text.clone();
+                                            let history =
+                                                crate::agent::runner::convert_history(session);
+                                            session.add_message(MessageRole::User, &run_text);
+                                            let runner = agent.clone().spawn_runner(
+                                                crate::agent::tools::background::prepend_pending_notifications(&run_text, bg_store.as_ref()),
+                                                history,
+                                                Some(ui.interjection_queue.clone()),
+                                            );
+                                            runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
+                                            begin_snapshot_turn(session);
+                                            renderer.set_avatar_state(avatar::AvatarState::Idle);
+                                        }
+                                    }
                                     Err(e) => {
                                         if e.downcast_ref::<std::io::Error>().is_some_and(|e: &std::io::Error| e.kind() == std::io::ErrorKind::Interrupted) {
                                             // dirge-ygxx: /quit (cmd_quit returns
