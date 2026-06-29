@@ -94,10 +94,10 @@ impl Tool for IssueTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "issue".to_string(),
-            description: "Persistent issue/kanban board for tracking work ACROSS sessions (stored in the project DB). The harness shows your open board at the start of each turn, so you don't need to list it constantly. Use this for durable tasks/features/bugs; use `write_todo_list` for throwaway within-turn steps. Actions: \
+            description: "Persistent issue/kanban board for tracking work (stored in the project DB, persists ACROSS sessions). The harness shows your open board at the start of each turn, so you don't need to list it constantly. This is the incremental, single-item surface; `write_todo_list` writes to the SAME board in bulk for laying out a multi-step plan. Actions: \
                 create (title, optional body/priority high|normal|low); \
                 start (id → in_progress); block (id → blocked); close (id → done); \
-                update (id, optional status/priority/body); \
+                update (id, optional status open|in_progress|blocked|done|cancelled / priority / body); \
                 show (id); list (optional status filter); search (query). \
                 Ids accept 7 or \"#7\". Create issues as you discover work; start one when you begin it; close it when done.".to_string(),
             parameters: serde_json::json!({
@@ -107,7 +107,7 @@ impl Tool for IssueTool {
                     "title": { "type": "string", "description": "Title (create)" },
                     "body": { "type": "string", "description": "Optional details (create/update)" },
                     "id": { "type": ["integer", "string"], "description": "Issue id for show/update/start/block/close (e.g. 7 or \"#7\")" },
-                    "status": { "type": "string", "description": "open | in_progress | blocked | done (update)" },
+                    "status": { "type": "string", "description": "open | in_progress | blocked | done | cancelled (update)" },
                     "priority": { "type": "string", "description": "high | normal | low (create/update)" },
                     "query": { "type": "string", "description": "Status filter for list, or search term for search" }
                 },
@@ -126,6 +126,12 @@ impl Tool for IssueTool {
             check_perm(&self.permission, &self.ask_tx, "issue", &action).await?;
         }
         let store = self.store()?;
+
+        // After a write, re-sync the right-pane / nudge mirror from the board so
+        // the panel reflects issue-tool edits, not just `write_todo_list` ones.
+        let refresh = |this: &Self| {
+            crate::agent::tools::todo::refresh_board(&this.db_path, this.session_id.as_deref());
+        };
 
         let need_id = |args: &IssueArgs| -> Result<i64, ToolError> {
             coerce_id(&args.id).ok_or_else(|| {
@@ -149,6 +155,7 @@ impl Tool for IssueTool {
                         self.session_id.as_deref(),
                     )
                     .map_err(ToolError::Msg)?;
+                refresh(self);
                 Ok(format!("Created issue #{id}: {}", title.trim()))
             }
             "start" | "block" | "close" => {
@@ -159,6 +166,7 @@ impl Tool for IssueTool {
                     _ => "done",
                 };
                 if store.set_status(id, status).map_err(ToolError::Msg)? {
+                    refresh(self);
                     Ok(format!("Issue #{id} → {status}"))
                 } else {
                     Err(ToolError::Msg(format!("no issue #{id}")))
@@ -180,7 +188,7 @@ impl Tool for IssueTool {
                 if let Some(status) = args.status.as_deref() {
                     normalize_status(status).ok_or_else(|| {
                         ToolError::Msg(format!(
-                            "unknown status '{status}' (use open|in_progress|blocked|done)"
+                            "unknown status '{status}' (use open|in_progress|blocked|done|cancelled)"
                         ))
                     })?;
                 }
@@ -204,6 +212,7 @@ impl Tool for IssueTool {
                     store.set_priority(id, priority).map_err(ToolError::Msg)?;
                     changed.push("priority");
                 }
+                refresh(self);
                 Ok(format!("Updated issue #{id} ({})", changed.join(", ")))
             }
             "show" => {
