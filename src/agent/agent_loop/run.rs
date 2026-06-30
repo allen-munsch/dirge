@@ -2093,9 +2093,10 @@ pub(crate) fn apply_truncation_repair(
             // validate_and_repair surfaces a real validation
             // error (Reasonix invariant `repair/index.ts:93-102`).
             if !r.fallback
-                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&r.repaired) {
-                    tc.arguments = parsed;
-                }
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&r.repaired)
+            {
+                tc.arguments = parsed;
+            }
         }
     }
 }

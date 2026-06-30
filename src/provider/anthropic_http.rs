@@ -200,9 +200,10 @@ fn hoist_system_messages(value: &mut serde_json::Value) {
             return true;
         }
         if let Some(text) = system_message_text(m)
-            && !text.is_empty() {
-                hoisted.push(text);
-            }
+            && !text.is_empty()
+        {
+            hoisted.push(text);
+        }
         false
     });
 

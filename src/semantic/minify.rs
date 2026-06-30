@@ -160,15 +160,16 @@ fn collect_leaves(node: Node, src: &[u8], tokens: &mut Vec<Token>) {
     // Leaf node → emit its text. tree-sitter leaves are the tokens.
     if node.child_count() == 0 {
         if let Ok(text) = node.utf8_text(src)
-            && !text.is_empty() {
-                tokens.push(Token {
-                    text: text.to_string(),
-                    line: node.start_position().row,
-                    byte_start: node.start_byte(),
-                    byte_end: node.end_byte(),
-                    separator: String::new(),
-                });
-            }
+            && !text.is_empty()
+        {
+            tokens.push(Token {
+                text: text.to_string(),
+                line: node.start_position().row,
+                byte_start: node.start_byte(),
+                byte_end: node.end_byte(),
+                separator: String::new(),
+            });
+        }
         return;
     }
     let mut cursor = node.walk();

@@ -24,9 +24,10 @@ pub(crate) async fn cmd_cd(ctx: &mut SlashCtx<'_>, text: &str) -> anyhow::Result
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
             ctx.session.working_dir = CompactString::new(canonical.to_string_lossy().as_ref());
             if let Some(perm) = ctx.permission
-                && let Ok(mut guard) = perm.lock() {
-                    guard.set_working_dir(&ctx.session.working_dir);
-                }
+                && let Ok(mut guard) = perm.lock()
+            {
+                guard.set_working_dir(&ctx.session.working_dir);
+            }
             ctx.context.reload();
             let model = ctx.client.completion_model(ctx.session.model.to_string());
             *ctx.agent = crate::provider::build_agent(

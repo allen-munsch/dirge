@@ -81,18 +81,19 @@ fn fold_cd_dirs(base: &str, segments: &[String]) -> String {
         let mut it = seg.split_whitespace();
         let head = it.next().unwrap_or("");
         if (head == "cd" || head == "pushd")
-            && let Some(target) = it.find(|a| !a.starts_with('-')) {
-                let t = target.trim_matches(['"', '\'']);
-                if t.is_empty() {
-                    continue;
-                }
-                let tp = std::path::Path::new(t);
-                if tp.is_absolute() {
-                    dir = tp.to_path_buf();
-                } else {
-                    dir = normalize_lexical(&dir.join(tp));
-                }
+            && let Some(target) = it.find(|a| !a.starts_with('-'))
+        {
+            let t = target.trim_matches(['"', '\'']);
+            if t.is_empty() {
+                continue;
             }
+            let tp = std::path::Path::new(t);
+            if tp.is_absolute() {
+                dir = tp.to_path_buf();
+            } else {
+                dir = normalize_lexical(&dir.join(tp));
+            }
+        }
     }
     dir.to_string_lossy().into_owned()
 }

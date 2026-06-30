@@ -317,9 +317,10 @@ pub fn apply_extension_overrides<C>(
                 .collect()
         };
         if let Some(exts) = ovr.extensions()
-            && let Some(s) = servers.iter_mut().find(|s| s.id == id) {
-                s.extensions = normalize(exts);
-            }
+            && let Some(s) = servers.iter_mut().find(|s| s.id == id)
+        {
+            s.extensions = normalize(exts);
+        }
         // Additive: append extra extensions (deduped), keeping the
         // built-in (or just-replaced) list. e.g. add `janet` to
         // clojure-lsp without re-listing clj/cljs/cljc/edn/bb.

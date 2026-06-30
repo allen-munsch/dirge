@@ -1595,10 +1595,11 @@ impl InputEditor {
 
     fn exit_search_accept(&mut self) {
         if self.search_match_idx.is_none()
-            && let Some((draft, cursor)) = self.search_draft.take() {
-                self.buffer = draft;
-                self.cursor = cursor.min(self.buffer.len());
-            }
+            && let Some((draft, cursor)) = self.search_draft.take()
+        {
+            self.buffer = draft;
+            self.cursor = cursor.min(self.buffer.len());
+        }
         self.search_mode = false;
         self.search_query.clear();
         self.search_match_idx = None;

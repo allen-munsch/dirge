@@ -23,9 +23,10 @@ pub(crate) async fn cmd_prompt(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow
     // text back to the UI loop, which launches the turn (see the match on
     // handle_slash's result in ui/mod.rs).
     if ctx.context.prompts.contains_key(name)
-        && let Some(sentinel) = defer_prompt_run_sentinel(parts) {
-            return Err(anyhow::anyhow!("{}", sentinel));
-        }
+        && let Some(sentinel) = defer_prompt_run_sentinel(parts)
+    {
+        return Err(anyhow::anyhow!("{}", sentinel));
+    }
     Ok(())
 }
 

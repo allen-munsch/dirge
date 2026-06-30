@@ -658,9 +658,10 @@ pub fn scrub_env(cmd: &mut Command) {
         let Some(name) = key.to_str() else { continue };
         if is_sensitive_env_name(name) {
             if let Some(val) = value
-                && let Some(s) = val.to_str() {
-                    sensitive_values.push(s.to_string());
-                }
+                && let Some(s) = val.to_str()
+            {
+                sensitive_values.push(s.to_string());
+            }
             keys_to_remove.push(name.to_string());
         }
     }
