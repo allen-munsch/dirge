@@ -99,6 +99,7 @@ fn build_stream_fn() -> Option<crate::agent::agent_loop::StreamFn> {
         AnyModel::Anthropic(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::AnthropicOauth(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Gemini(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
+        AnyModel::GeminiCodeAssist(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::DeepSeek(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Glm(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Ollama(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),

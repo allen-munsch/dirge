@@ -1,6 +1,7 @@
 pub(crate) mod anthropic_http;
 pub(crate) mod anthropic_oauth;
 pub(crate) mod auth;
+pub(crate) mod code_assist;
 pub(crate) mod google_adc;
 mod billing_fallback;
 mod build;
@@ -162,6 +163,7 @@ pub(crate) enum AnyAgentInner {
         Agent<anthropic::completion::CompletionModel<anthropic_http::AnthropicHttpClient>>,
     ),
     Gemini(Agent<gemini::completion::CompletionModel>),
+    GeminiCodeAssist(Agent<gemini::completion::CompletionModel<crate::provider::code_assist::client::CodeAssistHttpClient>>),
     DeepSeek(Agent<openai::completion::CompletionModel>),
     Glm(Agent<openai::completion::CompletionModel>),
     Ollama(Agent<ollama::CompletionModel>),
@@ -412,6 +414,7 @@ impl AnyAgent {
             AnyAgentInner::Anthropic(_) => "anthropic",
             AnyAgentInner::AnthropicOauth(_) => "anthropic",
             AnyAgentInner::Gemini(_) => "gemini",
+            AnyAgentInner::GeminiCodeAssist(_) => "gemini-codeassist",
             AnyAgentInner::DeepSeek(_) => "deepseek",
             AnyAgentInner::Glm(_) => "glm",
             AnyAgentInner::Ollama(_) => "ollama",

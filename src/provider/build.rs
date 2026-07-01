@@ -67,7 +67,19 @@ pub fn create_client_with_auth(
     providers: &HashMap<String, ProviderEntry>,
     default_auth: Option<crate::config::ProviderAuth>,
 ) -> anyhow::Result<AnyClient> {
-    client::create_client_with_auth(provider_name, api_key, providers, default_auth)
+    let handle = tokio::runtime::Handle::try_current().unwrap_or_else(|_| {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("create_client_with_auth: failed to build tokio runtime")
+            .handle()
+            .clone()
+    });
+    handle.block_on(client::create_client_with_auth(
+        provider_name,
+        api_key,
+        providers,
+        default_auth,
+    ))
 }
 
 fn create_role_client(
@@ -226,6 +238,7 @@ pub async fn build_agent(
         AnyModel::Anthropic(m) => build_inner!(m, Anthropic),
         AnyModel::AnthropicOauth(m) => build_inner!(m, AnthropicOauth),
         AnyModel::Gemini(m) => build_inner!(m, Gemini),
+        AnyModel::GeminiCodeAssist(m) => build_inner!(m, GeminiCodeAssist),
         AnyModel::DeepSeek(m) => build_inner!(m, DeepSeek),
         AnyModel::Glm(m) => build_inner!(m, Glm),
         AnyModel::Ollama(m) => build_inner!(m, Ollama),

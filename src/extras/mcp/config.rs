@@ -69,14 +69,5 @@ impl McpServerConfig {
         }
     }
 
-    /// Whether this `Url` variant has auth configured.
-    pub fn has_auth(&self) -> bool {
-        matches!(
-            self,
-            McpServerConfig::Url {
-                auth_provider_type: Some(_),
-                ..
-            }
-        )
-    }
+
 }

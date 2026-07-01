@@ -112,6 +112,9 @@ pub(crate) async fn oneshot_with_model(
             run_oneshot(m, label, preamble, prompt, disable).await
         }
         super::AnyModel::Gemini(m) => run_oneshot(m, label, preamble, prompt, disable).await,
+        super::AnyModel::GeminiCodeAssist(m) => {
+            run_oneshot(m, label, preamble, prompt, disable).await
+        }
         super::AnyModel::DeepSeek(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Glm(m) => run_oneshot(m, label, preamble, prompt, disable).await,
         super::AnyModel::Ollama(m) => run_oneshot(m, label, preamble, prompt, disable).await,
@@ -128,7 +131,7 @@ fn oneshot_provider_kind(model: &super::AnyModel) -> &'static str {
         M::OpenRouter(_) => "openrouter",
         M::OpenAI(_) | M::ChatGptOpenAI(_) | M::OpenAICodex(_) => "openai",
         M::Anthropic(_) | M::AnthropicOauth(_) => "anthropic",
-        M::Gemini(_) => "gemini",
+        M::Gemini(_) | M::GeminiCodeAssist(_) => "gemini",
         M::DeepSeek(_) => "deepseek",
         M::Glm(_) => "glm",
         M::Ollama(_) => "ollama",

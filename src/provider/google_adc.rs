@@ -25,6 +25,7 @@ pub struct AdcToken {
     pub project_id: Option<String>,
     /// Resolved from GOOGLE_CLOUD_LOCATION, CLOUD_ML_REGION, or defaults
     /// to "us-central1". Only meaningful for Vertex AI endpoints.
+    #[allow(dead_code)]
     pub location: Option<String>,
 }
 

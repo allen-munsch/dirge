@@ -64,6 +64,7 @@ macro_rules! dispatch_stream_fn {
                 __stream_fn($model, $tools, $timeout, $provider, $filter)
             }
             $enum::Gemini($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
+            $enum::GeminiCodeAssist($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::DeepSeek($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::Glm($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::Ollama($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),

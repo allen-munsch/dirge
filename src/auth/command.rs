@@ -286,7 +286,7 @@ fn current_epoch_ms() -> anyhow::Result<i64> {
     Ok(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
 }
 
-async fn login_google() -> Result<()> {
+async fn login_google() -> anyhow::Result<()> {
     let status = tokio::process::Command::new("gcloud")
         .args(["auth", "application-default", "login"])
         .stdin(std::process::Stdio::inherit())

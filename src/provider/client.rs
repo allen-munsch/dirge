@@ -82,7 +82,7 @@ pub(crate) fn create_client(
     )
 }
 
-pub(crate) fn create_client_with_auth(
+pub(crate) async fn create_client_with_auth(
     provider_name: &str,
     api_key: Option<&str>,
     providers: &HashMap<String, ProviderEntry>,
@@ -114,6 +114,7 @@ pub(crate) fn create_client_with_auth(
         |name| std::env::var(name).ok(),
         load_fresh_openai_oauth,
     )
+    .await
 }
 
 pub(crate) fn create_openai_api_key_fallback_client(
@@ -171,18 +172,20 @@ where
     F: Fn(&str) -> Option<String>,
     G: FnOnce() -> anyhow::Result<Option<OpenAiOAuthCredential>>,
 {
-    create_client_with_resolved_auth(
-        provider_name,
-        api_key,
-        providers,
-        None,
-        None,
-        env,
-        load_openai_oauth,
-    )
+    tokio::runtime::Handle::try_current()
+        .expect("test must run in a tokio runtime")
+        .block_on(create_client_with_resolved_auth(
+            provider_name,
+            api_key,
+            providers,
+            None,
+            None,
+            env,
+            load_openai_oauth,
+        ))
 }
 
-fn create_client_with_resolved_auth<F, G>(
+async fn create_client_with_resolved_auth<F, G>(
     provider_name: &str,
     api_key: Option<&str>,
     providers: &HashMap<String, ProviderEntry>,
@@ -229,7 +232,7 @@ where
         _ => resolve_auth_headers(auth)?,
     };
     let is_chatgpt_auth = auth == ProviderAuth::ChatGpt;
-    let is_google_auth = auth == ProviderAuth::Google;
+    let _is_google_auth = auth == ProviderAuth::Google;
 
     let credential = if let Some(headers) = auth_headers.as_ref() {
         ProviderCredential::ChatGptAuth(headers.bearer_token.clone())
@@ -351,44 +354,53 @@ where
             }
         }
         ProviderKind::Gemini => {
-            // When using an ADC access token (Google OAuth), the gemini API
-            // requires an Authorization: Bearer header, not a URL query param.
-            // Build a custom HTTP client with the Bearer header when needed;
-            // otherwise use a plain reqwest client (same type, avoids a type
-            // mismatch in the if/else).
+            // When using an ADC access token (Google OAuth), route via
+            // CodeAssist (cloudcode-pa.googleapis.com) which supports
+            // project billing and credit tracking.
+            // When using an API key, use the public Gemini API directly.
             let is_adc = key.starts_with("ya29.");
-            let http = if is_adc {
+            if is_adc {
+                let model_name = providers
+                    .get(provider_name)
+                    .and_then(|p| p.model.as_deref())
+                    .unwrap_or(provider_name);
+                let project_id = auth_headers
+                    .as_ref()
+                    .and_then(|h| h.chatgpt_account_id.as_deref())
+                    .map(str::to_string);
+                let ca_auth = super::code_assist::auth::CodeAssistAuth::new(project_id);
+                let ca_client = super::code_assist::client::CodeAssistHttpClient::new(
+                    reqwest::Client::new(),
+                    ca_auth,
+                    model_name.to_string(),
+                );
+                // Fire-and-forget setup — populates the project ID and
+                // user tier info. Errors are non-fatal; the subsequent
+                // generateContent call may still succeed.
+                let _ = ca_client.setup().await;
+
+                let b = gemini::Client::builder()
+                    .api_key(&key)
+                    .http_client(ca_client);
+                Ok(AnyClient::GeminiCodeAssist(b.build()?))
+            } else {
                 let mut headers = http::HeaderMap::new();
                 if let Ok(value) =
                     http::HeaderValue::from_str(&format!("Bearer {key}"))
                 {
                     headers.insert(http::header::AUTHORIZATION, value);
                 }
-                // X-Goog-User-Project: required when using ADC/OAuth tokens
-                // so Google bills the correct project (Code Assist etc.).
-                if let Ok(project) = std::env::var("GOOGLE_CLOUD_PROJECT")
-                    && !project.trim().is_empty()
-                {
-                    if let Ok(value) = http::HeaderValue::from_str(project.trim()) {
-                        headers.insert(
-                            http::HeaderName::from_static("x-goog-user-project"),
-                            value,
-                        );
-                    }
-                }
-                reqwest::Client::builder()
+                let http = reqwest::Client::builder()
                     .default_headers(headers)
-                    .build()?
-            } else {
-                reqwest::Client::new()
-            };
-            let mut b = gemini::Client::builder()
-                .api_key(&key)
-                .http_client(http);
-            if let Some(base_url) = &base_url {
-                b = b.base_url(base_url);
+                    .build()?;
+                let mut b = gemini::Client::builder()
+                    .api_key(&key)
+                    .http_client(http);
+                if let Some(base_url) = &base_url {
+                    b = b.base_url(base_url);
+                }
+                Ok(AnyClient::Gemini(b.build()?))
             }
-            Ok(AnyClient::Gemini(b.build()?))
         }
         ProviderKind::DeepSeek => {
             let b = openai::CompletionsClient::builder()
@@ -439,15 +451,17 @@ fn create_client_with_chatgpt_auth_headers(
     providers: &HashMap<String, ProviderEntry>,
     headers: ProviderAuthHeaders,
 ) -> anyhow::Result<AnyClient> {
-    create_client_with_resolved_auth(
-        provider_name,
-        None,
-        providers,
-        Some(ProviderAuth::ChatGpt),
-        Some(headers),
-        |name| std::env::var(name).ok(),
-        load_fresh_openai_oauth,
-    )
+    tokio::runtime::Handle::try_current()
+        .expect("test must run in a tokio runtime")
+        .block_on(create_client_with_resolved_auth(
+            provider_name,
+            None,
+            providers,
+            Some(ProviderAuth::ChatGpt),
+            Some(headers),
+            |name| std::env::var(name).ok(),
+            load_fresh_openai_oauth,
+        ))
 }
 
 fn chatgpt_http_headers(auth_headers: Option<&ProviderAuthHeaders>) -> Option<HeaderMap> {

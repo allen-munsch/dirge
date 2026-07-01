@@ -3,9 +3,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use rmcp::service::{Peer, RoleClient, RunningService, serve_client};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use tokio::process::{ChildStderr, Command};
 use tokio::sync::{Mutex, RwLock};
 
+use super::auth::{self, AuthInjectingClient};
 use super::config::McpServerConfig;
 
 /// Co-owned (peer, running_service) pair for one MCP server.
@@ -171,17 +173,35 @@ pub async fn raw_connect(
             target_audience: _,
             target_service_account: _,
         } => {
-            // Auth negotiation for Google/OAuth MCP servers is pending
-            // a minimal, secure ADC auth module (see google_adc module).
             let custom_headers = parse_headers(headers)?;
 
-            let cfg = rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str())
+            let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
                 .custom_headers(custom_headers);
-            type HttpClient = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
-            let transport = HttpClient::from_config(cfg);
-            let rs = serve_client((), transport).await.map_err(|e| {
-                anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
-            })?;
+
+            let rs = match auth::build_auth_provider(config).await {
+                Ok(Some(provider)) => {
+                    let inner = reqwest::Client::new();
+                    let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
+                        AuthInjectingClient::new(inner, provider),
+                        cfg,
+                    );
+                    serve_client((), transport).await.map_err(|e| {
+                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+                    })?
+                }
+                Ok(None) => {
+                    type HttpClient =
+                        rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+                    let transport = HttpClient::from_config(cfg);
+                    serve_client((), transport).await.map_err(|e| {
+                        anyhow::anyhow!("MCP HTTP connection failed for '{server_name}': {e}")
+                    })?
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+
             let peer = rs.peer().clone();
             Ok((peer, rs))
         }

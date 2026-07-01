@@ -116,6 +116,8 @@ mcp-server = ["dep:rmcp", "rmcp?/server", "rmcp?/macros", "rmcp?/transport-io", 
 git-worktree = []
 mcp = [
     "dep:rmcp",
+    "dep:sse-stream",
+    "rmcp?/auth",
     "rmcp?/client",
     "rmcp?/transport-child-process",
     "rmcp?/transport-streamable-http-client-reqwest",
@@ -202,10 +204,13 @@ async-stream = "0.3"
 # tables misaligned the right border when cells contained them.
 unicode-width = "0.2"
 rmcp = { version = "1.7", optional = true, default-features = false, features = [
+    "auth",
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }
+# Required to implement StreamableHttpClient trait (Sse type in return types)
+sse-stream = { version = "0.2", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
 # ui-redesign: ratatui migration. Replaces the hand-rolled stdout

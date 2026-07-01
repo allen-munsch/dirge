@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use anyhow::Context;
 use crate::auth::openai_oauth::normalize_optional_string;
 use crate::auth::store::OpenAiOAuthCredential;
 use crate::config::ProviderAuth;

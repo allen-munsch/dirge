@@ -16,6 +16,7 @@ use crate::agent::prompt;
 use crate::session::SessionMessage;
 
 use super::anthropic_http::AnthropicHttpClient;
+use super::code_assist::client::CodeAssistHttpClient;
 use super::codex_http::CodexHttpClient;
 use super::summarize;
 
@@ -29,6 +30,7 @@ pub enum AnyClient {
     Anthropic(anthropic::Client),
     AnthropicOauth(anthropic::Client<AnthropicHttpClient>),
     Gemini(gemini::Client),
+    GeminiCodeAssist(gemini::Client<CodeAssistHttpClient>),
     DeepSeek(openai::CompletionsClient),
     Glm(openai::CompletionsClient),
     Ollama(ollama::Client),
@@ -50,6 +52,7 @@ impl AnyClient {
             AnyClient::Anthropic(c) => AnyModel::Anthropic(c.completion_model(name)),
             AnyClient::AnthropicOauth(c) => AnyModel::AnthropicOauth(c.completion_model(name)),
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
+            AnyClient::GeminiCodeAssist(c) => AnyModel::GeminiCodeAssist(c.completion_model(name)),
             AnyClient::DeepSeek(c) => AnyModel::DeepSeek(c.completion_model(name)),
             AnyClient::Glm(c) => AnyModel::Glm(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
@@ -150,6 +153,7 @@ pub enum AnyModel {
         anthropic::completion::CompletionModel<super::anthropic_http::AnthropicHttpClient>,
     ),
     Gemini(gemini::completion::CompletionModel),
+    GeminiCodeAssist(gemini::completion::CompletionModel<CodeAssistHttpClient>),
     DeepSeek(openai::completion::CompletionModel),
     Glm(openai::completion::CompletionModel),
     Ollama(ollama::CompletionModel),
@@ -205,6 +209,7 @@ impl AnyModel {
             AnyModel::Anthropic(m) => one_shot!(m),
             AnyModel::AnthropicOauth(m) => one_shot!(m),
             AnyModel::Gemini(m) => one_shot!(m),
+            AnyModel::GeminiCodeAssist(m) => one_shot!(m),
             AnyModel::DeepSeek(m) => one_shot!(m),
             AnyModel::Glm(m) => one_shot!(m),
             AnyModel::Ollama(m) => one_shot!(m),
@@ -267,6 +272,7 @@ impl AnyModel {
             AnyModel::Anthropic(m) => m.model.clone(),
             AnyModel::AnthropicOauth(m) => m.model.clone(),
             AnyModel::Gemini(m) => m.model.clone(),
+            AnyModel::GeminiCodeAssist(m) => m.model.clone(),
             AnyModel::DeepSeek(m) => m.model.clone(),
             AnyModel::Glm(m) => m.model.clone(),
             AnyModel::Ollama(m) => m.model.clone(),
