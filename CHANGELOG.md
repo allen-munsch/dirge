@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-01
+
+### Added
+- **Reusable skill learning with salience.** Skills now carry the same salience
+  machinery as memory. `/learn` distills a reusable skill from any source — a
+  directory, a URL, pasted notes, or the current conversation (bare `/learn`) —
+  by running one standards-guided turn with the agent's own tools (`read`,
+  `grep`, `find_files`, `webfetch`) and saving through the `skill` tool; there's
+  no separate distillation engine. Skill telemetry (use/view/patch counts,
+  provenance, success/failure record) moves from the `.usage.json` sidecar into
+  the project's SQLite database, and the system-prompt skill list is ordered by
+  effective salience so the most useful skills surface first. (#557)
+- **Verification gate.** Creating a skill now requires a `## Verification`
+  section — a single command that proves the skill works — and a freshly learned
+  skill is seeded one grounding success, since it was validated in the session
+  that produced it. (#557)
+
+### Changed
+- **Skill curation is salience-driven, not age-based.** The old
+  active/stale/archived state machine is replaced: the curator decays
+  unconsulted agent-created skills and archives those whose effective salience
+  (decay folded with a proven success/failure record and confidence) falls to
+  the archival threshold. A skill that keeps working survives on its track
+  record even when untouched; pinned skills and skills you didn't author are
+  never auto-archived. The `.usage.json` sidecar is retired. (#557)
+
 ## [0.14.2] - 2026-06-30
 
 ### Added
@@ -1477,7 +1503,7 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.15.0...HEAD
 [0.4.1]: https://github.com/dirge-code/dirge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dirge-code/dirge/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/dirge-code/dirge/compare/v0.3.0...v0.3.1
