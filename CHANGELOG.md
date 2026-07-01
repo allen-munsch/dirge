@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-01
+
 ### Added
 - **Diff-aware code reviewer.** A new finalization gate reviews the actual diff a
   run produced (not just the transcript) and surfaces severity-ranked findings.
@@ -1513,7 +1515,8 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/dirge-code/dirge/compare/v0.15.0...v0.16.0
 [0.4.1]: https://github.com/dirge-code/dirge/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dirge-code/dirge/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/dirge-code/dirge/compare/v0.3.0...v0.3.1
