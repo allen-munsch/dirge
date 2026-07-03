@@ -522,21 +522,44 @@ use std::process::Command;
 /// `MAX_RULES_CHARS` sizing philosophy.
 const MAX_DIFF_BYTES: usize = 64_000;
 
-/// Capture the run's uncommitted changes as a single unified diff, ready
-/// for the reviewer: tracked edits (`git diff HEAD`) plus any new
-/// untracked files, exclude-filtered and size-capped. Returns `None` when
-/// there is nothing to review (clean tree, not a git repo, or git absent)
-/// — the gate treats `None` as "no diff, skip".
+/// The run's uncommitted diff prepared for the reviewer: the size-capped
+/// text actually sent to the judge, plus an UNcapped fingerprint used to
+/// decide whether anything changed since the run-start baseline.
 ///
-/// Thin git glue on purpose: the formatting/filtering/capping below is
-/// pure and unit-tested; this function is the one impure seam.
-pub fn capture_run_diff(repo: &Path) -> Option<String> {
+/// dirge-8gdv: the skip gate used to compare the CAPPED strings, but
+/// [`cap_diff`] truncates at [`MAX_DIFF_BYTES`]. When pre-existing WIP
+/// already exceeds the cap, a length-preserving edit that lands PAST the
+/// cutoff leaves the two capped strings byte-identical, so the reviewer
+/// was wrongly skipped. The fingerprint is hashed from the
+/// filtered-but-PRE-cap text, so such an edit still changes it — only the
+/// equality/skip decision changed; the bounded text still goes to the
+/// reviewer unchanged.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RunDiff {
+    /// The bounded diff sent to the reviewer (filtered + capped).
+    pub capped: String,
+    /// Hash of the filtered, PRE-cap diff — the change-detection key.
+    pub fingerprint: u64,
+}
+
+/// Capture the run's uncommitted changes as a [`RunDiff`]: tracked edits
+/// (`git diff HEAD`) plus any new untracked files, exclude-filtered and
+/// size-capped, with an UNcapped fingerprint for the change/skip decision.
+/// Returns `None` when there is nothing to review (clean tree, not a git
+/// repo, or git absent) — the gate treats `None` as "no diff, skip".
+///
+/// Thin git glue on purpose: the filtering/capping/hashing below is pure
+/// and unit-tested; this function is the one impure seam.
+pub fn capture_run_diff(repo: &Path) -> Option<RunDiff> {
     let raw = raw_uncommitted_diff(repo);
-    let formatted = format_run_diff(&raw);
-    if formatted.trim().is_empty() {
+    let filtered = filter_diff_excludes(&raw);
+    if filtered.trim().is_empty() {
         None
     } else {
-        Some(formatted)
+        Some(RunDiff {
+            fingerprint: diff_fingerprint(&filtered),
+            capped: cap_diff(&filtered, MAX_DIFF_BYTES),
+        })
     }
 }
 
@@ -629,9 +652,17 @@ fn git_stdout_allow_fail(repo: &Path, args: &[&str]) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
 }
 
-/// Filter excluded files out of a raw diff, then size-cap it. Pure.
-fn format_run_diff(raw: &str) -> String {
-    cap_diff(&filter_diff_excludes(raw), MAX_DIFF_BYTES)
+/// Hash the filtered (excluded-stripped) but UNcapped diff into a u64
+/// fingerprint for the run-start-baseline change/skip decision. Computed
+/// over the PRE-cap text so a length-preserving edit landing past
+/// [`MAX_DIFF_BYTES`] — which [`cap_diff`] would mask — still changes it.
+/// Pure; std [`DefaultHasher`] only, no new deps.
+fn diff_fingerprint(filtered: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    filtered.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Drop per-file sections whose path is noise (lockfiles, generated
@@ -1422,6 +1453,35 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert_eq!(cap_diff("small", 100), "small");
     }
 
+    /// dirge-8gdv: the change/skip decision keys on an UNcapped fingerprint,
+    /// not the capped string. When pre-existing WIP already exceeds the cap,
+    /// a length-preserving edit landing PAST [`MAX_DIFF_BYTES`] leaves the
+    /// two CAPPED strings byte-identical — so the old capped-string
+    /// comparison saw no change and skipped the reviewer. The fingerprint is
+    /// hashed from the PRE-cap text and DOES change.
+    #[test]
+    fn diff_fingerprint_catches_an_edit_the_cap_masks() {
+        let head = "diff --git a/f b/f\n@@ +1 @@\n+";
+        // Push the differing bytes PAST the MAX_DIFF_BYTES cutoff.
+        let padding = "a".repeat(MAX_DIFF_BYTES + 100);
+        let a = format!("{head}{padding}AAA");
+        // Same length, one byte changed past the cap.
+        let b = format!("{head}{padding}AAB");
+        // Premise of the bug: the cap really does mask this edit.
+        assert_eq!(
+            cap_diff(&a, MAX_DIFF_BYTES),
+            cap_diff(&b, MAX_DIFF_BYTES),
+            "capped strings are byte-identical — the old comparison saw no change"
+        );
+        assert_ne!(a, b, "uncapped text genuinely differs");
+        // The fingerprint is over the PRE-cap text, so it still catches it.
+        assert_ne!(
+            diff_fingerprint(&a),
+            diff_fingerprint(&b),
+            "fingerprint must change even though the cap masks the edit"
+        );
+    }
+
     // Git-backed integration: exercises the one impure seam.
     fn git(dir: &Path, args: &[&str]) -> String {
         let mut full = vec![
@@ -1485,6 +1545,7 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         std::fs::write(repo.join("Cargo.lock"), "# lockfile churn\n").unwrap();
 
         let diff = capture_run_diff(&repo).expect("dirty tree yields a diff");
+        let diff = &diff.capped;
         assert!(diff.contains("a.rs"), "tracked edit present");
         assert!(diff.contains("let x = 1"), "tracked edit body present");
         assert!(diff.contains("b.rs"), "untracked new file present");
