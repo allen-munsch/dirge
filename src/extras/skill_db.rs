@@ -417,7 +417,7 @@ impl SkillStore {
         let existed = Self::get_locked(&conn, name)?.is_some();
         if existed {
             conn.execute(
-                "UPDATE skills SET description = ?1, content = ?2, updated_at = ?3
+                "UPDATE skills SET status = 'active', description = ?1, content = ?2, updated_at = ?3
                  WHERE name = ?4",
                 params![description, content, now, name],
             )
@@ -803,6 +803,49 @@ mod tests {
         assert_eq!(row.use_count, 1, "usage lineage preserved across refresh");
         assert!(s.search("fmt").expect("search").len() == 1);
         assert!(s.search("clippy").expect("search").is_empty());
+    }
+
+    #[test]
+    fn register_file_skill_reactivates_archived_skill() {
+        let s = store();
+        s.register_file_skill("reactivated", "desc one.", "body one.", false)
+            .expect("register");
+        // Bump usage/salience so we can assert lineage survives re-register.
+        s.record_use("reactivated");
+        let before = s.get("reactivated").unwrap().unwrap();
+        assert_eq!(before.status, "active");
+        let saved_created_at = before.created_at.clone();
+
+        // Simulate the skill being archived (its dir moved into .archive/).
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE skills SET status = 'archived' WHERE name = 'reactivated'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            s.get("reactivated").unwrap().unwrap().status,
+            "archived",
+            "sanity: status is archived before re-register"
+        );
+
+        // Directory presence is ground truth: re-discovering the skill on
+        // disk must reactivate it.
+        s.register_file_skill("reactivated", "desc two.", "body two.", false)
+            .expect("re-register");
+        let after = s.get("reactivated").unwrap().unwrap();
+        assert_eq!(after.status, "active", "re-register must reactivate");
+        assert_eq!(after.use_count, 1, "usage lineage preserved");
+        assert!(
+            (after.salience - (SKILL_BASE_SALIENCE + USE_REINFORCEMENT)).abs() < 1e-9,
+            "salience lineage preserved"
+        );
+        assert_eq!(
+            after.created_at, saved_created_at,
+            "created_at preserved across re-register"
+        );
     }
 
     #[test]
