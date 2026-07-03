@@ -31,18 +31,25 @@ fn extract_tier<'a>(parts: &[&'a str]) -> Option<&'a str> {
         .copied()
 }
 
+/// Join the leading positional tokens of a `/graph search` remainder until the
+/// first flag token (anything starting with `--`), so flags like `--kind`,
+/// `--tier`, `--compress` and `--depth` never leak into the FTS5 query string.
+fn positional_query(remainder: &[&str]) -> String {
+    remainder
+        .iter()
+        .take_while(|s| !s.starts_with("--"))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(crate) async fn cmd_graph(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     let sub = parts.get(1).copied().unwrap_or("").trim();
 
     match sub {
         "search" => {
             let remainder = &parts[2..];
-            let query = remainder
-                .iter()
-                .take_while(|s| **s != "--kind" && **s != "--tier")
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" ");
+            let query = positional_query(remainder);
 
             if query.is_empty() {
                 ctx.renderer.write_line(
@@ -377,4 +384,42 @@ pub(crate) async fn cmd_graph(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positional_query_terminates_at_compress_flag() {
+        assert_eq!(positional_query(&["auth", "--compress"]), "auth");
+    }
+
+    #[test]
+    fn positional_query_terminates_at_kind_flag() {
+        assert_eq!(positional_query(&["auth", "--kind", "fn"]), "auth");
+    }
+
+    #[test]
+    fn positional_query_joins_multiple_words_before_flag() {
+        assert_eq!(
+            positional_query(&["foo", "bar", "--tier", "sql"]),
+            "foo bar"
+        );
+    }
+
+    #[test]
+    fn positional_query_terminates_at_depth_flag() {
+        assert_eq!(positional_query(&["auth", "--depth", "2"]), "auth");
+    }
+
+    #[test]
+    fn positional_query_no_flags_returns_all() {
+        assert_eq!(positional_query(&["auth"]), "auth");
+    }
+
+    #[test]
+    fn positional_query_empty_is_empty() {
+        assert!(positional_query(&[]).is_empty());
+    }
 }
