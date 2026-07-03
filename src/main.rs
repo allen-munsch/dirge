@@ -357,26 +357,49 @@ fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<Strin
 /// content. Warnings only — never refuse to load.
 fn warn_on_stale_resume(session: &session::Session) {
     let cwd = std::env::current_dir().ok();
-    let session_wd = session.working_dir.as_str();
-    if !session_wd.is_empty()
-        && let Some(cwd) = &cwd
-        && cwd.to_string_lossy() != session_wd
-    {
-        eprintln!(
-            "warning: resumed session was created in {:?}, current cwd is {:?}. Tool results captured against the old tree may be stale.",
-            session_wd,
-            cwd.display().to_string(),
-        );
+    for line in resume_staleness_warnings(
+        session.working_dir.as_str(),
+        cwd.as_deref(),
+        session.updated_at.as_str(),
+        chrono::Utc::now(),
+    ) {
+        eprintln!("{line}");
     }
-    if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(session.updated_at.as_str()) {
-        let age = chrono::Utc::now().signed_duration_since(updated.with_timezone(&chrono::Utc));
+}
+
+/// Pure predicate behind [`warn_on_stale_resume`]: returns the warning
+/// line(s) for a resumed session given its stored `working_dir`,
+/// `updated_at`, and the cwd / reference instant to compare against.
+/// A cwd-mismatch warning is emitted when `session_working_dir` is
+/// non-empty and differs from `cwd`; an age warning is emitted when
+/// `updated_at` parses as RFC-3339 and is >=24h before `now`.
+fn resume_staleness_warnings(
+    session_working_dir: &str,
+    cwd: Option<&std::path::Path>,
+    updated_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !session_working_dir.is_empty()
+        && let Some(cwd) = cwd
+        && cwd.to_string_lossy() != session_working_dir
+    {
+        out.push(format!(
+            "warning: resumed session was created in {:?}, current cwd is {:?}. Tool results captured against the old tree may be stale.",
+            session_working_dir,
+            cwd.display().to_string(),
+        ));
+    }
+    if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) {
+        let age = now.signed_duration_since(updated.with_timezone(&chrono::Utc));
         if age.num_hours() >= 24 {
-            eprintln!(
+            out.push(format!(
                 "warning: resumed session is {} hours old. Captured tool results (read/git/bash) may no longer reflect the current state of the working tree.",
                 age.num_hours(),
-            );
+            ));
         }
     }
+    out
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -751,6 +774,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(s) = sessions.into_iter().next() {
                 session = s;
+                // SESS-8: only warn when a session was actually loaded —
+                // the empty-list branch above leaves the fresh default.
+                warn_on_stale_resume(&session);
             }
         }
     }
@@ -761,6 +787,8 @@ async fn main() -> anyhow::Result<()> {
         && let Some(s) = sessions.into_iter().next()
     {
         session = s;
+        // SESS-8: warn on stale cwd/age for -c the same as --session.
+        warn_on_stale_resume(&session);
     }
 
     if let Some(session_id) = &cli.session {
@@ -2081,6 +2109,80 @@ mod parse_permission_config_tests {
         assert!(
             parse_permission_config(Some(&v)).is_err(),
             "an unknown field must yield Err so build_channels refuses to start"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_staleness_tests {
+    use super::*;
+
+    // Fixed reference instant so the age math is deterministic.
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn cwd_mismatch_emits_warning() {
+        // (a) session was created elsewhere than the current cwd.
+        let warnings = resume_staleness_warnings(
+            "/old/path",
+            Some(std::path::Path::new("/current/path")),
+            "2024-06-01T11:00:00Z", // 1h old — fresh, no age warning
+            now(),
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("was created in") && w.contains("/old/path")),
+            "expected a cwd-mismatch warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn matching_cwd_and_fresh_is_empty() {
+        // (b) same cwd, recent updated_at → nothing to warn about.
+        let warnings = resume_staleness_warnings(
+            "/current/path",
+            Some(std::path::Path::new("/current/path")),
+            "2024-06-01T11:00:00Z",
+            now(),
+        );
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn stale_updated_at_emits_age_warning() {
+        // (c) updated_at is 48h before `now` → crosses the 24h threshold.
+        let warnings = resume_staleness_warnings(
+            "/current/path",
+            Some(std::path::Path::new("/current/path")),
+            "2024-05-30T12:00:00Z",
+            now(),
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("hours old")),
+            "expected an age warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn empty_working_dir_and_fresh_is_empty() {
+        // (d) no working_dir recorded + fresh → nothing to warn about.
+        let warnings = resume_staleness_warnings(
+            "",
+            Some(std::path::Path::new("/current/path")),
+            "2024-06-01T11:00:00Z",
+            now(),
+        );
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
         );
     }
 }
