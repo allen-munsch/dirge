@@ -201,7 +201,7 @@ where
         );
     }
     let auth_headers = match (auth, resolved_auth_headers) {
-        (ProviderAuth::ChatGpt, Some(headers)) => Some(headers),
+        (ProviderAuth::ChatGpt | ProviderAuth::Anthropic, Some(headers)) => Some(headers),
         _ => resolve_auth_headers(auth)?,
     };
     let is_chatgpt_auth = auth == ProviderAuth::ChatGpt;
@@ -261,15 +261,17 @@ where
         _ => info.base_url,
     };
 
-    // A Codex login token is higher-value than a per-provider API key, so it
-    // must never leave over plaintext. `allow_insecure` is intentionally not
-    // honored for either explicit ChatGPT auth or native Dirge OAuth fallback.
-    if (is_chatgpt_auth || uses_openai_oauth)
+    // An OAuth login token — Codex/ChatGPT bearer, native Dirge OAuth, or an
+    // Anthropic `sk-ant-oat` bearer — is higher-value than a per-provider API
+    // key, so it must never leave over plaintext. `allow_insecure` is
+    // intentionally not honored for any of them.
+    let uses_anthropic_oauth = auth == ProviderAuth::Anthropic;
+    if (is_chatgpt_auth || uses_openai_oauth || uses_anthropic_oauth)
         && let Some(url) = base_url.as_deref()
         && !url.starts_with("https://")
     {
         anyhow::bail!(
-            "ChatGPT (Codex) auth requires an https base URL, but got `{url}`. The Codex login \
+            "OAuth login auth requires an https base URL, but got `{url}`. The OAuth bearer \
              token is too sensitive to send over http:// — `allow_insecure` is ignored here."
         );
     }
@@ -288,7 +290,7 @@ where
         ProviderKind::OpenAI if is_chatgpt_auth => {
             let mut b = openai::Client::builder()
                 .api_key(&key)
-                .http_client(CodexHttpClient::default());
+                .http_client(codex_http_client_for(&key));
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -414,6 +416,23 @@ fn create_client_with_chatgpt_auth_headers(
     )
 }
 
+#[cfg(test)]
+fn create_client_with_anthropic_auth_headers(
+    provider_name: &str,
+    providers: &HashMap<String, ProviderEntry>,
+    headers: ProviderAuthHeaders,
+) -> anyhow::Result<AnyClient> {
+    create_client_with_resolved_auth(
+        provider_name,
+        None,
+        providers,
+        Some(ProviderAuth::Anthropic),
+        Some(headers),
+        |name| std::env::var(name).ok(),
+        load_fresh_openai_oauth,
+    )
+}
+
 fn chatgpt_http_headers(auth_headers: Option<&ProviderAuthHeaders>) -> Option<HeaderMap> {
     let account_id = auth_headers?
         .chatgpt_account_id
@@ -478,11 +497,71 @@ where
 
 pub(crate) fn load_fresh_openai_oauth() -> anyhow::Result<Option<OpenAiOAuthCredential>> {
     let store = OpenAiAuthStore::default();
-    fresh_openai_oauth_at(store.load_openai()?, current_epoch_ms(), |credential| {
+    load_fresh_openai_oauth_locked(&store, current_epoch_ms, |credential| {
         let refreshed = refresh_openai_credential(credential)?;
         store.save_openai(&refreshed)?;
         Ok(refreshed)
     })
+}
+
+/// True when the ChatGPT/Codex refresh seam should be attached: only when the
+/// outgoing bearer is Dirge's own OAuth access token, the sole ChatGPT-path
+/// credential Dirge can refresh. Env (`CODEX_ACCESS_TOKEN`) and legacy
+/// `codex login` file tokens carry a different bearer, so this returns false
+/// and they keep the pre-fix frozen-header behavior (dirge-30nl).
+fn codex_refresh_applies(loaded: &Option<OpenAiOAuthCredential>, bearer: &str) -> bool {
+    loaded
+        .as_ref()
+        .is_some_and(|credential| credential.access_token() == bearer)
+}
+
+/// Build the Codex transport for the ChatGPT/Codex OAuth path, attaching a
+/// mid-session refresh seam when the bearer is Dirge's refreshable OAuth token
+/// (dirge-30nl). Otherwise returns a plain client whose bearer stays as rig set
+/// it from the static api_key.
+fn codex_http_client_for(bearer: &str) -> CodexHttpClient {
+    let loaded = load_fresh_openai_oauth().ok().flatten();
+    if !codex_refresh_applies(&loaded, bearer) {
+        return CodexHttpClient::default();
+    }
+    let credential = loaded.expect("codex_refresh_applies guarantees Some");
+    let refresher: super::codex_http::CodexRefreshFn = std::sync::Arc::new(|| {
+        let credential = load_fresh_openai_oauth()?.ok_or_else(|| {
+            anyhow::anyhow!("stored OpenAI OAuth credential is no longer available")
+        })?;
+        Ok(super::auth::RefreshedAuth {
+            bearer_token: credential.access_token().to_string(),
+            expires_at_ms: Some(credential.expires_at_epoch_ms()),
+        })
+    });
+    CodexHttpClient::new_refreshable(
+        credential.access_token().to_string(),
+        Some(credential.expires_at_epoch_ms()),
+        refresher,
+    )
+}
+
+/// Load a fresh OpenAI OAuth credential, refreshing under a cross-process lock.
+///
+/// OpenAI rotates the refresh token on every use, so two Dirge processes that
+/// both refresh the same stale credential would have the loser persist a
+/// now-dead refresh token over the winner's fresh one — the next expiry then
+/// fails and forces a re-login. Take an advisory lock on the auth file around
+/// load→refresh→save and re-check freshness after acquiring it, so a process
+/// that lost the race adopts the winner's result instead of refreshing again
+/// (dirge-m1o5). The fast path (fresh or absent credential) skips the lock.
+fn load_fresh_openai_oauth_locked(
+    store: &OpenAiAuthStore,
+    now: impl Fn() -> i64,
+    refresh_and_save: impl FnOnce(&OpenAiOAuthCredential) -> anyhow::Result<OpenAiOAuthCredential>,
+) -> anyhow::Result<Option<OpenAiOAuthCredential>> {
+    match store.load_openai()? {
+        Some(credential) if credential.is_fresh_at(now()) => return Ok(Some(credential)),
+        None => return Ok(None),
+        _ => {}
+    }
+    let _lock = crate::auth::file_lock::FileLock::acquire_for(store.path());
+    fresh_openai_oauth_at(store.load_openai()?, now(), refresh_and_save)
 }
 
 fn fresh_openai_oauth_at(
@@ -568,6 +647,30 @@ mod tests {
         None
     }
 
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dirge_client_oauth_{tag}_{}_{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn auth_path(&self) -> std::path::PathBuf {
+            self.0.join("auth.json")
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn oauth(access_token: &str) -> OpenAiOAuthCredential {
         oauth_with_account(access_token, None)
     }
@@ -586,6 +689,13 @@ mod tests {
         ProviderAuthHeaders {
             bearer_token: "test-token".to_string(),
             chatgpt_account_id: Some("acct-test".to_string()),
+        }
+    }
+
+    fn test_anthropic_headers() -> ProviderAuthHeaders {
+        ProviderAuthHeaders {
+            bearer_token: "sk-ant-oat-test".to_string(),
+            chatgpt_account_id: None,
         }
     }
 
@@ -968,6 +1078,104 @@ mod tests {
     }
 
     #[test]
+    fn codex_refresh_applies_only_to_the_dirge_oauth_bearer() {
+        let credential = oauth("DIRGE-OAUTH-ACCESS");
+        // The outgoing bearer is Dirge's OAuth token -> refreshable.
+        assert!(codex_refresh_applies(
+            &Some(credential.clone()),
+            "DIRGE-OAUTH-ACCESS"
+        ));
+        // An env / legacy-file token differs from the stored OAuth access
+        // token -> stays frozen, no accidental override.
+        assert!(!codex_refresh_applies(&Some(credential), "CODEX-ENV-TOKEN"));
+        // No stored OAuth credential at all -> frozen.
+        assert!(!codex_refresh_applies(&None, "ANY"));
+    }
+
+    #[test]
+    fn locked_load_takes_fast_path_for_fresh_credential() {
+        let dir = TestDir::new("fast");
+        let store = OpenAiAuthStore::at(dir.auth_path());
+        store
+            .save_openai(&OpenAiOAuthCredential::new(
+                "ACCESS",
+                "R0",
+                None,
+                None,
+                i64::MAX,
+            ))
+            .unwrap();
+
+        let result = load_fresh_openai_oauth_locked(
+            &store,
+            || 0,
+            |_| panic!("a fresh credential must not be refreshed"),
+        )
+        .unwrap()
+        .expect("fresh credential returned");
+
+        assert_eq!(result.access_token(), "ACCESS");
+    }
+
+    #[test]
+    fn concurrent_locked_refresh_rotates_token_exactly_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = TestDir::new("m1o5");
+        let path = dir.auth_path();
+        // Seed an expired credential whose single-use refresh token is "R0".
+        OpenAiAuthStore::at(path.clone())
+            .save_openai(&OpenAiOAuthCredential::new(
+                "OLD-ACCESS",
+                "R0",
+                None,
+                None,
+                0,
+            ))
+            .unwrap();
+
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let now = || 1_900_000_000_000_i64;
+
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                let path = path.clone();
+                let refreshes = refreshes.clone();
+                std::thread::spawn(move || {
+                    let store = OpenAiAuthStore::at(path);
+                    load_fresh_openai_oauth_locked(&store, now, |cred| {
+                        // Single-use: the token being rotated is still the
+                        // original — no one clobbered it back to "R0".
+                        assert_eq!(cred.refresh_token(), "R0");
+                        refreshes.fetch_add(1, Ordering::SeqCst);
+                        let refreshed =
+                            OpenAiOAuthCredential::new("NEW-ACCESS", "R1", None, None, i64::MAX);
+                        store.save_openai(&refreshed)?;
+                        Ok(refreshed)
+                    })
+                    .unwrap()
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            1,
+            "the stale credential must be refreshed exactly once across processes"
+        );
+        for result in &results {
+            let cred = result.as_ref().expect("a fresh credential");
+            assert_eq!(cred.access_token(), "NEW-ACCESS");
+        }
+        // The winner's rotated refresh token survives; it isn't overwritten.
+        let stored = OpenAiAuthStore::at(path).load_openai().unwrap().unwrap();
+        assert_eq!(stored.refresh_token(), "R1");
+    }
+
+    #[test]
     fn provider_credential_debug_redacts_selected_secrets() {
         let oauth_debug = format!(
             "{:?}",
@@ -1078,6 +1286,45 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(msg.contains("https base URL"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn anthropic_oauth_refuses_insecure_base_url_even_with_allow_insecure() {
+        let providers = HashMap::from([(
+            "anthropic".to_string(),
+            ProviderEntry {
+                base_url: Some("http://proxy.local/anthropic".to_string()),
+                allow_insecure: true,
+                ..Default::default()
+            },
+        )]);
+        let msg = match create_client_with_anthropic_auth_headers(
+            "anthropic",
+            &providers,
+            test_anthropic_headers(),
+        ) {
+            Ok(_) => panic!("http base url must be refused under anthropic oauth"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("https base URL"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn anthropic_oauth_allows_https_base_url() {
+        let providers = HashMap::from([(
+            "anthropic".to_string(),
+            ProviderEntry {
+                base_url: Some("https://proxy.example.com/anthropic".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let client = create_client_with_anthropic_auth_headers(
+            "anthropic",
+            &providers,
+            test_anthropic_headers(),
+        )
+        .unwrap();
+        assert!(matches!(client, AnyClient::AnthropicOauth(_)));
     }
 
     #[test]
