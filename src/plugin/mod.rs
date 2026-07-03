@@ -24,6 +24,18 @@ pub mod hook;
 pub mod loader;
 pub mod worker;
 
+/// Per-process sentinel the Rust host prepends to a plugin error string
+/// so it can tell a real error apart from a plugin *result* that merely
+/// looks like one. A plugin never sees the host's generated Janet wrapper
+/// source, so it cannot produce this prefix; one process-global value is
+/// enough. The hook/command/tool dispatch `catch` arms emit
+/// `(string "{sentinel}" err)` and the Rust side matches it back with
+/// `strip_prefix(err_sentinel())`.
+fn err_sentinel() -> &'static str {
+    static SENTINEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SENTINEL.get_or_init(|| format!("DIRGE_ERR_{}:", uuid::Uuid::new_v4().simple()))
+}
+
 /// Spawn a background task that drains plugin dialog requests in
 /// headless modes (`--print`, `--loop`, ACP) and auto-replies based
 /// on `mode`. Without this drain, a plugin that calls
@@ -335,7 +347,8 @@ impl PluginManager {
             //      `packages/coding-agent/src/core/extensions/runner.ts`
             //      which emits structured `ExtensionError` events
             //      the host renders as `ctx.ui.notify("...","error")`).
-            //   2. Return `DIRGE_HOOK_ERR:<msg>` so the Rust side
+            //   2. Return the host's per-process error sentinel + `<msg>`
+            //      (see `err_sentinel`) so the Rust side
             //      can also log a structured `tracing::warn!` —
             //      surfaces via `--verbose` or `RUST_LOG=warn`.
             //
@@ -359,12 +372,13 @@ impl PluginManager {
                                        " errored: "
                                        err)))
                            (harness/push-hook-err sanitized)
-                           (string "DIRGE_HOOK_ERR:" err))))"#,
+                           (string "{sentinel}" err))))"#,
                 ctx = context_janet,
                 fname = name,
+                sentinel = err_sentinel(),
             );
             if let Ok(s) = self.eval(&code) {
-                if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {
+                if let Some(msg) = s.strip_prefix(err_sentinel()) {
                     tracing::warn!(
                         target: "dirge::plugin",
                         hook = %hook,
@@ -707,13 +721,14 @@ impl PluginManager {
                                        " errored: "
                                        err)))
                            (harness/push-hook-err sanitized)
-                           (string "DIRGE_HOOK_ERR:" err))))"#,
+                           (string "{sentinel}" err))))"#,
                 ctx = context_janet,
                 fname = name,
+                sentinel = err_sentinel(),
             );
             match self.worker.eval_with_timeout(&code, HOOK_TIMEOUT) {
                 Ok(s) => {
-                    if let Some(msg) = s.strip_prefix("DIRGE_HOOK_ERR:") {
+                    if let Some(msg) = s.strip_prefix(err_sentinel()) {
                         tracing::warn!(
                             target: "dirge::plugin",
                             hook = %hook,
@@ -862,7 +877,8 @@ impl PluginManager {
         //
         // Error handling matches dispatch()'s pattern: on Janet
         // exception, queue a `[plugin] command <name> errored: <err>`
-        // notification AND return `DIRGE_HOOK_ERR:<msg>` so the Rust
+        // notification AND return the host's per-process error sentinel
+        // + `<msg>` (see `err_sentinel`) so the Rust
         // side can also tracing::warn. Caller still sees Ok(None).
         let handler_fn_escaped = escape_janet_string(handler_fn);
         let code = format!(
@@ -880,12 +896,13 @@ impl PluginManager {
                                  " errored: "
                                  err)))
                      (harness/push-hook-err sanitized)
-                     (string "DIRGE_HOOK_ERR:" err))))"#,
+                     (string "{sentinel}" err))))"#,
             fname = escaped_fn,
             args = escaped_args,
+            sentinel = err_sentinel(),
         );
         let result = self.eval(&code)?;
-        if let Some(msg) = result.strip_prefix("DIRGE_HOOK_ERR:") {
+        if let Some(msg) = result.strip_prefix(err_sentinel()) {
             tracing::warn!(
                 target: "dirge::plugin",
                 handler = %handler_fn,
@@ -1070,7 +1087,7 @@ impl PluginManager {
                      (let [r ((f :value) "{args}")]
                        (if (string? r) r nil))
                      nil))
-                 ([err fib] nil))"#,
+                  ([err fib] nil))"#,
             fname = escaped_fn,
             args = escaped_args,
         );
@@ -1108,15 +1125,16 @@ impl PluginManager {
                  (def result
                    (try (let [r ({handler} "{args}")]
                           (if (string? r) r (string r)))
-                        ([err fib] (string "DIRGE_TOOL_ERR:" err))))
+                        ([err fib] (string "{sentinel}" err))))
                  (set harness-current-tool-call nil)
                  result)"#,
             tcid = escaped_id,
             handler = handler,
             args = escaped_args,
+            sentinel = err_sentinel(),
         );
         let out = self.worker.eval(&code)?;
-        if let Some(msg) = out.strip_prefix("DIRGE_TOOL_ERR:") {
+        if let Some(msg) = out.strip_prefix(err_sentinel()) {
             Err(msg.to_string())
         } else {
             Ok(out)

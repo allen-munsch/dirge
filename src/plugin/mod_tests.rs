@@ -259,6 +259,39 @@ fn test_load_file() {
     assert!(result[0].contains("loaded with test"));
 }
 
+/// dirge-5vze: a hook result that happens to start with the OLD
+/// host-error prefix must pass through as an ordinary result, not be
+/// misclassified as a plugin error and dropped. The host now tags real
+/// errors with a per-process sentinel (`err_sentinel`) the plugin can't
+/// produce, so a plugin-supplied `DIRGE_HOOK_ERR:...` string is just data.
+#[test]
+fn dispatch_passes_through_result_that_looks_like_host_error() {
+    let mut mgr = PluginManager::try_new().unwrap();
+    mgr.eval(r#"(defn on-prompt [ctx] "DIRGE_HOOK_ERR: not really an error")"#)
+        .unwrap();
+    mgr.register("on-prompt", "on-prompt");
+    let result = mgr.dispatch("on-prompt", "@{:prompt \"x\"}").unwrap();
+    assert_eq!(
+        result.len(),
+        1,
+        "collision-prone prefix must not drop a real result"
+    );
+    assert_eq!(result[0], "DIRGE_HOOK_ERR: not really an error");
+}
+
+/// dirge-5vze: the error sentinel is one random value per process —
+/// stable across calls (so every dispatch/strip_prefix agrees) and
+/// distinct from any literal a plugin could return.
+#[test]
+fn err_sentinel_is_stable_and_not_plugin_guessable() {
+    let s = err_sentinel();
+    assert_eq!(s, err_sentinel());
+    assert!(s.starts_with("DIRGE_ERR_"));
+    assert!(s.ends_with(':'));
+    assert!(!s.contains("DIRGE_HOOK_ERR"));
+    assert!(!s.contains("DIRGE_TOOL_ERR"));
+}
+
 #[test]
 fn test_auto_discover_hooks() {
     let mut mgr = PluginManager::try_new().unwrap();
