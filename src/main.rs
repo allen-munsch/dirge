@@ -2089,6 +2089,64 @@ mod resolve_mode_tests {
         let cfg = config::Config::default();
         assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Standard);
     }
+
+    /// dirge-rb3f: the third CLI flag, `--accept-all`, is authoritative too —
+    /// CLI-wins is "CLI decides when present", not "most permissive wins".
+    #[test]
+    fn cli_accept_all_beats_config_restrictive() {
+        let cli = cli::Cli::parse_from(["dirge", "--accept-all"]);
+        let cfg = config::Config {
+            restrictive: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_mode(&cli, &cfg),
+            SecurityMode::Accept,
+            "explicit --accept-all must override config restrictive=true"
+        );
+    }
+
+    /// Without a CLI flag, the config `accept_all` boolean selects Accept.
+    #[test]
+    fn config_accept_all_applies_without_cli_flag() {
+        let cli = cli::Cli::parse_from(["dirge"]);
+        let cfg = config::Config {
+            accept_all: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Accept);
+    }
+
+    /// When a config sets two permission booleans, the first-match order in
+    /// `resolve_config_mode` (yolo > accept_all > restrictive) decides — yolo
+    /// wins over a simultaneously-set `restrictive: true`.
+    #[test]
+    fn config_yolo_outranks_restrictive_when_both_set() {
+        let cli = cli::Cli::parse_from(["dirge"]);
+        let cfg = config::Config {
+            yolo: Some(true),
+            restrictive: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Yolo);
+    }
+
+    /// An unknown `default_permission_mode` value (e.g. a typo) falls back to
+    /// Standard rather than being silently mis-parsed — the documented guard
+    /// at the bottom of `resolve_config_mode`.
+    #[test]
+    fn unknown_default_permission_mode_falls_back_to_standard() {
+        let cli = cli::Cli::parse_from(["dirge"]);
+        let cfg = config::Config {
+            default_permission_mode: Some("restritctive".to_string()), // typo
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_mode(&cli, &cfg),
+            SecurityMode::Standard,
+            "unknown mode string must fall back to Standard, not panic"
+        );
+    }
 }
 
 /// dirge-o2bw — a present-but-unparseable `permission` config block
