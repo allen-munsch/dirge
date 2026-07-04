@@ -959,6 +959,7 @@ pub fn context_window_for_model(model: &str) -> Option<u64> {
         ("deepseek-r1", 128_000),
         ("deepseek", 128_000),
         // GLM / ZhipuAI
+        ("glm-5.2", 1_000_000),
         ("glm-4.6", 200_000),
         ("glm-4.5", 128_000),
         ("glm-4", 128_000),
@@ -1534,6 +1535,7 @@ mod model_context_tests {
             ("gemini-2.5-pro", 2_000_000),
             ("gemini-1.5-flash-002", 1_000_000),
             ("glm-4.6", 200_000),
+            ("glm-5.2", 1_000_000),
         ] {
             let got = context_window_for_model(model);
             assert_eq!(
