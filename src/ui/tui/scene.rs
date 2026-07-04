@@ -217,6 +217,28 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
             .saturating_sub(2);
         f.set_cursor_position((cursor_x.min(cursor_x_max), cursor_y.min(cursor_y_max)));
     }
+
+    // dirge-kk4i: --no-color is the LAST paint step. Widgets and the stored
+    // SourceBlock colors paint directly with raw Color:: literals that bypass
+    // theme::themed(); this single post-render pass over the whole frame buffer
+    // collapses EVERY cell's fg+bg to the terminal default. Skipped entirely
+    // when no_color() is off so the common case pays nothing. (The theme
+    // accessors and write_line/write_line_raw already remap their own colors;
+    // this catches everything else — panels, frames, markdown, borders.)
+    if crate::ui::theme::no_color() {
+        strip_colors(f.buffer_mut());
+    }
+}
+
+/// Pure core of the `--no-color` frame pass (dirge-kk4i): reset every cell's
+/// foreground AND background to the terminal default. Split out of
+/// [`render_frame`] so it's unit-testable without the set-once `no_color()`
+/// global — [`render_frame`] calls it with the whole frame buffer.
+fn strip_colors(buf: &mut ratatui::buffer::Buffer) {
+    for cell in buf.content.iter_mut() {
+        cell.fg = RColor::Reset;
+        cell.bg = RColor::Reset;
+    }
 }
 
 /// Paint a picker's candidate list over the bottom rows of the chat content
@@ -400,6 +422,31 @@ mod tests {
             })
             .collect();
         assert!(status_row.starts_with("ready"));
+    }
+
+    /// dirge-kk4i: `--no-color` must collapse EVERY painted cell's fg+bg to the
+    /// terminal default — including colors that bypassed `theme::themed()` (raw
+    /// `Color::` literals, stored SourceBlock colors). This drives the pure
+    /// `strip_colors` core directly because the `no_color()` global is set-once
+    /// and can't be toggled in a unit test.
+    #[test]
+    fn strip_colors_resets_every_cell_fg_and_bg() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 2));
+        // Simulate widgets that painted colors directly, bypassing themed().
+        buf[(0, 0)].fg = RColor::Red;
+        buf[(1, 0)].bg = RColor::Blue;
+        buf[(4, 1)].fg = RColor::Rgb(1, 2, 3);
+        buf[(4, 1)].bg = RColor::Green;
+
+        strip_colors(&mut buf);
+
+        for cell in buf.content.iter() {
+            assert_eq!(cell.fg, RColor::Reset, "fg not reset to default");
+            assert_eq!(cell.bg, RColor::Reset, "bg not reset to default");
+        }
     }
 
     /// A configured (non-Reset) theme background fills every cell's bg;

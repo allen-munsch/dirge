@@ -1129,6 +1129,7 @@ impl Renderer {
     /// only — visible the next time the user switches to that
     /// chat via Ctrl-N/P/X.
     pub fn write_line_to_chat(&mut self, idx: usize, text: &str, color: Color) -> io::Result<()> {
+        let color = crate::ui::theme::no_color_remap(color);
         if idx == self.active_chat {
             return self.write_line(text, color);
         }
@@ -2040,6 +2041,10 @@ impl Renderer {
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
+        // dirge-kk4i: --no-color must collapse stored chat colors too, not just
+        // theme-accessor colors. Remap at this chokepoint so the SourceBlock
+        // color is already the terminal default when --no-color is on.
+        let color = crate::ui::theme::no_color_remap(color);
         self.commit_partial();
         // dirge-qy3y: record as a width-independent source block (which renders
         // + appends the wrapped rows and seals any open stream) so it reflows
@@ -2059,6 +2064,7 @@ impl Renderer {
     /// narrowing resize either). One buffer row per `\n`-split line, so the
     /// chamber's `buffer_len()` index bookkeeping is unchanged vs `write_line`.
     pub fn write_line_raw(&mut self, text: &str, color: Color) -> io::Result<()> {
+        let color = crate::ui::theme::no_color_remap(color);
         self.commit_partial();
         self.commit_stream();
         let rows: Vec<LineEntry> = text
