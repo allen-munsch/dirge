@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-04
+
+Three focused changes on top of 0.17.0: the diff-aware code reviewer is now
+configurable and non-blocking by default, a terminal-recovery escape hatch,
+and a new provider.
+
+### Added
+- `code_review` config (`off` | `advisory` | `blocking`, default `advisory`)
+  plus a per-prompt `code_review` front-matter override, controlling how the
+  diff-aware reviewer engages. Advisory runs the review in the background after
+  a turn and surfaces all findings (high/critical included) as one non-blocking
+  `<system>` notice; blocking is the previous synchronous behavior (re-enters
+  the loop on high/critical); off disarms it entirely — no diff capture, no
+  judge call. Still requires `critic_provider`.
+- OpenCode provider — `--provider opencode` (the opencode.ai zen endpoint,
+  default model `deepseek-v4-flash`). Thanks @gretel.
+- Ctrl+L forces a full terminal redraw: re-enter the alternate screen,
+  re-enable mouse capture and bracketed paste, and repaint. Recovers a session
+  that was dropped to the main screen — mouse wheel scrolling the native
+  scrollback (the whole TUI scrolls off) and selection no longer being
+  captured, while the keyboard still works.
+
+### Changed
+- The diff-aware code reviewer no longer blocks the turn by default. It now
+  runs in the background (advisory mode) and reports findings as a non-blocking
+  notice instead of re-entering the loop and spending a react budget, so a
+  tight back-and-forth debug loop isn't held up waiting on a review. Set
+  `code_review = blocking` to restore the previous synchronous, re-entering
+  behavior.
+
 ## [0.17.0] - 2026-07-03
 
 A large security- and correctness-hardening release: the findings from a
