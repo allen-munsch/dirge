@@ -201,7 +201,7 @@ export DEEPSEEK_API_KEY="sk-..."
 dirge --provider deepseek  # defaults to deepseek-v4-pro
 
 export GLM_API_KEY="..."
-dirge --provider glm       # defaults to glm-4
+dirge --provider glm       # defaults to glm-5.2
 
 # Verbose mode — debug-level dirge logs + warn-level plugin hook errors
 dirge --verbose

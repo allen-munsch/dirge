@@ -36,7 +36,7 @@ pub fn default_model_for(provider_name: &str) -> &'static str {
         Some(ProviderKind::Anthropic) => "claude-sonnet-4-6",
         Some(ProviderKind::Gemini) => "gemini-2.0-flash",
         Some(ProviderKind::DeepSeek) => "deepseek-v4-pro",
-        Some(ProviderKind::Glm) => "glm-4",
+        Some(ProviderKind::Glm) => "glm-5.2",
         Some(ProviderKind::Ollama) => "llama3",
         // OpenRouter + Custom + unknown — keep the historical default
         // since OpenRouter wants the `vendor/model` form.
