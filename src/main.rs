@@ -9,6 +9,10 @@ mod event;
 mod extras;
 mod fs_atomic;
 mod hash;
+/// Shared request/response correlation core over `jsonrpc_framing`, used by
+/// both the LSP and DAP clients (each supplies a `Protocol` impl).
+#[cfg(any(feature = "lsp", feature = "dap"))]
+mod jsonrpc_client;
 /// Shared Content-Length framing for the stdio JSON-RPC protocols
 /// (LSP + DAP). Compiled only when at least one is enabled.
 #[cfg(any(feature = "lsp", feature = "dap"))]
