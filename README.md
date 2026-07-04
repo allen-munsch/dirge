@@ -45,27 +45,28 @@ The study covers conversational memory, not code semantics. For structural
 code questions dirge reaches for tree-sitter [semantic tools](docs/semantic.md)
 and [LSP](docs/lsp.md) rather than embeddings.
 
-## A 100k context budget, on purpose
+## A bounded context budget, on purpose
 
-dirge caps the working context at **100k tokens by default**
-([`context_target`](docs/config.md)), even on models that advertise 200k, 1M,
-or larger windows. The compaction decision treats the effective window as
-`min(model_window, context_target)`, so history folds to stay inside *your*
-budget rather than the model's full advertised size.
+dirge budgets the working context to **250k tokens by default**
+([`context_target`](docs/config.md)). The compaction decision treats the
+effective window as `min(model_window, context_target)`, so a model whose
+window is under the budget uses its own (a 128k model stays 128k), while
+models advertising 1M+ are held to 250k rather than folding on a fraction of
+their full window.
 
-This is deliberate, not a limitation. Effective context quality degrades well
-before the advertised window fills — the usable "smart zone" runs out around
-100k tokens regardless of whether the model claims 200k or 1M ([Chroma's
-context-rot research](https://garrit.xyz/posts/2026-05-06-dont-trust-large-context-windows)).
-Earlier, dirge computed compaction as a fraction of the *full* window, which let
-a session on a large-window model drift deep into the degradation zone before
-folding. Budgeting to 100k keeps the live context in the smart zone — with the
-default fold fraction it sits around 75k — so answer quality stays high and the
-per-turn token bill stays bounded instead of scaling with an unused million-token
-window. It also keeps cheaper models, which fall off fastest at long context, on
-the rails.
+Why bound it at all, and why 250k. Effective context quality does degrade as
+the window fills — but the degradation is gradual, not a cliff, and models
+diverge a lot past 100k ([RULER](https://arxiv.org/abs/2404.06654),
+[Chroma context-rot](https://research.trychroma.com/context-rot)). Newer models
+(DeepSeek V4, Claude Opus 4.x, Gemini) hold up well into the mid-hundreds of
+thousands, so a flat 100k cap left capable models' usable range on the table,
+while trusting a full 1M window would drift deep into the degradation zone.
+250k is the middle ground: enough headroom for models that earn it, bounded
+enough that the per-turn token bill doesn't scale with an unused million-token
+window. Set `context_target` lower (e.g. `100000`) for smaller local models or
+cost-sensitive routes, or higher if your model genuinely holds long context.
 
-A smaller live window would normally mean forgetting older work. dirge doesn't,
+A bounded live window would normally mean forgetting older work. dirge doesn't,
 because durable knowledge lives *outside* the live context. When history folds
 at the budget, dirge writes a resumable checkpoint and forms project memory —
 facts and pitfalls persisted in the session DB, not the transcript. Memory is
@@ -73,9 +74,9 @@ two-tiered: salient entries stay inline; the rest demote to a one-line
 breadcrumb index the agent dereferences or searches (FTS5) on demand, so
 specifics are recovered when needed instead of billed on every turn. A
 post-session orchestrator then extracts learnings into memory and skills and
-curates them. The result: long-horizon continuity with a small, high-quality
-window — the model reasons over ~100k of live context while the distilled state
-of a much longer session rides alongside it in memory. See
+curates them. The result: long-horizon continuity within a bounded window —
+the model reasons over the live budget while the distilled state of a much
+longer session rides alongside it in memory. See
 [docs/config.md](docs/config.md#context-window--compaction) for the knobs.
 
 ## Installation

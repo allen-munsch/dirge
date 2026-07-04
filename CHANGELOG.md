@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Default working-context budget (`context_target`) raised from 100k to **250k**
+  tokens. Context quality degrades gradually past ~100k rather than falling off
+  a cliff, and capable newer models (DeepSeek V4, Claude Opus 4.x, Gemini) hold
+  up well into the mid-hundreds of thousands — so a flat 100k cap left usable
+  range on the table. The effective window is still `min(model_window,
+  context_target)`, so smaller models are unaffected; set `context_target`
+  lower (e.g. `100000`) for small local models or cost-sensitive routes. Thanks
+  @gretel (#585).
+
 ## [0.18.2] - 2026-07-04
 
 ### Added
