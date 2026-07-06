@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.6] - 2026-07-06
+
+### Fixed
+- Question modal: in a multi-select question that allows a custom answer, you
+  couldn't submit once you'd typed one — Enter re-opened the text editor
+  instead of confirming, and Space did nothing on the `(custom)` row. Enter now
+  confirms once custom text exists; Space (re)opens the editor to edit the
+  answer in place; the footer shows `Space edit` on the custom row (dirge-72h2).
+
+### Changed
+- `review` and `review-security` prompts no longer deny the whole `bash` tool.
+  A whole-tool `bash` deny is terminal and pre-empted the default rules that
+  already allow read-only git, so the reviewer couldn't even run `git diff` /
+  `git log` to inspect the change under review. `bash` now flows through the
+  normal permission engine: read-only git and other pre-trusted commands are
+  allowed, while effectful/destructive commands (`git push`, `rm`, `curl`, …)
+  still prompt. `plan` mode keeps its full read-only lock (dirge-k265).
+
 ## [0.18.5] - 2026-07-06
 
 ### Added
