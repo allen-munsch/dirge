@@ -4,6 +4,25 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.7] - 2026-07-06
+
+### Fixed
+- DeepSeek/GLM reasoning was not being controlled as intended, verified against
+  the live hosted APIs. The tool-less one-shots (summarizer, critic, approval
+  evaluator) tried to disable reasoning with `chat_template_kwargs` — which the
+  hosted DeepSeek and GLM APIs silently ignore, so those calls kept reasoning
+  and paid the latency. They now send `thinking:{type:"disabled"}`. And DeepSeek
+  reasoning-effort was sent in the nested `reasoning:{effort}` shape it doesn't
+  honor; it's now sent top-level as `reasoning_effort` (which it does honor) and
+  can reach DeepSeek's `"max"` tier at the highest thinking level (dirge-r9k8,
+  dirge-f1su).
+
+### Changed
+- Internal: per-provider reasoning wire tuning (enable + disable shapes, effort
+  maps) is consolidated into a single `provider::adapter` module, so adding or
+  retuning a provider's reasoning is a one-line change instead of edits across
+  two files. Behavior-preserving (dirge-md5d).
+
 ## [0.18.6] - 2026-07-06
 
 ### Fixed
