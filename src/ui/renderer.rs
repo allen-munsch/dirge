@@ -506,6 +506,13 @@ pub struct Renderer {
     /// Timestamp of the most recent [`force_terminal_reassert`] — throttles
     /// the FocusGained → full-reassert → `?1004h` → FocusGained feedback loop.
     last_full_reassert: Option<std::time::Instant>,
+    /// Timestamp of the most recent `?1004h` write (focus-reporting arm),
+    /// either from [`force_terminal_reassert`] or [`reassert_terminal_modes`].
+    /// Used to suppress the alt-screen re-entry when a FocusGained event is
+    /// just the terminal acknowledging our own command rather than a real
+    /// focus change — avoids a visible blink even on terminals where `?2026`
+    /// synchronized output doesn't fully hide the screen-switch.
+    last_focus_reporting_write: Option<std::time::Instant>,
     /// Bumped each time scrollback eviction drains lines from the FRONT of
     /// `buffer`, which shifts every absolute line index down. Consumers
     /// holding an absolute index across appends (the Ctrl+O expansion
@@ -709,6 +716,7 @@ impl Renderer {
             last_paint: None,
             last_mode_reassert: None,
             last_full_reassert: None,
+            last_focus_reporting_write: None,
             eviction_generation: 0,
             #[cfg(test)]
             test_cols: None,
@@ -2782,6 +2790,13 @@ impl Renderer {
     /// which is why, in the broken state, the keyboard keeps working while
     /// the mouse stays dead.
     pub fn reassert_terminal_modes(&mut self) {
+        // Don't write to /dev/tty while the user is mid-drag selecting
+        // text: re-sending mouse-tracking enable sequences (?1003h et al.)
+        // resets internal tracking state on some terminals, dropping the
+        // drag so MouseUp never fires and copy_to_clipboard is never called.
+        if self.selection_active {
+            return;
+        }
         let now = std::time::Instant::now();
         if let Some(bytes) = mode_reassert_payload(self.last_mode_reassert, now) {
             if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
@@ -2789,6 +2804,7 @@ impl Renderer {
                 let _ = tty.flush();
             }
             self.last_mode_reassert = Some(now);
+            self.last_focus_reporting_write = Some(now);
         }
     }
 
@@ -2821,6 +2837,7 @@ impl Renderer {
         self.needs_paint = true;
         self.last_full_reassert = Some(std::time::Instant::now());
         self.last_mode_reassert = Some(std::time::Instant::now());
+        self.last_focus_reporting_write = Some(std::time::Instant::now());
     }
 
     /// Lightweight recovery for the automatic `FocusGained` path: re-arm SGR
@@ -2841,6 +2858,11 @@ impl Renderer {
     /// deliberately un-throttled. The manual Ctrl+L hatch still uses
     /// [`force_terminal_reassert`] for a genuine full recovery + clear.
     pub fn reassert_modes_light(&mut self) {
+        // Same guard as reassert_terminal_modes: writing mode-enable
+        // sequences to /dev/tty mid-drag drops the selection.
+        if self.selection_active {
+            return;
+        }
         let now = std::time::Instant::now();
         // Throttle: a terminal that echoes `FocusGained` on the `?1004h` in
         // TERMINAL_MODE_REASSERT would otherwise drive an unbounded re-arm →
@@ -2853,6 +2875,19 @@ impl Renderer {
             let _ = tty.flush();
         }
         self.last_mode_reassert = Some(now);
+        self.last_focus_reporting_write = Some(now);
+    }
+
+    /// True when a FocusGained event arrived within a short window of our
+    /// own `?1004h` write — meaning the terminal is just acknowledging our
+    /// focus-reporting arm, not reporting a real focus change. The caller
+    /// (FocusGained handler) should skip the alt-screen re-entry to avoid
+    /// a visible blink.
+    pub fn focus_gained_is_self_inflicted(&self) -> bool {
+        match self.last_focus_reporting_write {
+            None => false,
+            Some(t) => t.elapsed() < std::time::Duration::from_millis(200),
+        }
     }
 
     /// Test hook: the reassert payload that would be emitted *right now*,

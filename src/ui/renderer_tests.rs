@@ -1204,6 +1204,28 @@ fn force_terminal_reassert_is_throttled_against_feedback_loop() {
     );
 }
 
+/// After `force_terminal_reassert` or `reassert_terminal_modes` writes
+/// `?1004h`, `focus_gained_is_self_inflicted` must return true — the
+/// FocusGained handler should skip the alt-screen re-entry and just
+/// re-arm modes instead.
+#[test]
+fn focus_gained_is_self_inflicted_after_reassert() {
+    let mut r = Renderer::new().expect("renderer");
+
+    // Before any reassert: not self-inflicted (no ?1004h written yet).
+    assert!(
+        !r.focus_gained_is_self_inflicted(),
+        "no ?1004h write yet — not self-inflicted"
+    );
+
+    // After force_terminal_reassert: within 200ms window.
+    r.force_terminal_reassert();
+    assert!(
+        r.focus_gained_is_self_inflicted(),
+        "immediately after reassert — self-inflicted"
+    );
+}
+
 /// The throttle: re-assert on the first paint, then suppress until the
 /// interval elapses, then re-assert again. A leak that lands between paints
 /// is healed within one interval.

@@ -1643,7 +1643,17 @@ pub async fn run_interactive(
                                 // strobing on every alt-tab. We never leave the
                                 // alt screen on a focus change, so re-entry was
                                 // never needed. Ctrl+L keeps the full hatch.
-                                renderer.reassert_modes_light();
+                                //
+                                // Skip the alt-screen re-entry when FocusGained
+                                // is just the terminal acknowledging our own
+                                // ?1004h write — the screen switch causes a
+                                // visible blink even with ?2026 on some
+                                // terminals (vte/GNOME Terminal).
+                                if renderer.focus_gained_is_self_inflicted() {
+                                    renderer.reassert_modes_light();
+                                } else {
+                                    renderer.force_terminal_reassert();
+                                }
                                 renderer.request_repaint();
                                 continue;
                             }
