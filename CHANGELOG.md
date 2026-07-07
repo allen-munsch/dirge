@@ -4,6 +4,19 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.10] - 2026-07-06
+
+### Fixed
+- Mouse capture and text selection could stay dead until a manual `Ctrl+L`
+  after an external terminal reset (a terminal `reset`, a tmux/screen
+  detach+reattach, or a multiplexer that drops private modes). The automatic
+  recovery is event-driven (`FocusGained` re-asserts the terminal modes), but
+  that event only fires while focus reporting (`?1004`) is armed, and the
+  periodic self-heal re-armed mouse + paste but not focus reporting — so once
+  `?1004` was dropped the recovery went dark. The periodic reassert now also
+  re-arms `?1004`, so focus reporting self-heals within one interval and the
+  recovery keeps working (dirge-tc2q follow-up).
+
 ## [0.18.9] - 2026-07-06
 
 ### Fixed
