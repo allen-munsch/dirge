@@ -442,7 +442,8 @@ where
                     };
                 }
                 Ok(StreamedAssistantContent::Final(r)) => {
-                    token_usage = r.token_usage().map(|u| super::message::TokenUsage {
+                    let u = r.token_usage();
+                    token_usage = Some(super::message::TokenUsage {
                         input_tokens: u.input_tokens,
                         output_tokens: u.output_tokens,
                         cached_input_tokens: u.cached_input_tokens,

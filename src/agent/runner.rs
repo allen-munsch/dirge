@@ -125,6 +125,7 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
                     if !msg.content.is_empty() {
                         parts.push(UserContent::Text(Text {
                             text: msg.content.to_string(),
+                            additional_params: None,
                         }));
                     }
                     for img in &msg.images {

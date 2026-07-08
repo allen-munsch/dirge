@@ -445,6 +445,7 @@ fn build_user_content(parts: &[Value], asset_dir: Option<&std::path::Path>) -> O
                 {
                     user_parts.push(UserContent::Text(Text {
                         text: t.to_string(),
+                        additional_params: None,
                     }));
                 }
             }
@@ -458,6 +459,7 @@ fn build_user_content(parts: &[Value], asset_dir: Option<&std::path::Path>) -> O
                     Some(img) => user_parts.push(UserContent::Image(img)),
                     None => user_parts.push(UserContent::Text(Text {
                         text: format!("[image unavailable: {asset_id}]"),
+                        additional_params: None,
                     })),
                 }
             }
@@ -1324,8 +1326,11 @@ mod tests {
     struct NopModel;
 
     impl GetTokenUsage for NopStreamResponse {
-        fn token_usage(&self) -> Option<rig::completion::Usage> {
-            None
+        // rig 0.39 changed the trait return type from Option<Usage> to
+        // Usage. All-zeros is the "provider didn't report" sentinel per
+        // rig's own docs — functionally unchanged from the pre-0.39 None.
+        fn token_usage(&self) -> rig::completion::Usage {
+            rig::completion::Usage::default()
         }
     }
 

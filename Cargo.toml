@@ -185,14 +185,14 @@ libc = "0.2"
 # cargo-audit findings. The `rustls` feature on rig-core ensures the
 # reqwest TLS backend stays on the modern rustls 0.23 → webpki 0.103
 # stack rather than the legacy 0.21 pathway.
-rig = { version = "0.37", default-features = false, features = ["rmcp"] }
+rig = { version = "0.39", default-features = false, features = ["rmcp"] }
 # Explicit dep to pin feature flags. Without this, rig (our only
 # dep on rig-core) enables `derive` and `reqwest` via its own
 # feature resolution, but we want `rustls` explicitly declared so
 # future readers understand the TLS backend choice is deliberate.
 # cargo-machete reports this as unused — the package.metadata
 # block at the top of this file suppresses that false positive.
-rig-core = { version = "0.37", default-features = false, features = ["reqwest", "derive", "rustls"] }
+rig-core = { version = "0.39", default-features = false, features = ["reqwest", "derive", "rustls"] }
 # Macros for emitting `Stream<Item = …>` from async generator-style
 # code blocks. Used by `agent_loop::rig_stream` to wrap rig's
 # `StreamingCompletionResponse` into our pi-style `StreamEvent`

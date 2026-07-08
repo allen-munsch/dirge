@@ -853,6 +853,7 @@ mod tests {
             content: OneOrMany::many(vec![
                 UserContent::Text(Text {
                     text: "hi".to_string(),
+                    additional_params: None,
                 }),
                 UserContent::Image(Image {
                     data: DocumentSourceKind::Url("dirge-asset:abc".to_string()),
