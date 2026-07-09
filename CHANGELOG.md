@@ -4,6 +4,29 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.3] - 2026-07-08
+
+### Added
+- Opt-in desktop notifications on macOS, Linux, and Windows, backed by
+  `notify-rust`: a notification banner on macOS, a freedesktop D-Bus
+  notification on Linux (pure-Rust `zbus`, no libdbus dependency; needs a
+  running notification daemon), and a WinRT toast on Windows. Enable with
+  `desktop_notifications.enabled`; notifies on run completion and when a
+  permission prompt, question, or plugin dialog is waiting for input. Extends
+  the macOS-only backend from #611 to all three platforms (GH #594).
+
+### Fixed
+- Background review left the avatar showing the idle `(^_^)` face while the
+  runner was still busy (the `/plan` reviewer or a plugin hook chain keeps
+  `is_running` true after a turn's visible output ends). Since `is_running`
+  also routes a typed message to send-vs-queue, messages typed against the
+  idle-looking avatar were queued behind the busy runner and could be dropped.
+  The idle face is now deferred until the turn actually settles idle, so the
+  indicator matches the real run state (dirge-79ue, GH #621).
+- Three `cargo audit` advisories in the dependency graph: `anyhow`
+  (RUSTSEC-2026-0190), `crossbeam-epoch` (RUSTSEC-2026-0204, via an `ignore`
+  pin), and `quinn-proto` (RUSTSEC-2026-0185) bumped to fixed versions (#623).
+
 ## [0.19.2] - 2026-07-08
 
 ### Fixed
