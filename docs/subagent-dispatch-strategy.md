@@ -1,103 +1,135 @@
-# Subagent Dispatch Strategy and Worktree-Isolated Writers
+# Coordinated Subagents
 
-## Status
+Dirge can coordinate background subagents so the main agent can split independent research, implementation, and review work across specialized profiles. Instead of reacting to each result as it arrives, dirge waits for the current batch to finish and gives the main agent one reconciliation update.
 
-Implemented coordinator runtime contract. Coordinator dispatch, profile activation, batch delivery, and retry behavior describe the current runtime. Worktree-isolated writer behavior below is the live isolation contract: implementations must preserve these guarantees when isolation is available. This document lists verification to run; it does not claim those commands have passed.
+This feature is opt-in. Without `subagent_dispatch_strategy`, `task` works as a normal independent subagent tool.
 
-## Scope
+> Coordinated dispatch runs in the interactive TUI. It is not enabled for `--print`, ACP, or other noninteractive runs.
 
-The coordinator is available only to the interactive TUI's `BackgroundStore`. It is not enabled for `--print`, ACP, or other noninteractive paths; `full` warns and behaves as `off` there. The manual `/orchestrate` and `/delegate` plugins remain proof-of-concept workflows and must not be combined with core `full` coordination.
+## Quick start
 
-The main agent owns planning, durable context, reconciliation, integration, and final verification. It provides the user one final concise summary, not intermediate batch summaries.
+Create one read-only and one read-write agent profile, then enable coordinated dispatch in `~/.config/dirge/config.json` or your project configuration:
 
-## Configuration
-
-```json
+```jsonc
 {
   "subagent_dispatch_strategy": "full",
-  "subagent_write_isolation": "auto"
+  "subagent_write_isolation": "auto",
+  "agents": {
+    "researcher": {
+      "model": "haiku",
+      "description": "Investigates the repository and reports findings",
+      "subagent": {
+        "tools": "readonly",
+        "max_turns": 15
+      }
+    },
+    "implementer": {
+      "model": "sonnet",
+      "description": "Implements isolated changes and verifies them",
+      "subagent": {
+        "tools": "readwrite",
+        "max_turns": 25,
+        "timeout_secs": 900
+      }
+    }
+  }
 }
 ```
 
-Both fields are tolerant `Option<String>` wire values, trimmed and case-normalized:
+Restart dirge after changing configuration. At startup, dirge resolves the eligible profiles and enables coordination only when it has both a `readonly` and a `readwrite` profile with tools available.
 
-- `subagent_dispatch_strategy`: `off` (default), `optional`, or `full`. Missing, empty, and invalid values resolve to `off`; invalid values warn and never enable coordination.
-- `subagent_write_isolation`: `auto` (default), `worktree`, or `serialize`. Missing, empty, and invalid values resolve to `auto`; invalid values warn.
-- Prefer `subagent.tools: "readwrite"`; do not use `"full"`, which is ambiguous with strategy mode.
+For the full profile format, precedence rules, and regular `task(agent="…")` use, see [Agent profiles](agents.md).
 
-`optional` permits direct trivial work. When it starts coordinated work, it follows the same batch, retry, isolation, reconciliation, and final-summary rules as `full`. `full` dispatches substantive tier-routed research, implementation, and review work.
+## Dispatch strategies
 
-Coordinator profiles are resolved from loaded agent definitions, not process-global route state. Readonly and readwrite profiles are deterministic by name; toolless profiles satisfy neither tier. `optional` enables only when both tiers exist, otherwise warns and degrades to `off`. `full` requires both tiers and fails interactive startup with a diagnostic when either is absent; it also fails when tools are disabled. Route resolution occurs at process startup, so `/cd` does not reload routes.
+Set `subagent_dispatch_strategy` to one of these values:
 
-## Dispatch, retry, and batch barrier
+- **`off`** — the default. `task(background=true)` results are delivered independently.
+- **`optional`** — the main agent may handle small tasks directly, but uses coordinated batches when it delegates work.
+- **`full`** — substantive routed work is delegated as coordinated background tasks.
 
-While enabled, every `task(background=true)` subagent dispatch is tracked in a coordinator generation, including default and toolless subagents. Background shells use a separate store and are unaffected.
+Invalid or empty values resolve to `off` with a warning. `optional` warns and disables coordination if the required profiles are unavailable. `full` reports a startup error instead, so a missing profile or disabled tools cannot silently change its behavior.
 
-- The first tracked task opens a generation. Later tracked tasks join it until delivery, even if another member has completed.
-- A generation is deliverable only after every member is terminal. A missing task record becomes a synthetic failure rather than leaving the barrier open.
-- Delivery atomically emits one reconciliation continuation, removes the generation's pending notifications, records history, and closes the generation. The next dispatch opens the next generation.
-- Notification draining, pending-notification checks, idle resume, interjections, and normal follow-ups respect this barrier. Partial results do not reach the model or trigger a phantom turn.
-- `task_status(wait=true)` does not reveal a partial payload for an active generation; it reports that reconciliation will deliver the result.
-- At most four background subagents run in a wave.
+## Profiles used for coordination
 
-`retry_of` is coordinator-only and requires `background=true`. It may name one known failed tracked task after delivery. Completed, running, cancelled, unknown, and already-retried tasks are rejected. Accepting a retry links both records; a second retry is rejected and the main agent repairs the work directly.
+A coordinating session needs both of these profile tiers:
 
-In `full`, tier-routed readonly and readwrite work requires `background=true`; inexpensive toolless foreground requests remain allowed. Every readwrite dispatch, foreground or background, passes writer-mutation safety checks.
+- **`readonly`** profiles can inspect the repository, search files, and use enabled web tools. Use them for research, review, and investigation.
+- **`readwrite`** profiles can also edit files and run commands. Use them for implementation work.
 
-## Writer isolation
+Profiles with `subagent.tools: "toolless"` do not satisfy either coordinator tier. The `allow` and `deny` fields can narrow a profile's tool set, but cannot grant tools outside its tier.
 
-Writer isolation resolves as follows:
+Useful subagent settings are:
 
-- `serialize` uses the parent checkout and permits only one active serialized writer.
-- `worktree` requires isolation prerequisites and rejects the writer if any prerequisite is unavailable.
-- `auto` uses an isolated worktree when possible; otherwise it logs the reason and serializes writers in the parent checkout.
+- `tools`: `toolless`, `readonly`, or `readwrite`.
+- `max_turns`: maximum number of turns for a tooled subagent. The default is 25.
+- `timeout_secs`: wall-clock timeout in seconds. Dirge clamps it to 30 through 3600 seconds.
+- `allow` and `deny`: restrict the selected tier's tool set further.
 
-Isolated writers may run concurrently, subject to the four-subagent cap. Serialized writers cannot overlap, including with a foreground parent-checkout writer.
+In Markdown profiles, use the corresponding frontmatter names:
 
-A worktree requires the `git-worktree` feature, a canonical Git session repository, a clean parent working tree according to `git status --porcelain`, supported sandbox mode, and successful worktree creation. Ignored scratch files do not make that porcelain status dirty. The clean-parent requirement prevents writers from missing uncommitted parent changes because linked worktrees begin at committed `HEAD`.
-
-Names use a safe full task UUID: `dirge-task-<task-uuid>` for both the branch and sibling worktree directory. Creation validates repository, branch, and directory inputs, uses argument vectors and Git `--` separators where supported, and cleans up a newly created worktree if later setup fails.
-
-MicroVM does not support isolated writers: `auto` warns and serializes, `worktree` rejects, and `serialize` remains shared-checkout behavior.
-
-## Rooted writer tools and sandboxing
-
-An isolated writer receives newly constructed, restricted tools rooted at its worktree; it never receives parent shared tool instances.
-
-- File tools resolve relative paths from the root and reject absolute, traversal, ancestor, and symlink escapes outside it.
-- Search and navigation tools default omitted paths to the root.
-- Bash starts with the worktree as its current directory.
-- Tools that cannot enforce the root are excluded.
-- The permission checker is cloned and retargeted to the root, so in-root paths are internal; root confinement runs before that checker.
-
-For an isolated writer under Bwrap, the runtime binds `/` read-only, the writer worktree read-write at its original path, and `<main-repo>/.git` read-write at its original path; the parent checkout working tree remains read-only. The command runs from the writer worktree. The `.git` mount is required for linked-worktree metadata, commits, objects, refs, and index updates.
-
-The writer preamble identifies the root and branch, prohibits parent-checkout modification, and requires the writer to inspect status, stage intended changes, make one descriptive commit, and report the commit hash, changed files, tests run, and unresolved issues.
-
-## Preservation and reconciliation
-
-Rust never auto-merges writer branches. The coordinator retains committed worktrees for reconciliation and merges valid branches through normal Git tools after resolving conflicts against the retained plan. Reviewers inspect the integrated parent tree only after that merge.
-
-Clean worktrees without useful committed work may be removed best-effort. Failed, timed-out, and cancelled worktrees are removed only when clean and contain no commits. Dirty worktrees and clean committed worktrees remain for salvage, and `cancel_all()` performs the same retention-aware cleanup. Crash leftovers are recoverable with `git worktree prune`.
-
-The single terminal reconciliation continuation includes every dispatch's original prompt and outcome, retry status, output-relay reference when applicable, and writer branch, path, commits, clean/dirty state, and retained salvage path. Before the next dispatch, repair, merge, or verification decision, the coordinator creates an internal status summary covering completed work, failures, remaining requirements, required verification, and the next action.
-
-## Verification
-
-The runtime has focused checks for configuration tolerance; profile resolution and activation; timeout and route metadata; generation barriers and synthetic failures; retry limits; writer exclusion and isolation fallback; worktree validation and clean-only cleanup; rooted path and Bash confinement; permission scoping; Bwrap commit behavior with an unchanged parent source tree; and reconciliation metadata. Run the relevant checks below when changing those areas.
-
-Run the relevant checks, including:
-
-```bash
-cargo fmt --check
-cargo test --bin dirge coordinator
-cargo test --bin dirge background
-cargo test --bin dirge task
-cargo test --bin dirge agent_defs
-cargo test --bin dirge git_worktree
-cargo test --no-default-features --features loop --bin dirge coordinator
-cargo clippy --all-targets -- -D warnings
-cargo test --bin dirge
+```markdown
+---
+description: Repository investigator
+subagent_tools: readonly
+subagent_max_turns: 15
+subagent_timeout_secs: 600
+subagent_deny: [webfetch]
+---
+Investigate the requested area, cite relevant files, and return concise findings.
 ```
 
-The no-default-feature coordinator check verifies the unavailable-isolation contract: `auto` serializes and `worktree` reports an actionable error when Git-worktree support is not compiled.
+## How a coordinated batch works
+
+The main agent starts subagents with `task(background=true)`. A batch can include up to four running subagents.
+
+Dirge collects all terminal results in the current batch before continuing the coordinator. The reconciliation update includes each task's prompt and outcome, retry information, and—when a writer ran in a worktree—its branch, path, commits, and retention status.
+
+This prevents the main agent from acting on a partial implementation while another task in the same batch is still running. Background shell commands are separate from subagent dispatch and are not part of this barrier.
+
+### Retries
+
+A failed coordinated task can be retried once with `retry_of=<task-id>`. The original task must be a known failed coordinator task. Completed, running, cancelled, unknown, and already-retried tasks cannot be retried.
+
+Cancelled work is intentionally not retryable: the main agent should decide whether to start new work after the cancellation rather than treating it as an ordinary task failure.
+
+## Read-write subagents and worktrees
+
+Read-write subagents can modify code. Set `subagent_write_isolation` to choose where they work:
+
+- **`auto`** — the default. Dirge creates an isolated Git worktree when it can; otherwise it warns and runs one serialized writer in the parent checkout.
+- **`worktree`** — require a worktree. The dispatch fails if isolation is unavailable.
+- **`serialize`** — always use the parent checkout and allow only one writer at a time.
+
+Worktree isolation requires a Git repository with a clean parent checkout, the `git-worktree` feature, and a supported sandbox. It is unavailable in the MicroVM sandbox. In `auto` mode, unavailable isolation falls back to serialized parent-checkout execution; in `worktree` mode, it fails instead.
+
+An isolated writer gets a newly built tool registry rooted at its own worktree. Its file, search, navigation, and shell tools are confined to that checkout. Background shell jobs also use a writer-local store, so the writer cannot inspect or terminate the parent agent's shell jobs.
+
+Worktrees and branches use a `dirge-task-<task-uuid>` name. The writer is instructed to inspect its status, make a descriptive commit, run relevant checks, and report its commit, changed files, tests, and unresolved issues.
+
+### Reconciliation and cleanup
+
+Dirge does not automatically merge a writer branch. The main agent reviews the result, chooses whether to merge it, and performs any integration and final verification in the main checkout.
+
+A dirty worktree or a worktree containing commits is retained for recovery. A clean worktree with no commits may be removed. If a session is cancelled, the same retention rule applies, so useful committed work remains available at the reported salvage path.
+
+## Operational limits
+
+- Coordinated subagents must run in the background. Read-write coordinator profiles cannot run as foreground tasks because their isolation and lifecycle tracking are background-only.
+- At most four background subagents run at once.
+- The coordinator is separate from the manual `orchestrator.janet` and `delegate.janet` plugin workflows. Do not combine them in the same session.
+- `/cd` does not reload coordinator profiles. Restart dirge after changing profile definitions or project directory configuration.
+
+## Troubleshooting
+
+- **Coordinator mode does not start:** ensure tools are enabled and that loaded profiles include both `readonly` and `readwrite` tiers. `full` prints the missing tier at startup.
+- **A writer runs in the parent checkout:** `auto` could not create an isolated worktree, commonly because the parent checkout has uncommitted changes, Git worktree support is unavailable, or the active sandbox does not support it.
+- **A writer dispatch fails immediately:** use `auto` for fallback behavior, or fix the repository/sandbox prerequisite required by `worktree` mode.
+- **A writer's changes are not in the main branch:** this is expected. Inspect the reconciliation result and merge the reported branch deliberately.
+- **A task result has not appeared yet:** a coordinated batch is delivered only after every task in that batch reaches a terminal state. Do not poll for partial output; continue other work or wait for the reconciliation update.
+
+## Related documentation
+
+- [Agent profiles](agents.md) for defining subagent profiles and their tool policies.
+- [Permissions](permissions.md) for the authorization policy that still applies to subagent tool calls.
+- [Configuration](config.md) for sandbox and other runtime configuration.
