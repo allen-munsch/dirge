@@ -4,6 +4,31 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.8] - 2026-07-15
+
+### Changed
+- Issues and todos are now distinct. Creating an issue files it to a passive
+  backlog (unassigned) instead of the active work queue, so filing something
+  for later no longer trips the finish-your-work nudge (the loop the model got
+  stuck in when you asked it to "add an issue for X"). `issue start` claims a
+  backlog item onto your active queue; `write_todo_list` still writes active
+  work. The turn-start reminder is split into an "Active work queue" section
+  (with a "Currently in progress" callout) and a "Backlog" section, so the
+  model has a clear current task each turn (#668).
+- Issue ids are now beads-style hashes (`drg-a1b2`) instead of integers.
+  Existing issue databases migrate on first open.
+
+### Added
+- Issues can be grouped under an epic: `issue create epic=<id>` files under a
+  parent, and `issue show <id>` lists an epic's children.
+- An advisory nudge when the model edits files without any tracked todo, so
+  active work reliably lands on the list.
+
+### Fixed
+- Restating a todo as completed with different casing or spacing now closes the
+  existing item instead of leaving the finished task stuck on the board behind
+  a duplicate.
+
 ## [0.19.7] - 2026-07-14
 
 ### Fixed
