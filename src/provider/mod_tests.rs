@@ -655,9 +655,16 @@ async fn in_loop_compaction_refuses_anthropic_oauth_without_summarization_provid
     let cfg = crate::config::Config::default();
     let client = rig::providers::anthropic::Client::builder()
         .api_key("sk-ant-oat-test")
-        .http_client(crate::provider::anthropic_http::AnthropicHttpClient::new(
-            "sk-ant-oat-test".to_string(),
-        ))
+        .http_client(
+            crate::provider::compressing_http::CompressingHttpClient::new(
+                crate::provider::anthropic_http::AnthropicHttpClient::new(
+                    "sk-ant-oat-test".to_string(),
+                ),
+                llmtrim_core::ir::ProviderKind::Anthropic,
+                std::sync::Arc::new(crate::compression::dirge_default_config()),
+                true,
+            ),
+        )
         .build()
         .expect("Anthropic OAuth client builds");
     let model = crate::provider::AnyModel::AnthropicOauth(client.completion_model("claude-sonnet"));
@@ -679,9 +686,16 @@ fn ui_compaction_refuses_anthropic_oauth_without_summarization_provider() {
     let main_client = crate::provider::AnyClient::AnthropicOauth(
         rig::providers::anthropic::Client::builder()
             .api_key("sk-ant-oat-test")
-            .http_client(crate::provider::anthropic_http::AnthropicHttpClient::new(
-                "sk-ant-oat-test".to_string(),
-            ))
+            .http_client(
+                crate::provider::compressing_http::CompressingHttpClient::new(
+                    crate::provider::anthropic_http::AnthropicHttpClient::new(
+                        "sk-ant-oat-test".to_string(),
+                    ),
+                    llmtrim_core::ir::ProviderKind::Anthropic,
+                    std::sync::Arc::new(crate::compression::dirge_default_config()),
+                    true,
+                ),
+            )
             .build()
             .expect("Anthropic OAuth client builds"),
     );

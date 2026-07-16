@@ -22,18 +22,18 @@ use super::summarize;
 const OPENAI_CODEX_OAUTH_DEFAULT_MODEL: &str = "gpt-5.5";
 
 pub enum AnyClient {
-    OpenRouter(openrouter::Client),
+    OpenRouter(openrouter::Client<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     OpenAI(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
-    ChatGptOpenAI(openai::Client<CodexHttpClient>),
+    ChatGptOpenAI(openai::Client<super::compressing_http::CompressingHttpClient<CodexHttpClient>>),
     OpenAICodex(chatgpt::Client),
-    Anthropic(anthropic::Client),
-    AnthropicOauth(anthropic::Client<AnthropicHttpClient>),
-    Gemini(gemini::Client),
+    Anthropic(anthropic::Client<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    AnthropicOauth(anthropic::Client<super::compressing_http::CompressingHttpClient<AnthropicHttpClient>>),
+    Gemini(gemini::Client<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     DeepSeek(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     Glm(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
-    OpenCode(openai::CompletionsClient),
-    Ollama(ollama::Client),
-    Custom(openai::CompletionsClient),
+    OpenCode(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Ollama(ollama::Client<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Custom(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
 }
 
 impl AnyClient {
@@ -309,20 +309,20 @@ mod resolve_model_name_tests {
 
 #[derive(Clone)]
 pub enum AnyModel {
-    OpenRouter(openrouter::completion::CompletionModel),
+    OpenRouter(openrouter::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     OpenAI(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
-    ChatGptOpenAI(openai::responses_api::ResponsesCompletionModel<CodexHttpClient>),
+    ChatGptOpenAI(openai::responses_api::ResponsesCompletionModel<super::compressing_http::CompressingHttpClient<CodexHttpClient>>),
     OpenAICodex(chatgpt::ResponsesCompletionModel),
-    Anthropic(anthropic::completion::CompletionModel),
+    Anthropic(anthropic::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     AnthropicOauth(
-        anthropic::completion::CompletionModel<super::anthropic_http::AnthropicHttpClient>,
+        anthropic::completion::CompletionModel<super::compressing_http::CompressingHttpClient<super::anthropic_http::AnthropicHttpClient>>,
     ),
-    Gemini(gemini::completion::CompletionModel),
+    Gemini(gemini::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     DeepSeek(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     Glm(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
-    OpenCode(openai::completion::CompletionModel),
-    Ollama(ollama::CompletionModel),
-    Custom(openai::completion::CompletionModel),
+    OpenCode(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Ollama(ollama::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Custom(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
 }
 
 impl AnyModel {

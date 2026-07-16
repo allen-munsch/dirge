@@ -27,3 +27,6 @@ whatlang = "0.18.0"
 
 [features]
 default = []
+skeleton = []
+tiktoken = []
+multimodal = []

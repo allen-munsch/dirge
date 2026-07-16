@@ -1,18 +1,6 @@
 #[cfg(feature = "compression")]
 use anyhow::{Context as _, Result};
 
-/// Convenience: rewrite a request body using a named config preset.
-#[cfg(feature = "compression")]
-pub fn rewrite(
-    body: &str,
-    provider: llmtrim_core::ir::ProviderKind,
-    preset: &str,
-) -> Result<String> {
-    let result = llmtrim_core::rewrite_request(body, Some(provider), Some(preset))
-        .context("llmtrim-core rewrite_request failed")?;
-    Ok(result.request_json)
-}
-
 /// Dirge's default compression config: "lossless + tool-output windowing, no
 /// output-shaping" — the A/B-validated safe default.
 #[cfg(feature = "compression")]
@@ -59,8 +47,9 @@ mod tests {
     #[test]
     fn smoke_openai_safe() {
         let body = r#"{"model":"x","messages":[{"role":"user","content":"hi"}],"max_tokens":5}"#;
-        let out = rewrite(body, llmtrim_core::ir::ProviderKind::OpenAi, "safe")
-            .expect("rewrite should succeed");
+        let cfg = config_for_preset("safe");
+        let out = rewrite_with(body, llmtrim_core::ir::ProviderKind::OpenAi, &cfg)
+            .expect("rewrite_with should succeed");
         let parsed: serde_json::Value =
             serde_json::from_str(&out).expect("output should be valid JSON");
         let content = parsed["messages"][0]["content"]
