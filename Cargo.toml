@@ -3,7 +3,7 @@
 # taken on crates.io. The installed BINARY is still `dirge` (see [[bin]]),
 # so users run: `cargo install dirge-agent` then the `dirge` command.
 name = "dirge-agent"
-version = "0.19.8"
+version = "0.19.9"
 edition = "2024"
 # MSRV: edition 2024 needs 1.85, but the dependency tree (time, serde_with,
 # darling, instability) requires 1.88 — pin there so older toolchains fail
@@ -22,6 +22,7 @@ categories = ["command-line-utilities", "development-tools"]
 # compile-time-embedded `prompts/` (include_dir!) is deliberately NOT
 # excluded — it must ship.
 exclude = [
+    "vendor/",
     "spikes/",
     "img/",
     "docs/",
@@ -159,6 +160,17 @@ experimental-ui-computer-use = []
 # and an entity_search module. PRISM #393.
 experimental-graph-search = []
 
+# The inlined llmtrim engine (src/llmtrim) carries upstream
+# `#[cfg(feature = "skeleton"/"tiktoken"/"multimodal")]` blocks whose
+# crates we deliberately dropped. Declare those cfg names via check-cfg
+# (below) rather than as real features, so the code stays permanently
+# excluded — `--all-features` can't accidentally enable it — while
+# rustc's unexpected-cfg lint stays quiet under `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("skeleton", "tiktoken", "multimodal"))',
+] }
+
 [target.'cfg(unix)'.dependencies]
 # Used by the bash tool for process-group cleanup on timeout
 # (F6) — `killpg(pgid, SIGKILL)` to terminate the whole subshell
@@ -245,7 +257,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # sequences as literal characters.
 ansi-to-tui = "8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-util", "signal"] }
 anyhow = "1.0.103"
 # Already transitive via rig's `http_client` API (rig re-exports `bytes::Bytes`
@@ -337,6 +349,18 @@ yaml-rust2 = "0.11"
 nucleo-matcher = "0.3"
 url = "2"
 vt100 = "0.16.2"
+
+# --- compression-engine deps (always-on; was optional via `compression` feature) ---
+bm25 = { version = "2.3.2" }
+csv = { version = "1.4.0" }
+gaoya = { version = "0.2.0" }
+once_cell = { version = "1.21.4" }
+stop-words = { version = "0.10.0" }
+toml = { version = "1.1.2" }
+toon-format = { version = "0.5.0", default-features = false }
+unicode-normalization = { version = "0.1.25" }
+unicode-segmentation = { version = "1.13.3" }
+whatlang = { version = "0.18.0" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -5,6 +5,7 @@ mod auth;
 #[cfg(any(feature = "lsp", feature = "dap", feature = "mcp"))]
 mod child_guard;
 mod cli;
+mod compression;
 mod config;
 mod context;
 #[cfg(feature = "dap")]
@@ -21,6 +22,7 @@ mod jsonrpc_client;
 /// (LSP + DAP). Compiled only when at least one is enabled.
 #[cfg(any(feature = "lsp", feature = "dap"))]
 mod jsonrpc_framing;
+mod llmtrim;
 #[cfg(feature = "lsp")]
 mod lsp;
 mod permission;
@@ -536,6 +538,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = config::load();
+
+    crate::compression::init_from_config(
+        cfg.compression.as_ref().and_then(|c| c.enabled),
+        cfg.compression.as_ref().and_then(|c| c.preset.clone()),
+    );
 
     // Handle subcommands that exit before the TUI starts.
     if let Some(ref command) = cli.command {
