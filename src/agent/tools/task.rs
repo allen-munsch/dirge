@@ -1249,6 +1249,7 @@ mod tests {
         use rig::client::CompletionClient;
 
         let openai = rig::providers::openai::CompletionsClient::builder()
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
             .api_key("test-key")
             .build()
             .unwrap()

@@ -153,10 +153,11 @@ fn fallback_list_covers_canonical_alternatives() {
 /// called during these tests, so construction stays offline.
 fn build_openai_any_agent() -> AnyAgent {
     use rig::providers::openai;
-    let client = openai::CompletionsClient::builder()
-        .api_key("test-key")
-        .build()
-        .expect("openai CompletionsClient::new should work");
+        let client = openai::CompletionsClient::builder()
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
+            .api_key("test-key")
+            .build()
+            .expect("openai CompletionsClient::new should work");
     let model = client.completion_model("gpt-4o");
     let agent = rig::agent::AgentBuilder::new(model).build();
     AnyAgent::new(
@@ -309,6 +310,7 @@ async fn any_model_filtered_stream_fn_hides_unloaded_dynamic_tools() {
     });
 
     let client = openai::CompletionsClient::builder()
+        .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
         .api_key("test-key")
         .base_url(&base_url)
         .build()

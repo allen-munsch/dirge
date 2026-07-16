@@ -79,6 +79,7 @@ default = [
     'semantic-elixir',
     'semantic-sql',
     'semantic-dafny',
+    'compression',
     'slash-completion',
     'mcp-server',
 ]
@@ -108,6 +109,7 @@ windows-default = [
     'semantic-elixir',
     'semantic-sql',
     'semantic-dafny',
+    'compression',
     'slash-completion',
     'mcp-server',
 ]
@@ -158,6 +160,7 @@ experimental-ui-computer-use = []
 # Opt-in: creates two new SQLite tables (entities, relations)
 # and an entity_search module. PRISM #393.
 experimental-graph-search = []
+compression = ["dep:llmtrim-core"]
 
 [target.'cfg(unix)'.dependencies]
 # Used by the bash tool for process-group cleanup on timeout
@@ -182,6 +185,10 @@ notify-rust = { version = "4", default-features = false }
 notify-rust = { version = "4", default-features = false, features = ["z"] }
 
 [dependencies]
+# Vendored compression engine (llmtrim-core). Self-contained path dep behind
+# the `compression` feature (on by default); disable at runtime with
+# DIRGE_COMPRESSION=0 or the [compression] config section.
+llmtrim-core = { path = "vendor/llmtrim-core", default-features = false, optional = true }
 # CVE-2026 audit (2026-05-27): rig's default features pull a
 # sprawling transitive tree:
 #

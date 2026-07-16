@@ -23,14 +23,14 @@ const OPENAI_CODEX_OAUTH_DEFAULT_MODEL: &str = "gpt-5.5";
 
 pub enum AnyClient {
     OpenRouter(openrouter::Client),
-    OpenAI(openai::CompletionsClient),
+    OpenAI(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     ChatGptOpenAI(openai::Client<CodexHttpClient>),
     OpenAICodex(chatgpt::Client),
     Anthropic(anthropic::Client),
     AnthropicOauth(anthropic::Client<AnthropicHttpClient>),
     Gemini(gemini::Client),
-    DeepSeek(openai::CompletionsClient),
-    Glm(openai::CompletionsClient),
+    DeepSeek(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Glm(openai::CompletionsClient<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     OpenCode(openai::CompletionsClient),
     Ollama(ollama::Client),
     Custom(openai::CompletionsClient),
@@ -310,7 +310,7 @@ mod resolve_model_name_tests {
 #[derive(Clone)]
 pub enum AnyModel {
     OpenRouter(openrouter::completion::CompletionModel),
-    OpenAI(openai::completion::CompletionModel),
+    OpenAI(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     ChatGptOpenAI(openai::responses_api::ResponsesCompletionModel<CodexHttpClient>),
     OpenAICodex(chatgpt::ResponsesCompletionModel),
     Anthropic(anthropic::completion::CompletionModel),
@@ -318,8 +318,8 @@ pub enum AnyModel {
         anthropic::completion::CompletionModel<super::anthropic_http::AnthropicHttpClient>,
     ),
     Gemini(gemini::completion::CompletionModel),
-    DeepSeek(openai::completion::CompletionModel),
-    Glm(openai::completion::CompletionModel),
+    DeepSeek(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
+    Glm(openai::completion::CompletionModel<super::compressing_http::CompressingHttpClient<reqwest::Client>>),
     OpenCode(openai::completion::CompletionModel),
     Ollama(ollama::CompletionModel),
     Custom(openai::completion::CompletionModel),

@@ -7,6 +7,8 @@ mod child_guard;
 mod cli;
 mod config;
 mod context;
+#[cfg(feature = "compression")]
+mod compression;
 #[cfg(feature = "dap")]
 mod dap;
 mod event;

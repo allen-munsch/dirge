@@ -538,6 +538,7 @@ mod tests {
         use rig::client::CompletionClient;
         use rig::providers::openai;
         let client = openai::CompletionsClient::builder()
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
             .api_key("test-key")
             .build()
             .expect("openai client");

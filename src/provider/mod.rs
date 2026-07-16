@@ -6,6 +6,7 @@ mod billing_fallback;
 mod build;
 pub mod client;
 pub(crate) mod codex_http;
+pub(crate) mod compressing_http;
 mod dispatch;
 mod resolve;
 mod run;
@@ -196,7 +197,7 @@ pub struct AnyAgent {
 #[derive(Clone)]
 pub(crate) enum AnyAgentInner {
     OpenRouter(Agent<openrouter::completion::CompletionModel>),
-    OpenAI(Agent<openai::completion::CompletionModel>),
+    OpenAI(Agent<openai::completion::CompletionModel<compressing_http::CompressingHttpClient<reqwest::Client>>>),
     ChatGptOpenAI(
         Agent<openai::responses_api::ResponsesCompletionModel<codex_http::CodexHttpClient>>,
     ),
@@ -206,8 +207,8 @@ pub(crate) enum AnyAgentInner {
         Agent<anthropic::completion::CompletionModel<anthropic_http::AnthropicHttpClient>>,
     ),
     Gemini(Agent<gemini::completion::CompletionModel>),
-    DeepSeek(Agent<openai::completion::CompletionModel>),
-    Glm(Agent<openai::completion::CompletionModel>),
+    DeepSeek(Agent<openai::completion::CompletionModel<compressing_http::CompressingHttpClient<reqwest::Client>>>),
+    Glm(Agent<openai::completion::CompletionModel<compressing_http::CompressingHttpClient<reqwest::Client>>>),
     OpenCode(Agent<openai::completion::CompletionModel>),
     Ollama(Agent<ollama::CompletionModel>),
     Custom(Agent<openai::completion::CompletionModel>),
