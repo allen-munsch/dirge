@@ -436,6 +436,21 @@ pub struct PluginSettings {
     pub auto_start: Option<bool>,
 }
 
+/// Prompt-compression engine config. Disabled → no compression. Enabled with
+/// no preset → the "dirge" default (lossless transforms + tool-output
+/// windowing, no output-shaping). Other presets (e.g. `"agent"`,
+/// `"aggressive"`, `"auto"`, `"rag"`, `"code"`) enable lossy stages AND
+/// output-shaping directives that alter the model's output — they are an
+/// opt-in escape hatch, not a tuning knob. Runtime env: `DIRGE_COMPRESSION=0`
+/// or `off` disables regardless of this setting; `DIRGE_COMPRESSION_PRESET`
+/// overrides the preset name.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Compression {
+    pub enabled: Option<bool>,
+    pub preset: Option<String>,
+}
+
 /// Optional desktop notification settings. The block is absent/off by default;
 /// when enabled, individual event classes default to on so a minimal
 /// `{ "enabled": true }` does the useful thing.
@@ -676,6 +691,10 @@ pub struct Config {
     /// Optional OS-level desktop notifications for turn completion and
     /// prompts waiting on human input. Absent/off by default.
     pub desktop_notifications: Option<DesktopNotificationConfig>,
+    /// Prompt-compression engine config. `enabled = false` or
+    /// `DIRGE_COMPRESSION=0` disables compression at runtime even when the
+    /// feature is compiled in; the `preset` key picks the compression profile.
+    pub compression: Option<Compression>,
     pub permission: Option<serde_json::Value>,
     pub restrictive: Option<bool>,
     pub accept_all: Option<bool>,

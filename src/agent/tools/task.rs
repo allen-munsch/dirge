@@ -1234,7 +1234,11 @@ mod tests {
     fn mock_tool() -> TaskTool {
         // The model is never invoked in these tests — they exercise the
         // definition surface only.
-        let client = openrouter::Client::new("test-key").unwrap();
+        let client = openrouter::Client::builder()
+            .api_key("test-key")
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
+            .build()
+            .unwrap();
         let model = client.completion_model("anthropic/claude-sonnet-4.5");
         TaskTool::new(
             None,
@@ -1249,11 +1253,15 @@ mod tests {
         use rig::client::CompletionClient;
 
         let openai = rig::providers::openai::CompletionsClient::builder()
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
             .api_key("test-key")
             .build()
             .unwrap()
             .completion_model("gpt-test");
-        let anthropic = rig::providers::anthropic::Client::new("test-key")
+        let anthropic = rig::providers::anthropic::Client::builder()
+            .api_key("test-key")
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
+            .build()
             .unwrap()
             .completion_model("claude-test");
 

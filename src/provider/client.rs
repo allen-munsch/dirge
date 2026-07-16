@@ -138,7 +138,19 @@ where
             Err(_) => return Ok(None),
         }
     };
-    let client = openai::CompletionsClient::builder().api_key(&key).build()?;
+    let client = openai::CompletionsClient::builder()
+        .http_client(
+            crate::provider::compressing_http::CompressingHttpClient::new(
+                reqwest::Client::new(),
+                crate::llmtrim::ir::ProviderKind::OpenAi,
+                std::sync::Arc::new(crate::compression::config_for_preset(
+                    &resolve_compression_preset(),
+                )),
+                resolve_compression_enabled(),
+            ),
+        )
+        .api_key(&key)
+        .build()?;
     Ok(Some(AnyClient::OpenAI(client)))
 }
 
@@ -375,9 +387,16 @@ where
             let bearer_is_dirge_oauth = auth_headers
                 .as_ref()
                 .is_some_and(|h| h.chatgpt_bearer_is_dirge_oauth);
-            let mut b = openai::Client::builder()
-                .api_key(&key)
-                .http_client(codex_http_client_for(&key, bearer_is_dirge_oauth));
+            let mut b = openai::Client::builder().api_key(&key).http_client(
+                crate::provider::compressing_http::CompressingHttpClient::new(
+                    codex_http_client_for(&key, bearer_is_dirge_oauth),
+                    crate::llmtrim::ir::ProviderKind::OpenAi,
+                    std::sync::Arc::new(crate::compression::config_for_preset(
+                        &resolve_compression_preset(),
+                    )),
+                    resolve_compression_enabled(),
+                ),
+            );
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -387,7 +406,18 @@ where
             Ok(AnyClient::ChatGptOpenAI(b.build()?))
         }
         ProviderKind::OpenAI => {
-            let mut b = openai::CompletionsClient::builder().api_key(&key);
+            let mut b = openai::CompletionsClient::builder()
+                .http_client(
+                    crate::provider::compressing_http::CompressingHttpClient::new(
+                        reqwest::Client::new(),
+                        crate::llmtrim::ir::ProviderKind::OpenAi,
+                        std::sync::Arc::new(crate::compression::config_for_preset(
+                            &resolve_compression_preset(),
+                        )),
+                        resolve_compression_enabled(),
+                    ),
+                )
+                .api_key(&key);
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -423,13 +453,30 @@ where
                         super::anthropic_http::AnthropicHttpClient::new(bearer)
                     }
                 };
+                let http = crate::provider::compressing_http::CompressingHttpClient::new(
+                    http,
+                    crate::llmtrim::ir::ProviderKind::Anthropic,
+                    std::sync::Arc::new(crate::compression::config_for_preset(
+                        &resolve_compression_preset(),
+                    )),
+                    resolve_compression_enabled(),
+                );
                 let mut b = anthropic::Client::builder().api_key(&key).http_client(http);
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
                 }
                 Ok(AnyClient::AnthropicOauth(b.build()?))
             } else {
-                let mut b = anthropic::Client::builder().api_key(&key);
+                let mut b = anthropic::Client::builder().api_key(&key).http_client(
+                    crate::provider::compressing_http::CompressingHttpClient::new(
+                        reqwest::Client::new(),
+                        crate::llmtrim::ir::ProviderKind::Anthropic,
+                        std::sync::Arc::new(crate::compression::config_for_preset(
+                            &resolve_compression_preset(),
+                        )),
+                        resolve_compression_enabled(),
+                    ),
+                );
                 if let Some(base_url) = &base_url {
                     b = b.base_url(base_url);
                 }
@@ -437,7 +484,16 @@ where
             }
         }
         ProviderKind::Gemini => {
-            let mut b = gemini::Client::builder().api_key(&key);
+            let mut b = gemini::Client::builder().api_key(&key).http_client(
+                crate::provider::compressing_http::CompressingHttpClient::new(
+                    reqwest::Client::new(),
+                    crate::llmtrim::ir::ProviderKind::Google,
+                    std::sync::Arc::new(crate::compression::config_for_preset(
+                        &resolve_compression_preset(),
+                    )),
+                    resolve_compression_enabled(),
+                ),
+            );
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -445,34 +501,84 @@ where
         }
         ProviderKind::DeepSeek => {
             let b = openai::CompletionsClient::builder()
+                .http_client(
+                    crate::provider::compressing_http::CompressingHttpClient::new(
+                        reqwest::Client::new(),
+                        crate::llmtrim::ir::ProviderKind::OpenAi,
+                        std::sync::Arc::new(crate::compression::config_for_preset(
+                            &resolve_compression_preset(),
+                        )),
+                        resolve_compression_enabled(),
+                    ),
+                )
                 .api_key(&key)
                 .base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"));
             Ok(AnyClient::DeepSeek(b.build()?))
         }
         ProviderKind::Glm => {
-            let b = openai::CompletionsClient::builder().api_key(&key).base_url(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://open.bigmodel.cn/api/coding/paas/v4"),
-            );
+            let b = openai::CompletionsClient::builder()
+                .http_client(
+                    crate::provider::compressing_http::CompressingHttpClient::new(
+                        reqwest::Client::new(),
+                        crate::llmtrim::ir::ProviderKind::OpenAi,
+                        std::sync::Arc::new(crate::compression::config_for_preset(
+                            &resolve_compression_preset(),
+                        )),
+                        resolve_compression_enabled(),
+                    ),
+                )
+                .api_key(&key)
+                .base_url(
+                    base_url
+                        .as_deref()
+                        .unwrap_or("https://open.bigmodel.cn/api/coding/paas/v4"),
+                );
             Ok(AnyClient::Glm(b.build()?))
         }
         ProviderKind::OpenCode => {
             let b = openai::CompletionsClient::builder()
+                .http_client(
+                    crate::provider::compressing_http::CompressingHttpClient::new(
+                        reqwest::Client::new(),
+                        crate::llmtrim::ir::ProviderKind::OpenAi,
+                        std::sync::Arc::new(crate::compression::config_for_preset(
+                            &resolve_compression_preset(),
+                        )),
+                        resolve_compression_enabled(),
+                    ),
+                )
                 .api_key(&key)
                 .base_url(base_url.as_deref().unwrap_or("https://opencode.ai/zen/v1"));
             Ok(AnyClient::OpenCode(b.build()?))
         }
         ProviderKind::Ollama => {
             let key: ollama::OllamaApiKey = key.as_str().into();
-            let mut b = ollama::Client::builder().api_key(key);
+            let mut b = ollama::Client::builder().api_key(key).http_client(
+                crate::provider::compressing_http::CompressingHttpClient::new(
+                    reqwest::Client::new(),
+                    crate::llmtrim::ir::ProviderKind::OpenAi,
+                    std::sync::Arc::new(crate::compression::config_for_preset(
+                        &resolve_compression_preset(),
+                    )),
+                    resolve_compression_enabled(),
+                ),
+            );
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
             Ok(AnyClient::Ollama(b.build()?))
         }
         ProviderKind::OpenRouter => {
-            let mut b = openrouter::Client::builder().api_key(&key);
+            let mut b = openrouter::Client::builder().api_key(&key).http_client(
+                crate::provider::compressing_http::CompressingHttpClient::new(
+                    reqwest::Client::new(),
+                    crate::llmtrim::ir::ProviderKind::OpenAi,
+                    std::sync::Arc::new(crate::compression::config_for_preset(
+                        &resolve_compression_preset(),
+                    )),
+                    resolve_compression_enabled(),
+                ),
+            );
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -485,6 +591,16 @@ where
                 )
             })?;
             let b = openai::CompletionsClient::builder()
+                .http_client(
+                    crate::provider::compressing_http::CompressingHttpClient::new(
+                        reqwest::Client::new(),
+                        crate::llmtrim::ir::ProviderKind::OpenAi,
+                        std::sync::Arc::new(crate::compression::config_for_preset(
+                            &resolve_compression_preset(),
+                        )),
+                        resolve_compression_enabled(),
+                    ),
+                )
                 .api_key(&key)
                 .base_url(&base_url);
             Ok(AnyClient::Custom(b.build()?))
@@ -744,6 +860,28 @@ fn current_epoch_ms() -> i64 {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
+}
+
+/// Resolve `enabled` for the compression interceptor. Config defaults to
+/// on; `DIRGE_COMPRESSION=0` or `DIRGE_COMPRESSION=off` disables at runtime.
+fn resolve_compression_enabled() -> bool {
+    // Env var takes absolute precedence (case-insensitive boolean-disable
+    // spellings). If unset, fall back to the [compression] config section
+    // loaded at startup.
+    match std::env::var("DIRGE_COMPRESSION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | "disabled"
+        ),
+        Err(_) => crate::compression::configured_enabled(),
+    }
+}
+
+/// Resolve the compression preset name. `DIRGE_COMPRESSION_PRESET` overrides
+/// the config-file preset (which itself defaults to "dirge").
+fn resolve_compression_preset() -> String {
+    std::env::var("DIRGE_COMPRESSION_PRESET")
+        .unwrap_or_else(|_| crate::compression::configured_preset())
 }
 
 #[cfg(test)]

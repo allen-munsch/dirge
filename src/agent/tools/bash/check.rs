@@ -241,7 +241,7 @@ pub(super) async fn check_bash_segments(
         // command-substitution / heredoc / ANSI-C quoting are checked as
         // one whole-command claim. Shared with the `/why` explainer
         // (dirge-p3vf) so enforcement and explanation can't drift.
-        let has_substitution = bash::coarse_complex_syntax(command);
+        let has_substitution = crate::semantic::adapters::bash::coarse_complex_syntax(command);
         if has_substitution {
             claims.push(complex_cmd_claim(command));
         } else {

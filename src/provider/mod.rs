@@ -6,6 +6,7 @@ mod billing_fallback;
 mod build;
 pub mod client;
 pub(crate) mod codex_http;
+pub(crate) mod compressing_http;
 mod dispatch;
 mod resolve;
 mod run;
@@ -195,22 +196,80 @@ pub struct AnyAgent {
 
 #[derive(Clone)]
 pub(crate) enum AnyAgentInner {
-    OpenRouter(Agent<openrouter::completion::CompletionModel>),
-    OpenAI(Agent<openai::completion::CompletionModel>),
+    OpenRouter(
+        Agent<
+            openrouter::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
+    OpenAI(
+        Agent<
+            openai::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
     ChatGptOpenAI(
-        Agent<openai::responses_api::ResponsesCompletionModel<codex_http::CodexHttpClient>>,
+        Agent<
+            openai::responses_api::ResponsesCompletionModel<
+                compressing_http::CompressingHttpClient<codex_http::CodexHttpClient>,
+            >,
+        >,
     ),
     OpenAICodex(Agent<chatgpt::ResponsesCompletionModel>),
-    Anthropic(Agent<anthropic::completion::CompletionModel>),
-    AnthropicOauth(
-        Agent<anthropic::completion::CompletionModel<anthropic_http::AnthropicHttpClient>>,
+    Anthropic(
+        Agent<
+            anthropic::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
     ),
-    Gemini(Agent<gemini::completion::CompletionModel>),
-    DeepSeek(Agent<openai::completion::CompletionModel>),
-    Glm(Agent<openai::completion::CompletionModel>),
-    OpenCode(Agent<openai::completion::CompletionModel>),
-    Ollama(Agent<ollama::CompletionModel>),
-    Custom(Agent<openai::completion::CompletionModel>),
+    AnthropicOauth(
+        Agent<
+            anthropic::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<anthropic_http::AnthropicHttpClient>,
+            >,
+        >,
+    ),
+    Gemini(
+        Agent<
+            gemini::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
+    DeepSeek(
+        Agent<
+            openai::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
+    Glm(
+        Agent<
+            openai::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
+    OpenCode(
+        Agent<
+            openai::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
+    Ollama(
+        Agent<ollama::CompletionModel<compressing_http::CompressingHttpClient<reqwest::Client>>>,
+    ),
+    Custom(
+        Agent<
+            openai::completion::CompletionModel<
+                compressing_http::CompressingHttpClient<reqwest::Client>,
+            >,
+        >,
+    ),
 }
 
 impl AnyAgent {
