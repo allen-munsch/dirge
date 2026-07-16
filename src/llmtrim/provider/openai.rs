@@ -342,7 +342,8 @@ impl Provider for OpenAiProvider {
             // Chat Completions: data URI under image_url.url.
             if let Some(Value::String(url)) = b.pointer_mut("/image_url/url")
                 && url.starts_with("data:")
-                && let Some(new_url) = crate::llmtrim::media::fit_data_uri(url, crate::llmtrim::media::CAP_OPENAI)
+                && let Some(new_url) =
+                    crate::llmtrim::media::fit_data_uri(url, crate::llmtrim::media::CAP_OPENAI)
             {
                 *url = new_url;
             }
@@ -350,7 +351,8 @@ impl Provider for OpenAiProvider {
             if b.get("type").and_then(Value::as_str) == Some("input_image")
                 && let Some(Value::String(url)) = b.get_mut("image_url")
                 && url.starts_with("data:")
-                && let Some(new_url) = crate::llmtrim::media::fit_data_uri(url, crate::llmtrim::media::CAP_OPENAI)
+                && let Some(new_url) =
+                    crate::llmtrim::media::fit_data_uri(url, crate::llmtrim::media::CAP_OPENAI)
             {
                 *url = new_url;
             }

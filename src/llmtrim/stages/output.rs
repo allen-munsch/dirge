@@ -149,8 +149,7 @@ const TOOLS_FRUGAL_MARKER: &str = "fewest tool-use turns";
 /// isolation (`llmtrim bench quality --corpus bench/data/gsm8k.jsonl --config <anti_overthink-
 /// only.toml> --model openai/gpt-oss-20b --route wandb/fp4 --reasoning-effort medium`, n=40):
 /// output tokens cut 62.0%, quality retention +0.0pp (unchanged, paired 95% CI ±10.2).
-pub const ANTI_OVERTHINK_INSTRUCTION: &str =
-    include_str!("../prompts/output_anti_overthink.txt");
+pub const ANTI_OVERTHINK_INSTRUCTION: &str = include_str!("../prompts/output_anti_overthink.txt");
 
 /// Stable substring of [`ANTI_OVERTHINK_INSTRUCTION`] for the idempotent guard. Deliberately NOT
 /// one of the restart words the instruction names ("Wait"/"But"/"Actually") — those are common
@@ -317,7 +316,9 @@ impl Transform for OutputControlStage {
         if self.anti_overthink
             && (!tool_call_shaped(req) || is_first_turn(req))
             && (reasoning_model_request(req)
-                || crate::llmtrim::capability::model_is_reasoning_capable(req.model_id().unwrap_or("")))
+                || crate::llmtrim::capability::model_is_reasoning_capable(
+                    req.model_id().unwrap_or(""),
+                ))
             && !anti_overthink_present(req, provider)
         {
             provider.add_system_instruction(req, ANTI_OVERTHINK_INSTRUCTION);

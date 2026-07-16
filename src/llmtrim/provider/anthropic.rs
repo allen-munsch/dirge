@@ -261,7 +261,8 @@ fn downscale_anthropic_block(b: &mut Value) {
     if b.get("type").and_then(Value::as_str) == Some("image")
         && b.pointer("/source/type").and_then(Value::as_str) == Some("base64")
         && let Some(Value::String(data)) = b.pointer_mut("/source/data")
-        && let Some(new_data) = crate::llmtrim::media::fit_to_cap(data, crate::llmtrim::media::CAP_ANTHROPIC)
+        && let Some(new_data) =
+            crate::llmtrim::media::fit_to_cap(data, crate::llmtrim::media::CAP_ANTHROPIC)
     {
         *data = new_data;
     }

@@ -80,7 +80,6 @@ default = [
     'semantic-elixir',
     'semantic-sql',
     'semantic-dafny',
-    'compression',
     'slash-completion',
     'mcp-server',
 ]
@@ -110,7 +109,6 @@ windows-default = [
     'semantic-elixir',
     'semantic-sql',
     'semantic-dafny',
-    'compression',
     'slash-completion',
     'mcp-server',
 ]
@@ -161,25 +159,17 @@ experimental-ui-computer-use = []
 # Opt-in: creates two new SQLite tables (entities, relations)
 # and an entity_search module. PRISM #393.
 experimental-graph-search = []
-compression = [
-    "dep:bm25",
-    "dep:csv",
-    "dep:gaoya",
-    "dep:once_cell",
-    "dep:stop-words",
-    "dep:toml",
-    "dep:toon-format",
-    "dep:unicode-normalization",
-    "dep:unicode-segmentation",
-    "dep:whatlang",
-]
-# Empty; declare features referenced by inlined llmtrim-core code so
-# rustc's cfg check doesn't warn about unknown feature names. The
-# conditional code under these features needs crates not in the tree,
-# so these are deliberately no-op stubs.
-tiktoken = []
-skeleton = []
-multimodal = []
+
+# The inlined llmtrim engine (src/llmtrim) carries upstream
+# `#[cfg(feature = "skeleton"/"tiktoken"/"multimodal")]` blocks whose
+# crates we deliberately dropped. Declare those cfg names via check-cfg
+# (below) rather than as real features, so the code stays permanently
+# excluded — `--all-features` can't accidentally enable it — while
+# rustc's unexpected-cfg lint stays quiet under `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("skeleton", "tiktoken", "multimodal"))',
+] }
 
 [target.'cfg(unix)'.dependencies]
 # Used by the bash tool for process-group cleanup on timeout
@@ -360,17 +350,17 @@ nucleo-matcher = "0.3"
 url = "2"
 vt100 = "0.16.2"
 
-# --- compression-engine deps (optional; included via `compression` feature) ---
-bm25 = { version = "2.3.2", optional = true }
-csv = { version = "1.4.0", optional = true }
-gaoya = { version = "0.2.0", optional = true }
-once_cell = { version = "1.21.4", optional = true }
-stop-words = { version = "0.10.0", optional = true }
-toml = { version = "1.1.2", optional = true }
-toon-format = { version = "0.5.0", default-features = false, optional = true }
-unicode-normalization = { version = "0.1.25", optional = true }
-unicode-segmentation = { version = "1.13.3", optional = true }
-whatlang = { version = "0.18.0", optional = true }
+# --- compression-engine deps (always-on; was optional via `compression` feature) ---
+bm25 = { version = "2.3.2" }
+csv = { version = "1.4.0" }
+gaoya = { version = "0.2.0" }
+once_cell = { version = "1.21.4" }
+stop-words = { version = "0.10.0" }
+toml = { version = "1.1.2" }
+toon-format = { version = "0.5.0", default-features = false }
+unicode-normalization = { version = "0.1.25" }
+unicode-segmentation = { version = "1.13.3" }
+whatlang = { version = "0.18.0" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

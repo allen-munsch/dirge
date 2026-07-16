@@ -1,19 +1,16 @@
-#[cfg(feature = "compression")]
 use anyhow::{Context as _, Result};
 
 /// Process-global compression configuration, set once at startup from the
 /// `[compression]` config section (with env var overrides checked later at
 /// each `resolve_compression_*` call site). Initialized by
 /// [`init_from_config`] right after the runtime Config is loaded from disk.
-#[cfg(feature = "compression")]
 static COMPRESSION_CFG: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
 
 /// Seed the compression config from the loaded runtime Config. Call ONCE
-/// at startup, BEFORE any provider client is built. Callers must gate with
-/// `#[cfg(feature = "compression")]`.
+/// at startup, BEFORE any provider client is built.
 ///
 /// `enabled` is `None` when no `[compression]` section exists; the default
-/// is `true` (compression is on by default when compiled in).
+/// is `true`.
 /// `preset` defaults to `"dirge"` when absent or `None`.
 pub fn init_from_config(enabled: Option<bool>, preset: Option<String>) {
     let _ = COMPRESSION_CFG.set((
@@ -47,7 +44,6 @@ pub fn configured_preset() -> String {
 /// arrays down to a row cap), `retrieve`/`skeletonize`/`ngram` (lossy or
 /// redundant with dirge's own minify), and every `output_*` control (they
 /// alter the model's output, not just the input).
-#[cfg(feature = "compression")]
 pub fn dirge_default_config() -> crate::llmtrim::config::DenseConfig {
     let mut c = crate::llmtrim::config::DenseConfig::lossless();
     c.toolout = true;
@@ -70,17 +66,15 @@ pub fn dirge_default_config() -> crate::llmtrim::config::DenseConfig {
 /// output-shaping directives that **alter the model's output behavior** —
 /// they are an opt-in escape hatch for aggressive trimming, not a tuning
 /// knob to casually dial.
-#[cfg(feature = "compression")]
 pub fn config_for_preset(name: &str) -> crate::llmtrim::config::DenseConfig {
     if name == "dirge" || name == "default" {
         return dirge_default_config();
     }
-    crate::llmtrim::config::DenseConfig::preset(name).unwrap_or_else(|| dirge_default_config())
+    crate::llmtrim::config::DenseConfig::preset(name).unwrap_or_else(dirge_default_config)
 }
 
 /// Rewrite a request body with an explicit config (the low-level entry point,
 /// called from the HTTP interceptor).
-#[cfg(feature = "compression")]
 pub fn rewrite_with(
     body: &str,
     provider: crate::llmtrim::ir::ProviderKind,
@@ -92,7 +86,6 @@ pub fn rewrite_with(
 }
 
 #[cfg(test)]
-#[cfg(feature = "compression")]
 mod tests {
     use super::*;
 
@@ -104,7 +97,11 @@ mod tests {
         // that configured_enabled() defaults to true when the lock is
         // still empty (which it is before any prod startup path runs).
         assert!(configured_enabled(), "default should be true");
-        assert_eq!(configured_preset(), "dirge", "default preset should be 'dirge'");
+        assert_eq!(
+            configured_preset(),
+            "dirge",
+            "default preset should be 'dirge'"
+        );
     }
 
     #[test]

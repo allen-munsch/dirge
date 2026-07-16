@@ -1236,9 +1236,7 @@ mod tests {
         // definition surface only.
         let client = openrouter::Client::builder()
             .api_key("test-key")
-            .http_client(
-                crate::provider::compressing_http::CompressingHttpClient::default(),
-            )
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
             .build()
             .unwrap();
         let model = client.completion_model("anthropic/claude-sonnet-4.5");
@@ -1262,9 +1260,7 @@ mod tests {
             .completion_model("gpt-test");
         let anthropic = rig::providers::anthropic::Client::builder()
             .api_key("test-key")
-            .http_client(
-                crate::provider::compressing_http::CompressingHttpClient::default(),
-            )
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
             .build()
             .unwrap()
             .completion_model("claude-test");

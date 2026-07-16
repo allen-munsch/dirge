@@ -54,10 +54,11 @@ impl Transform for NgramStage {
     ) -> Result<()> {
         // Keep (pointer, text) pairs so write-back stays aligned even if a pointer
         // yields no string.
-        let segs: Vec<(String, String)> = crate::llmtrim::cache_zone::compressible_pointers(req, provider)
-            .into_iter()
-            .filter_map(|p| req.get_str(&p).map(|s| (p, s.to_string())))
-            .collect();
+        let segs: Vec<(String, String)> =
+            crate::llmtrim::cache_zone::compressible_pointers(req, provider)
+                .into_iter()
+                .filter_map(|p| req.get_str(&p).map(|s| (p, s.to_string())))
+                .collect();
         if segs.is_empty() {
             return Ok(());
         }
@@ -91,10 +92,12 @@ impl Transform for NgramStage {
         // + LCP, greedy by gain with overlap accounting). Phrases come back in commit
         // order — longest/most-profitable first.
         let work_refs: Vec<&str> = working.iter().map(String::as_str).collect();
-        let selections =
-            crate::llmtrim::stages::ngram_sa::mine(&work_refs, self.max_entries, counter.as_ref(), |k| {
-                format!("{marker}{k}")
-            });
+        let selections = crate::llmtrim::stages::ngram_sa::mine(
+            &work_refs,
+            self.max_entries,
+            counter.as_ref(),
+            |k| format!("{marker}{k}"),
+        );
         if selections.is_empty() {
             return Ok(());
         }
@@ -212,8 +215,9 @@ mod tests {
             "{phrase} grew. later {phrase} fell. again {phrase} held. then {phrase} rose. finally {phrase} dipped."
         );
         let counter = counter_for(ProviderKind::OpenAi, Some("gpt-4o")).unwrap();
-        let sel =
-            crate::llmtrim::stages::ngram_sa::mine(&[&text], 32, counter.as_ref(), |k| format!("§{k}"));
+        let sel = crate::llmtrim::stages::ngram_sa::mine(&[&text], 32, counter.as_ref(), |k| {
+            format!("§{k}")
+        });
         assert!(
             sel.iter().any(|s| s.phrase == phrase),
             "frequent phrase is mined and selected"
@@ -372,8 +376,9 @@ mod tests {
         let counter = counter_for(ProviderKind::OpenAi, Some("gpt-4o")).unwrap();
 
         // New miner: the full 9-word clause is the top selection.
-        let sel =
-            crate::llmtrim::stages::ngram_sa::mine(&[&text], 32, counter.as_ref(), |k| format!("§{k}"));
+        let sel = crate::llmtrim::stages::ngram_sa::mine(&[&text], 32, counter.as_ref(), |k| {
+            format!("§{k}")
+        });
         let top = sel.first().expect("a phrase is selected");
         assert_eq!(
             top.phrase, clause,
@@ -486,10 +491,12 @@ mod tests {
             format!("{p} failed. retry {p}. then {p} again. {p} more. {p} keeps. {p} still.");
         let counter = counter_for(ProviderKind::OpenAi, Some("gpt-4o")).unwrap();
         let run_once = || {
-            crate::llmtrim::stages::ngram_sa::mine(&[&content], 32, counter.as_ref(), |k| format!("§{k}"))
-                .into_iter()
-                .map(|s| s.phrase)
-                .collect::<Vec<_>>()
+            crate::llmtrim::stages::ngram_sa::mine(&[&content], 32, counter.as_ref(), |k| {
+                format!("§{k}")
+            })
+            .into_iter()
+            .map(|s| s.phrase)
+            .collect::<Vec<_>>()
         };
         let a = run_once();
         let b = run_once();

@@ -252,7 +252,8 @@ impl Provider for GoogleProvider {
                     "/inline_data/data"
                 };
                 if let Some(Value::String(data)) = p.pointer_mut(ptr)
-                    && let Some(new_data) = crate::llmtrim::media::fit_to_cap(data, crate::llmtrim::media::CAP_GOOGLE)
+                    && let Some(new_data) =
+                        crate::llmtrim::media::fit_to_cap(data, crate::llmtrim::media::CAP_GOOGLE)
                 {
                     *data = new_data;
                 }

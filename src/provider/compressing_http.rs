@@ -7,34 +7,23 @@ use rig::http_client::{
 /// delegating — fail-open: any compression error passes the original body
 /// through unchanged, so a compression bug can never break a request.
 ///
-/// When the `compression` feature is off, this is a thin pass-through.
+/// The `enabled` field gates compression at runtime; set to `false` for a
+/// pass-through. Use `DIRGE_COMPRESSION=0` to disable via env.
 #[derive(Clone)]
 pub(crate) struct CompressingHttpClient<Inner> {
     inner: Inner,
     enabled: bool,
-    #[cfg(feature = "compression")]
     provider: crate::llmtrim::ir::ProviderKind,
-    #[cfg(feature = "compression")]
     config: std::sync::Arc<crate::llmtrim::config::DenseConfig>,
 }
 
 impl<Inner: Default> Default for CompressingHttpClient<Inner> {
     fn default() -> Self {
-        #[cfg(feature = "compression")]
-        {
-            Self {
-                inner: Inner::default(),
-                enabled: true,
-                provider: crate::llmtrim::ir::ProviderKind::OpenAi,
-                config: std::sync::Arc::new(
-                    crate::compression::dirge_default_config(),
-                ),
-            }
-        }
-        #[cfg(not(feature = "compression"))]
         Self {
             inner: Inner::default(),
-            enabled: false,
+            enabled: true,
+            provider: crate::llmtrim::ir::ProviderKind::OpenAi,
+            config: std::sync::Arc::new(crate::compression::dirge_default_config()),
         }
     }
 }
@@ -49,25 +38,18 @@ impl<Inner: std::fmt::Debug> std::fmt::Debug for CompressingHttpClient<Inner> {
 }
 
 impl<Inner> CompressingHttpClient<Inner> {
-    /// Construct a compressing HTTP client wrapper. Without the
-    /// `compression` feature, the provider and config are unused
-    /// and the client is always a pass-through.
-    #[allow(unused_variables)]
+    /// Construct a compressing HTTP client wrapper. Runtime compression is
+    /// controlled by the `enabled` field; set to `false` for a pass-through.
     pub fn new(
         inner: Inner,
-        #[cfg(feature = "compression")] provider: crate::llmtrim::ir::ProviderKind,
-        #[cfg(feature = "compression")] config: std::sync::Arc<crate::llmtrim::config::DenseConfig>,
-        #[cfg(feature = "compression")] enabled: bool,
+        provider: crate::llmtrim::ir::ProviderKind,
+        config: std::sync::Arc<crate::llmtrim::config::DenseConfig>,
+        enabled: bool,
     ) -> Self {
         Self {
             inner,
-            #[cfg(feature = "compression")]
             enabled,
-            #[cfg(not(feature = "compression"))]
-            enabled: false,
-            #[cfg(feature = "compression")]
             provider,
-            #[cfg(feature = "compression")]
             config,
         }
     }
@@ -77,7 +59,6 @@ impl<Inner> CompressingHttpClient<Inner> {
     /// Try to compress the body. On any failure, return the original bytes
     /// unchanged — this is the fail-open guard.
     fn maybe_compress(&self, body: Bytes) -> Bytes {
-        #[cfg(feature = "compression")]
         if self.enabled {
             let body_str = match std::str::from_utf8(&body) {
                 Ok(s) => s,

@@ -869,8 +869,12 @@ mod tests {
         let code = "fun handle(req: Request): Response {\n    val auth = req.header(\"authorization\")\n    val user = lookupUser(auth)\n    val perms = loadPermissions(user.id)\n    val payload = req.parseBody()\n    val saved = repository.persist(payload, user)\n    audit.log(user, saved.id)\n    return Response.ok(saved)\n}";
         let input = json!({"model":"gpt-4o","messages":[{"role":"user","content":format!("Review:\n```kotlin\n{code}\n```")}]}).to_string();
         let cfg = crate::llmtrim::config::DenseConfig::auto();
-        let res = crate::llmtrim::compress_with_config(&input, Some(crate::llmtrim::ir::ProviderKind::OpenAi), &cfg)
-            .unwrap();
+        let res = crate::llmtrim::compress_with_config(
+            &input,
+            Some(crate::llmtrim::ir::ProviderKind::OpenAi),
+            &cfg,
+        )
+        .unwrap();
         assert!(
             !res.request_json.contains("loadPermissions")
                 && res.request_json.contains("fun handle"),
