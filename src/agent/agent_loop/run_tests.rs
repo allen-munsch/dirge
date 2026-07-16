@@ -4136,7 +4136,10 @@ async fn finalization_unified_judge_reenters_on_finding() {
         LoopMessage::User(u) => u.text_joined(),
         other => panic!("expected user follow-up, got {other:?}"),
     };
-    assert!(text.contains("null deref"), "finding must reach the model: {text}");
+    assert!(
+        text.contains("null deref"),
+        "finding must reach the model: {text}"
+    );
     assert!(
         critic_done,
         "Off/Advisory unified judge is one-shot — critic_done must flip"
