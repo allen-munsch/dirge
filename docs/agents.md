@@ -192,6 +192,10 @@ and a path outside the cwd surfaces a permission prompt through the parent
 UI. If a profile pinned a model, the tooled subagent runs on that model;
 otherwise it uses the live agent's.
 
+To coordinate several background subagents as a batch, require read-only and
+read-write profile tiers, retry failed tasks, or isolate writers in Git
+worktrees, see [Coordinated Subagents](subagent-dispatch-strategy.md).
+
 ## Relationship to the built-in critic and roles
 
 Defining profiles never disables or changes the built-in critic or any role

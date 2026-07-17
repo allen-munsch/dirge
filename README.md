@@ -463,6 +463,7 @@ as `auto_start`.
 | [docs/permissions.md](docs/permissions.md) | Authorization engine, security modes, `/why` |
 | [docs/prompts.md](docs/prompts.md) | Prompts system, per-prompt tool restrictions, context files |
 | [docs/agents.md](docs/agents.md) | Agent profiles — named model + prompt + tool-policy bundles, `/agent` switching |
+| [docs/subagent-dispatch-strategy.md](docs/subagent-dispatch-strategy.md) | Coordinated subagents — batch dispatch, profile tiers, retries, and read-write isolation |
 | [docs/skills.md](docs/skills.md) | Claude-compatible skills |
 | [docs/semantic.md](docs/semantic.md) | Tree-sitter semantic code tools |
 | [docs/lsp.md](docs/lsp.md) | LSP integration and built-in server set |

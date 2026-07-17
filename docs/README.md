@@ -8,6 +8,8 @@ For configuration keys and provider setup, see [config.md](config.md).
 |---|---|
 | [config.md](config.md) | Config file location, keys, provider aliases + roles, permission rules, MCP/LSP/ACP servers |
 | [features.md](features.md) | Full feature catalog — core capabilities, the robust agent loop, performance |
+| [agents.md](agents.md) | Agent profiles — named personas, model routing, and tooled subagents |
+| [subagent-dispatch-strategy.md](subagent-dispatch-strategy.md) | Coordinated subagents — batch dispatch, profile tiers, retries, and read-write isolation |
 | [permissions.md](permissions.md) | Authorization engine — the single decision point, operations/claims, policy precedence, sane defaults, config, security modes, `/why` |
 | [prompts.md](prompts.md) | Prompts system — built-in prompts, per-prompt `deny_tools` restrictions, custom prompts, context files |
 | [skills.md](skills.md) | Claude-compatible skills — discovery directories, `SKILL.md` format |
