@@ -4,6 +4,23 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.11] - 2026-07-17
+
+### Added
+- `keyboard_enhancement` config (default on). Enables the terminal's enhanced
+  keyboard (kitty) protocol on terminals that support it — kitty, Ghostty,
+  WezTerm, foot, rio — so distinct chords like Shift+Enter reach the input
+  editor instead of collapsing onto plain Enter. A no-op on terminals that
+  don't advertise support; set `false` to disable.
+
+### Changed
+- Shift+Enter now inserts a newline in the input box instead of submitting, so
+  you can write multi-line prompts. The newline gesture is a rebindable
+  `insert_newline` command (defaults Shift+Enter, Alt+Enter, Ctrl+J) rather than
+  a hardcoded key, so it can be remapped from `keybindings`. Alt+Enter and
+  Ctrl+J work in every terminal; Shift+Enter needs `keyboard_enhancement`. Plain
+  Enter still submits. Home/End continue to move within the current line.
+
 ## [0.19.10] - 2026-07-16
 
 ### Changed
