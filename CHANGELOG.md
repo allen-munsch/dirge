@@ -4,6 +4,18 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.12] - 2026-07-17
+
+### Fixed
+- A parent turn that dispatched coordinated background subagents no longer runs
+  the completion critic — or any lower "are we done?" gate — while that batch is
+  still running. It waits for the batch to finish and reconcile instead of being
+  judged prematurely; the turn resumes when results are deliverable (#679).
+- A blank or whitespace-only `retry_of` on a `task` call is now treated as
+  omitted, so a generated tool call carrying an empty retry id no longer enters
+  coordinator retry validation for a nonexistent task. Real ids are trimmed and
+  still validated strictly (#679).
+
 ## [0.19.11] - 2026-07-17
 
 ### Added
@@ -22,6 +34,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Enter still submits. Home/End continue to move within the current line.
 
 ## [0.19.10] - 2026-07-16
+
+### Added
+- Coordinated subagent dispatch. The `task` tool can fan out background
+  subagents as a batch and deliver one reconciliation update once the whole
+  batch reaches terminal state, routed through configured `readonly` /
+  `readwrite` agent profiles. Read-write subagents run isolated in rooted Git
+  worktrees when available; `auto` mode warns and serializes writers in the
+  parent checkout when no worktree can be created. Reconciliation preserves each
+  writer's branch, path, commit, dirty-state, and salvage metadata. See
+  `docs/subagent-dispatch-strategy.md` (#670, resolves #660).
 
 ### Changed
 - The post-turn code reviewer is now folded into the completeness critic as a
@@ -69,6 +91,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   could desync the message history into a provider 400 and a duplicated
   response. Scavenged calls are now validated before promotion and dropped when
   invalid; native tool-call errors are unchanged.
+- The OpenCode provider (`opencode.ai/zen`, which proxies to DeepSeek models)
+  sent the wrong reasoning-control keys — the vLLM/SGLang self-hosted keys
+  (`reasoning_level`, `chat_template_kwargs`) that DeepSeek's hosted API ignores
+  — so deep-thinking mode and one-shot reasoning-disable didn't take. It now
+  uses `reasoning_effort` + `thinking: {type: disabled}`, matching the built-in
+  DeepSeek provider (#671).
 
 ### Changed
 - Work tracking nudges earlier. After the first file edit with no active todo,
