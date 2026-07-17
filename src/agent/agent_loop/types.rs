@@ -327,6 +327,12 @@ pub struct LoopConfig {
     /// (types.ts:243).
     pub get_followup_messages: Option<super::hooks::GetFollowupMessagesFn>,
 
+    /// Polled at the finalization boundary: when set and it returns `true`,
+    /// the run ends cleanly WITHOUT invoking the critic or any lower "are we
+    /// done?" gate, so a parent turn waiting on still-running coordinated
+    /// subagents isn't judged prematurely. Wired to
+    /// `BackgroundStore::coordinator_generation_running`; the UI re-wakes the
+    /// parent once the batch is deliverable.
     pub should_defer_finalization: Option<super::hooks::ShouldDeferFinalizationFn>,
 
     // ============================================================
