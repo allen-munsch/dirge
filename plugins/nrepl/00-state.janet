@@ -191,6 +191,18 @@
       (set nrepl-rbuf @"")
       "disconnected from nREPL")))
 
+(defn nrepl-reconnect []
+  "Recover from a dead/stale socket (server restart, dropped connection).
+  Drops the current connection and re-establishes it to the last known
+  host/port. Returns the new session id, or raises if the server is down."
+  (when nrepl-connected
+    (try (:close nrepl-conn) ([_] nil))
+    (set nrepl-conn nil)
+    (set nrepl-session nil)
+    (set nrepl-connected false)
+    (set nrepl-rbuf @""))
+  (connect-nrepl-inner nrepl-host nrepl-port))
+
 # ── paren repair ─────────────────────────────────────────────────
 #
 # LLMs frequently emit Clojure code with unbalanced delimiters.
@@ -315,12 +327,21 @@
 (defn nrepl-eval
   "Evaluate Clojure code on the connected nREPL server.
   Automatically repairs unbalanced delimiters before sending.
-  Returns a dict with keys: result, out, err, ns."
+  If the socket is stale (server restarted, connection dropped),
+  reconnects once and retries. Returns a dict with keys:
+  result, out, err, ns."
   [code]
   (if (not nrepl-connected)
     (error "not connected to nREPL — use /nrepl-connect first"))
   (def repaired (paren-repair code))
-  (def result (nrepl-eval-inner repaired))
+  (var result
+    (try (nrepl-eval-inner repaired)
+         ([err]
+          # A broken-pipe / closed error means the socket went stale
+          # (e.g. the nREPL server was restarted). Reconnect once and
+          # retry; if the server is genuinely down, this re-raises.
+          (nrepl-reconnect)
+          (nrepl-eval-inner repaired))))
   (def result-table @{:result (get result "result")
                        :out (get result "out")
                        :err (get result "err")
