@@ -4,6 +4,17 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.13] - 2026-07-17
+
+### Fixed
+- Blocking code-review mode no longer repeats the same finalization message. The
+  review judge is stateless and re-read the run's diff on every finalization, so
+  when the model declined a finding and changed nothing on disk the identical
+  finding was re-raised and the model repeated its rebuttal. The judge now skips
+  an unchanged diff (falling through to the goal/todo gates) and, on a changed
+  diff, is given the prior findings so it re-raises one only when it's still
+  present and the model neither fixed nor justified it (#681).
+
 ## [0.19.12] - 2026-07-17
 
 ### Fixed
