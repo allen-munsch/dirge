@@ -2,12 +2,10 @@
 //! (dirge-iy20).
 //!
 //! `AnyAgent::build_stream_fn_with_filter` (matching `AnyAgentInner`)
-//! and `AnyModel::build_stream_fn` (matching `AnyModel`) both
-//! enumerate the same eight providers and call the same
-//! `rig_stream_fn_from_model_with_filter` helper. They were two
-//! parallel 8-arm matches: adding a provider meant editing both, and
-//! the compiler couldn't catch a missed arm (each match was already
-//! exhaustive over its own enum). This macro is the single list.
+//! and `AnyModel::build_stream_fn` (matching `AnyModel`) dispatch through
+//! this shared provider list and call the same
+//! `rig_stream_fn_from_model_with_filter` helper. Adding a provider here
+//! updates both paths, while each enum match remains exhaustive.
 
 /// Dispatch over a provider enum to build a `StreamFn`.
 ///
@@ -28,15 +26,13 @@ macro_rules! dispatch_stream_fn {
         filter = $filter:expr $(,)?
     ) => {{
         use $crate::agent::agent_loop::rig_stream_fn_from_model_with_filter as __stream_fn;
-        // dirge-480 follow-up: OpenAI's Responses API needs the per-message
-        // conversion (drop historical reasoning, synthesize tool call_ids) keyed
-        // on the canonical "openai" provider identity. All three OpenAI client
-        // variants — API key, ChatGPT-OAuth, and Codex — are ProviderKind::OpenAI
-        // and hit that endpoint, but a custom ALIAS (provider_type = "openai"
-        // named e.g. "my-gpt", or an escalation/critic alias) would otherwise
-        // pass the alias string and miss the fix. The dispatch arm knows the
-        // concrete variant, so force the canonical identity here regardless of
-        // alias. Non-OpenAI providers keep their passed identity.
+        // Provider-specific wire adapters key off canonical backend names, not
+        // configured aliases. OpenAI Responses needs canonical `openai` for
+        // reasoning/tool-call ID conversion; Cerebras needs canonical `cerebras`
+        // for its top-level reasoning_effort shape. These concrete dispatch arms
+        // know the backend even when a role route was configured under an alias.
+        // Other providers retain the passed identity until they need the same
+        // canonicalization treatment.
         match $value {
             $enum::OpenRouter($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
@@ -80,6 +76,14 @@ macro_rules! dispatch_stream_fn {
             $enum::Glm($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
             }
+            $enum::Cerebras($bind) => __stream_fn(
+                $model,
+                $tools,
+                $timeout,
+                Some("cerebras".to_string()),
+                $model_name,
+                $filter,
+            ),
             $enum::OpenCode($bind) => {
                 __stream_fn($model, $tools, $timeout, $provider, $model_name, $filter)
             }

@@ -81,6 +81,103 @@ fn auto_detect_glm_api_key_wins_over_zhipu_when_both_set() {
     assert_eq!(auto_detect_provider_from(env), Some("glm"));
 }
 
+#[test]
+fn cerebras_auto_detects_from_its_key_in_isolation() {
+    let env = mock_env(&[("CEREBRAS_API_KEY", "test-cerebras-key")]);
+    assert_eq!(auto_detect_provider_from(env), Some("cerebras"));
+}
+
+#[test]
+fn cerebras_empty_key_is_skipped_before_ollama() {
+    assert!(
+        PROVIDER_AUTODETECT_ORDER.contains(&("CEREBRAS_API_KEY", "cerebras")),
+        "Cerebras must participate in autodetection",
+    );
+    let env = mock_env(&[
+        ("CEREBRAS_API_KEY", ""),
+        ("OLLAMA_API_KEY", "test-ollama-key"),
+    ]);
+    assert_eq!(auto_detect_provider_from(env), Some("ollama"));
+}
+
+#[test]
+fn cerebras_autodetect_preserves_existing_precedence() {
+    let without_cerebras: Vec<_> = PROVIDER_AUTODETECT_ORDER
+        .iter()
+        .copied()
+        .filter(|(env_var, _)| *env_var != "CEREBRAS_API_KEY")
+        .collect();
+    assert_eq!(
+        without_cerebras,
+        vec![
+            ("DEEPSEEK_API_KEY", "deepseek"),
+            ("OPENAI_API_KEY", "openai"),
+            ("ANTHROPIC_API_KEY", "anthropic"),
+            ("GEMINI_API_KEY", "gemini"),
+            ("GLM_API_KEY", "glm"),
+            ("ZHIPU_API_KEY", "glm"),
+            ("OPENCODE_API_KEY", "opencode"),
+            ("OLLAMA_API_KEY", "ollama"),
+            ("OPENROUTER_API_KEY", "openrouter"),
+        ],
+    );
+
+    let position = |env_var: &str| {
+        PROVIDER_AUTODETECT_ORDER
+            .iter()
+            .position(|(candidate, _)| *candidate == env_var)
+            .unwrap_or_else(|| panic!("missing autodetect entry for {env_var}"))
+    };
+    assert!(position("OPENCODE_API_KEY") < position("CEREBRAS_API_KEY"));
+    assert!(position("CEREBRAS_API_KEY") < position("OLLAMA_API_KEY"));
+    assert!(position("CEREBRAS_API_KEY") < position("OPENROUTER_API_KEY"));
+}
+
+#[test]
+fn cerebras_standard_key_lookup_uses_only_cerebras_api_key() {
+    let kind = parse_provider("cerebras").expect("cerebras should be a built-in provider");
+    let key = resolve_api_key_from(
+        kind,
+        None,
+        None,
+        mock_env(&[("CEREBRAS_API_KEY", "test-cerebras-key")]),
+    )
+    .expect("standard Cerebras key should resolve");
+
+    assert_eq!(key, "test-cerebras-key");
+    assert!(provider_env_var_fallbacks(kind).is_empty());
+}
+
+#[test]
+fn cerebras_standard_key_lookup_never_falls_back_to_openai() {
+    let kind = parse_provider("cerebras").expect("cerebras should be a built-in provider");
+    let err = resolve_api_key_from(
+        kind,
+        None,
+        None,
+        mock_env(&[("OPENAI_API_KEY", "test-openai-key-must-not-leak")]),
+    )
+    .expect_err("an OpenAI key must not authenticate Cerebras");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("CEREBRAS_API_KEY"),
+        "unexpected error: {message}"
+    );
+    assert!(!message.contains("test-openai-key-must-not-leak"));
+}
+
+#[test]
+fn cerebras_builtin_name_is_protected_from_plugin_shadowing() {
+    let err = validate_custom_provider("CEREBRAS", "https://interceptor.invalid/v1", false, true)
+        .expect_err("plugins must not shadow the Cerebras built-in");
+
+    assert!(
+        err.contains("collides with built-in"),
+        "unexpected error: {err}"
+    );
+}
+
 /// No stored `dirge auth` login → no provider implied, so the
 /// caller falls through to the openrouter default.
 #[test]
@@ -344,6 +441,113 @@ async fn any_model_filtered_stream_fn_hides_unloaded_dynamic_tools() {
 
     assert!(tool_names.contains(&"mcp_loaded"));
     assert!(!tool_names.contains(&"mcp_hidden"));
+}
+
+mod cerebras_alias_stream_tests {
+    use crate::agent::agent_loop::stream::{LlmContext, StreamOptions};
+    use crate::agent::agent_loop::tool::AbortSignal;
+    use crate::agent::agent_loop::types::ThinkingLevel;
+    use crate::provider::AnyModel;
+    use futures::StreamExt;
+    use rig::client::CompletionClient;
+    use rig::providers::openai;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    async fn capture_aliased_cerebras_request(reasoning: ThinkingLevel) -> serde_json::Value {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let body_start = loop {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                buf.extend_from_slice(&chunk[..read]);
+                if let Some(end) = header_end(&buf) {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..body_start]);
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap();
+            while buf.len() < body_start + content_length {
+                let mut chunk = [0u8; 1024];
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert!(read > 0, "client closed before sending full request body");
+                buf.extend_from_slice(&chunk[..read]);
+            }
+            let body = serde_json::from_slice::<serde_json::Value>(
+                &buf[body_start..body_start + content_length],
+            )
+            .unwrap();
+            body_tx.send(body).ok();
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = openai::CompletionsClient::builder()
+            .http_client(crate::provider::compressing_http::CompressingHttpClient::default())
+            .api_key("test-cerebras-key")
+            .base_url(&base_url)
+            .build()
+            .unwrap();
+        let model = AnyModel::Cerebras(client.completion_model("gemma-4-31b"));
+        let stream_fn = model.build_stream_fn(
+            Vec::new(),
+            std::time::Duration::from_secs(5),
+            Some("review-fast".to_string()),
+        );
+        let mut options = StreamOptions::from_signal(AbortSignal::new());
+        options.reasoning = Some(reasoning);
+        let mut stream = stream_fn(
+            LlmContext {
+                system_prompt: String::new(),
+                messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+                asset_dir: None,
+            },
+            options,
+        );
+        while stream.next().await.is_some() {}
+
+        let body = body_rx.await.unwrap();
+        server.await.unwrap();
+        body
+    }
+
+    #[tokio::test]
+    async fn aliased_cerebras_streamed_role_uses_top_level_high_effort() {
+        let body = capture_aliased_cerebras_request(ThinkingLevel::High).await;
+
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("reasoning_level").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn aliased_cerebras_streamed_role_omits_reasoning_when_off() {
+        let body = capture_aliased_cerebras_request(ThinkingLevel::Off).await;
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning_level").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
 }
 
 // --- dirge-7ls: review-runner cache isolation regression --------
@@ -1244,4 +1448,59 @@ fn injected_tool_is_gated_then_visible_then_dispatchable() {
         agent.loop_tools.iter().any(|t| t.name() == "mcp_demo"),
         "dispatch must find the tool by name"
     );
+}
+
+#[tokio::test]
+async fn cerebras_identity_survives_client_model_and_agent_construction() {
+    use clap::Parser;
+
+    let client =
+        create_client_with_auth("cerebras", Some("test-cerebras-key"), &HashMap::new(), None)
+            .expect("Cerebras client should build without network access");
+    let model = client.completion_model(default_model_for("cerebras"));
+    assert_eq!(
+        (model.provider_name(), model.name()),
+        ("cerebras", "gemma-4-31b".to_string()),
+    );
+
+    let cli = crate::cli::Cli::parse_from(["dirge", "--provider", "cerebras", "--no-tools"]);
+    let cfg = crate::config::Config {
+        provider: Some("cerebras".to_string()),
+        no_tools: Some(true),
+        ..Default::default()
+    };
+    let context = crate::context::ContextFiles {
+        agents: None,
+        prompts: HashMap::new(),
+        agent_defs: Default::default(),
+        current_agent: None,
+        current_prompt: None,
+        current_prompt_name: None,
+        current_prompt_deny_tools: Vec::new(),
+        prompt_layer: None,
+        agent_layer: None,
+        model_before_agent: None,
+    };
+    let agent = build_agent(
+        model,
+        &cli,
+        &cfg,
+        &context,
+        None,
+        None,
+        None,
+        None,
+        None,
+        #[cfg(feature = "lsp")]
+        None,
+        crate::sandbox::Sandbox::new(crate::sandbox::SandboxMode::Off),
+        #[cfg(feature = "mcp")]
+        None,
+        #[cfg(feature = "semantic")]
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(agent.provider_name(), "cerebras");
 }
