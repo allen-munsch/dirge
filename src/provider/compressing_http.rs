@@ -122,7 +122,28 @@ where
         let req = self.normalized_request(req);
         async move {
             let req = req?;
-            inner.send(req).await
+            let method = req.method().to_string();
+            let uri = req.uri().to_string();
+            let result = inner.send(req).await;
+            match &result {
+                Ok(resp) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        status = resp.status().as_u16(),
+                        "HTTP response received"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        error = %e,
+                        "sending HTTP request"
+                    );
+                }
+            }
+            result
         }
     }
 
@@ -147,7 +168,27 @@ where
         let req = self.normalized_request(req);
         async move {
             let req = req?;
-            inner.send_streaming(req).await
+            let method = req.method().to_string();
+            let uri = req.uri().to_string();
+            let result = inner.send_streaming(req).await;
+            match &result {
+                Ok(_) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        "sending HTTP streaming request"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        error = %e,
+                        "sending HTTP streaming request"
+                    );
+                }
+            }
+            result
         }
     }
 }
