@@ -342,6 +342,25 @@ impl VigilKeeper {
                     }
                 }
             }
+
+            // DB state is authoritative even when the payload came from
+            // config or a filesystem file (which win on name collision
+            // above): a vigil laid to rest must not be reaped on the next
+            // run. `list_non_resting` only covers store-only vigils, so
+            // drop any merged entry whose DB row is resting.
+            merged.retain(|e| {
+                let resting = matches!(
+                    store.get(&e.name),
+                    Ok(Some(crate::extras::vigil_db::VigilRow {
+                        status: crate::extras::vigil_db::VigilStatus::Resting,
+                        ..
+                    }))
+                );
+                if resting {
+                    info!(name = %e.name, "vigil laid to rest - skipping on next run");
+                }
+                !resting
+            });
         }
 
         Self::from_entries(merged, paused_names)

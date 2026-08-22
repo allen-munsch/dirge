@@ -2056,7 +2056,7 @@ async fn main() -> anyhow::Result<()> {
             vigil_wake_rx,
             mut vigil_observance_rx,
             vigil_ctl_tx,
-            vigil_hook_rx,
+            mut vigil_hook_rx,
         ) = {
             if !cli.vigil_mode && !cli.vigil_once {
                 (None, None, None, None, None)
@@ -2238,6 +2238,25 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await
                 .ok();
+            }
+
+            // Deliver any queued on-vigil-event / on-vigil-reap hook
+            // requests. The interactive loop drains these every iteration;
+            // --vigil-once has no loop, so flush them once before exiting.
+            if let Some(ref mut hook_rx) = vigil_hook_rx {
+                while let Ok(req) = hook_rx.try_recv() {
+                    #[cfg(feature = "plugin")]
+                    if let Some(pm) = plugin_manager.as_ref() {
+                        let pm = pm.clone();
+                        let hook = req.hook_name;
+                        let ctx = req.context;
+                        tokio::task::spawn_blocking(move || {
+                            pm.lock_ignore_poison().dispatch_tool_hook(&hook, &ctx)
+                        })
+                        .await
+                        .ok();
+                    }
+                }
             }
             crate::agent::tools::bg_shell::global().kill_all();
             return Ok(());
