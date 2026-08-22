@@ -26,6 +26,7 @@ pub fn spawn_harbinger(
     vigil_name: String,
     port: u16,
     commands_map: HashMap<String, VigilCommand>,
+    has_commands: bool,
     tx: mpsc::Sender<VigilEvent>,
     hook_tx: mpsc::Sender<HookDispatchRequest>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
@@ -37,8 +38,6 @@ pub fn spawn_harbinger(
         .map_err(|e| format!("set nonblocking for {vigil_name}: {e}"))?;
     let listener = TcpListener::from_std(listener)
         .map_err(|e| format!("convert listener for {vigil_name}: {e}"))?;
-
-    let has_commands = !commands_map.is_empty();
 
     Ok(tokio::spawn(async move {
         loop {
@@ -67,7 +66,9 @@ pub fn spawn_harbinger(
                 }
                 Err(e) => {
                     error!(%vigil_name, "accept error: {e}");
-                    break;
+                    // Transient errors (ECONNABORTED, EMFILE under fd pressure)
+                    // must not kill the listener. Back off briefly and retry.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }
         }

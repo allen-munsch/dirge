@@ -1022,12 +1022,22 @@ const HARNESS_VIGIL_INIT: &str = r#"
     (truthy? ((entry :value)))
     false))
 
+(defn- json-escape
+  "Escape a string for embedding inside a JSON string literal."
+  [s]
+  (->> s
+       (string/replace-all "\\" "\\\\")
+       (string/replace-all "\"" "\\\"")
+       (string/replace-all "\n" "\\n")
+       (string/replace-all "\r" "\\r")
+       (string/replace-all "\t" "\\t")))
+
 (defn- json-encode
   "Serialize a Janet value to JSON. Handles strings, numbers, booleans,
    nil, indexed arrays, and dictionaries (tables/structs)."
   [x]
   (cond
-    (string? x) (string "\"" x "\"")
+    (string? x) (string "\"" (json-escape x) "\"")
     (number? x) (string x)
     (= x true) "true"
     (= x false) "false"

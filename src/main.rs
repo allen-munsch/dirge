@@ -2844,8 +2844,8 @@ async fn handle_vigil_command(action: &crate::cli::VigilAction) -> anyhow::Resul
         }
         crate::cli::VigilAction::Rest { name } => {
             let store = VigilStore::open(&paths).map_err(|e| anyhow::anyhow!("{e}"))?;
-            match store.set_status(name, VigilStatus::Active) {
-                Ok(()) => println!("Restarted vigil '{name}'."),
+            match store.set_status(name, VigilStatus::Resting) {
+                Ok(()) => println!("vigil '{name}' resting (will sleep until next trigger)."),
                 Err(e) => eprintln!("{e}"),
             }
         }

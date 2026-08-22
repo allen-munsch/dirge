@@ -295,10 +295,13 @@ pub async fn run_reaper(
                             prompt,
                             context,
                             event_count: batch.event_count,
-                            running: running_flag,
+                            running: running_flag.clone(),
                         };
 
                         if observance_tx.try_send(observance).is_err() {
+                            // The flag was set above; clear it so this vigil can
+                            // reap again instead of being stuck "in flight" forever.
+                            running_flag.store(false, Ordering::SeqCst);
                             warn!(%vigil_name, "observance queue full, dropping");
                         } else if let Some(ref wt) = wake_tx {
                             let _ = wt.send(());

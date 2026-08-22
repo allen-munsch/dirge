@@ -272,8 +272,13 @@ fn paint_vigil_card(buf: &mut Buffer, area: Rect, data: &[VigilStatusRow], style
                     format!("{}  {}  {}", row.trigger, ev_tick, interval)
                 };
                 let name_limit = inner_w.saturating_sub(6 + rhs.len() + 2);
-                let name = if row.name.len() > name_limit && name_limit > 3 {
-                    format!("{}…", &row.name[..name_limit.saturating_sub(1)])
+                let name = if row.name.chars().count() > name_limit && name_limit > 3 {
+                    let truncated: String = row
+                        .name
+                        .chars()
+                        .take(name_limit.saturating_sub(1))
+                        .collect();
+                    format!("{truncated}…")
                 } else {
                     row.name.clone()
                 };

@@ -103,6 +103,16 @@ impl VigilKeeper {
             let running = Arc::new(AtomicBool::new(false));
 
             let name = entry.name.clone();
+            if entry.reap_interval_secs == 0 {
+                return Err(format!(
+                    "vigil {name}: reap_interval_secs must be greater than zero"
+                ));
+            }
+            if let crate::config::VigilTrigger::Toll { interval_secs: 0 } = &entry.trigger {
+                return Err(format!(
+                    "vigil {name}: toll interval_secs must be greater than zero"
+                ));
+            }
             let interval = entry.reap_interval_secs;
             let prompt = entry.prompt.clone();
             let procession = entry.procession.clone();
@@ -120,11 +130,19 @@ impl VigilKeeper {
                 }
                 crate::config::VigilTrigger::Watcher { path, .. } => {
                     let watch_path = std::path::PathBuf::from(&path);
-                    watcher::spawn_watcher(name.clone(), watch_path, tx.clone(), hook_tx.clone())?;
+                    if let Err(e) = watcher::spawn_watcher(
+                        name.clone(),
+                        watch_path,
+                        tx.clone(),
+                        hook_tx.clone(),
+                    ) {
+                        warn!(%name, "failed to spawn watcher, skipping vigil: {e}");
+                        continue;
+                    }
                 }
                 crate::config::VigilTrigger::Harbinger {
                     address,
-                    protocol: _,
+                    protocol,
                     socket_mode,
                     commands,
                 } => {
@@ -139,6 +157,12 @@ impl VigilKeeper {
                         ));
                     }
 
+                    if !protocol.is_empty() && protocol != "tcp" {
+                        return Err(format!(
+                            "vigil {name}: unsupported harbinger protocol '{protocol}' (only 'tcp' is supported)"
+                        ));
+                    }
+
                     let has_commands = matches!(socket_mode, crate::config::SocketMode::Commands);
                     if has_commands && commands.is_empty() {
                         return Err(format!(
@@ -146,13 +170,17 @@ impl VigilKeeper {
                         ));
                     }
 
-                    harbinger::spawn_harbinger(
+                    if let Err(e) = harbinger::spawn_harbinger(
                         name.clone(),
                         port,
                         commands,
+                        has_commands,
                         tx.clone(),
                         hook_tx.clone(),
-                    )?;
+                    ) {
+                        warn!(%name, "failed to spawn harbinger, skipping vigil: {e}");
+                        continue;
+                    }
                 }
             }
 
@@ -284,6 +312,33 @@ impl VigilKeeper {
                             let file_path = path.display();
                             warn!(file = %file_path, "cannot read vigil file, skipping: {e}");
                         }
+                    }
+                }
+            }
+        }
+
+        // Import vigils added via `dirge vigil add` / `/vigil add`, which are
+        // persisted to the SQLite store rather than config or the filesystem
+        // dir. Without this the add paths are dead ends: the keeper would never
+        // load them. Config/filesystem entries win on name collision, and
+        // `list_non_resting` already excludes vigils the user put to rest.
+        let db_path = crate::extras::dirge_paths::ProjectPaths::new(&cwd).session_db_path();
+        if db_path.exists()
+            && let Ok(store) = crate::extras::vigil_db::VigilStore::open_at(&db_path)
+        {
+            for row in store.list_non_resting().unwrap_or_default() {
+                let name = row.name.clone();
+                match serde_json::from_str::<VigilEntry>(&row.payload_json) {
+                    Ok(db_entry) => {
+                        if !merged.iter().any(|e| e.name == name) {
+                            info!(%name, "imported vigil from store");
+                            merged.push(db_entry);
+                        } else {
+                            info!(%name, "vigil from store skipped: config/filesystem entry wins on name collision");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(%name, "invalid vigil payload in store, skipping: {e}");
                     }
                 }
             }
